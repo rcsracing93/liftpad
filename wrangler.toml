@@ -1,0 +1,23 @@
+# LiftPad Worker config. The three __LP_...__ values are placeholders.
+# tools/deploy.sh fills them in a build copy from deploy.env and the D1 lookup.
+# Do not put real values in this file.
+name = "liftpad"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+workers_dev = false
+preview_urls = false
+routes = [ { pattern = "__LP_HOSTNAME__", custom_domain = true } ]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__LP_D1_NAME__"
+database_id = "__LP_D1_ID__"
+
+[vars]
+NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
