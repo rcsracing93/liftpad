@@ -191,8 +191,19 @@ await t('lookup links: the built K&N and RockAuto addresses for the 5 sample car
   const ford = (await call('/api/links?year=2021&make=Ford&model=Mustang')).d.find(l => l.label.startsWith('Ford owner manual'));
   const old = (await call('/api/links?year=2007&make=Ford&model=Mustang')).d.find(l => l.label.startsWith('Ford owner manual'));
   if (!ford || ford.url !== 'https://www.ford.com/support/vehicle/mustang/2021/owner-manuals/' || old) bad2.push(`Ford manual 2021 ${ford && ford.url}, 2007 ${old && old.url}`);
+  // Rick's tap check (LINKS-RESULTS 2026-10-17): new patterns, fixed addresses, patterns first, no NHTSA link.
+  const hc = (await call('/api/links?year=2018&make=Honda&model=Civic&engine=2.0L+4+cyl')).d;
+  const want = { 'tirepressure.com': 'https://tirepressure.com/honda-civic-tire-pressure', 'Wheel-Size (thread, torque, bolt pattern)': 'https://www.wheel-size.com/size/honda/civic/',
+    'Wix filter finder': 'https://www.wixfilters.com/en-us/filter-finder.html', 'Purolator part finder': 'https://www.purolatornow.com/en/part-finder.html',
+    'Mobil 1 oil filters': 'https://www.mobil.com/en/lubricants/for-personal-vehicles/our-products/oil-filters', 'Honda owner manuals (MyGarage)': 'https://mygarage.honda.com/s/find-honda' };
+  for (const [label, url] of Object.entries(want)) { const l = hc.find(x => x.label === label); if (!l || l.url !== url) bad2.push(`${label}: ${l && l.url}`); }
+  const jp = (await call('/api/links?year=2021&make=Jeep&model=Grand+Cherokee')).d.find(x => x.label === 'tirepressure.com');
+  if (!jp || jp.url !== 'https://tirepressure.com/jeep-grand-cherokee-tire-pressure' || !/not yet checked/.test(jp.note)) bad2.push(`Jeep tirepressure ${jp && jp.url} ${jp && jp.note}`);
+  for (const [c] of cars) { const d = (await call('/api/links?' + new URLSearchParams({ ...c, ev: c.ev ? '1' : '0' }))).d;
+    const firstFixed = d.findIndex(x => x.kind !== 'pattern'); if (firstFixed >= 0 && d.slice(firstFixed).some(x => x.kind === 'pattern')) bad2.push(`${c.make}: a pattern link after a fixed one`);
+    if (d.some(x => /nhtsa\.gov/.test(x.url))) bad2.push(`${c.make}: the NHTSA link is still there`); }
   ok(!bad2.length, bad2.join('; '));
-  return '5 cars, 10 addresses, Ford manual pattern 2013+ only';
+  return '5 cars, 10 K&N/RockAuto addresses, Ford manual 2013+ only, 7 addresses from Rick\'s check, patterns first';
 });
 if (priv) await priv.default({ t, call, ok });
 
