@@ -7,6 +7,8 @@ Writes:  db/seed-public.sql        makes list + 2 example cars. Safe for git. Ex
                                    not look like a lift-guide chart code (two letters, dash, digit).
          PRIVATE_DIR/seed-private.sql   makes + lift-guide index + classics + your cars.
                                        Never put this file in git.
+Both seeds are for a NEW, empty database only, after tools/migrate.sh (tools/d1_load.sh does
+both). A database with data is never reseeded: restore it from a backup (README).
 """
 import csv
 import os
@@ -47,23 +49,35 @@ def my_cars(rows):
 
 
 def car_lines(cars):
-    out = []
+    """Cars and their values for a NEW database after the migrations (schema 0002 or later).
+    Each value is a model-year value for that car's year, status `proposed` (only Rick
+    confirms, in the app), with its history row. A field the migrations do not create is added."""
+    t = lambda v: "'" + str(v or '').replace("'", "''") + "'"   # text, '' rather than NULL
+    now = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    out, seen = [], set()
     for i, (y, mk, md, tr, specs) in enumerate(cars, 1):
-        out.append(f"INSERT INTO vehicles(id,year,make,model,trim,mine) VALUES({i},{y},{q(mk)},{q(md)},{q(tr)},1);")
-        for t, f, v, c, s, n, w in specs:
-            out.append(f"INSERT INTO specs(vehicle_id,tab,field,value,confidence,source,note,warn) VALUES({i},{q(t)},{q(f)},{q(v)},{q(c)},{q(s)},{q(n)},{w});")
+        out.append(f"INSERT INTO vehicles(id,year,make,model,trim,mine,grp) VALUES({i},{y},{q(mk)},{q(md)},{q(tr)},1,'mine');")
+        for tab, f, v, c, s, n, w in specs:
+            if (tab, f) not in seen:
+                seen.add((tab, f))
+                out.append(f"INSERT OR IGNORE INTO fields(tab_id,name,sort) SELECT id,{t(f)},50 FROM tabs WHERE name={t(tab)};")
+            fid = f"(SELECT f.id FROM fields f JOIN tabs t ON t.id=f.tab_id WHERE t.name={t(tab)} AND f.name={t(f)})"
+            out.append(f"INSERT INTO vals(field_id,scope,make,model,year_from,year_to,value,confidence,source,note,warn,status,entered_at,entered_by,updated_at) "
+                       f"VALUES({fid},'model',{t(mk)},{t(md)},{y},{y},{t(v)},{t(c)},{t(s)},{t(n)},{w},'proposed',{now},'seed',{now});")
+            out.append(f"INSERT INTO history(value_id,action,new_value,new_status,new_confidence,at,device) "
+                       f"VALUES(last_insert_rowid(),'insert',{t(v)},'proposed',{t(c)},{now},'seed');")
     return out
 
 
-def main():
-    if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
-        sys.exit('usage: python3 tools/make_seed.py PRIVATE_DIR')
-    priv = sys.argv[1]
+def load(priv):
+    """The rows the input CSVs stand for, as dicts. Shared by this script and tools/import.py,
+    so the seed and the import read the CSVs the same way.
+    Returns (makes, guide, classics): makes {name: {aliases, nhtsa_name}}; guide and classics lists."""
     makes = {}
 
     def addmake(n, alias='', nh=''):
         if n not in makes:
-            makes[n] = (alias, nh or n)
+            makes[n] = {'aliases': alias, 'nhtsa_name': nh or n}
 
     guide = []
     for r in read_csv(os.path.join(priv, 'ali-index.csv')):
@@ -73,18 +87,32 @@ def main():
             rows.append('Ram')
         for m in rows:
             addmake(m)
-            guide.append(f"INSERT INTO ali_index(make,model,year_from,year_to,chart,guide_page,pdf_page,status,note) VALUES({q(m)},{q(r['model'])},{int(r['year_from'])},{int(r['year_to'])},{q(r['chart'])},{int(r['guide_page'])},{q(int(r['pdf_page'])) if r['pdf_page'] else 'NULL'},{q(r['status'])},{q(r['note'])});")
+            guide.append({'make': m, 'model': r['model'], 'year_from': int(r['year_from']), 'year_to': int(r['year_to']), 'chart': r['chart'],
+                          'guide_page': int(r['guide_page']), 'pdf_page': int(r['pdf_page']) if r['pdf_page'] else None,
+                          'status': r['status'], 'note': r['note']})
     classics = []
     for r in read_csv(os.path.join(priv, 'classics.csv')):
         if r['note']:
             continue
         mk = r['make']
         addmake(mk, 'American Motors' if mk == 'AMC' else ('Citroen' if mk == 'Citroën' else ''))
-        my = 1 if (r['years_src'] == 'hand' or r['raw_years'].startswith('model_years')) else 0
-        classics.append(f"INSERT INTO classics(make,model,year_from,year_to,model_years,years_src) VALUES({q(mk)},{q(r['model'])},{q(int(r['start'])) if r['start'] else 'NULL'},{q(int(r['end'])) if r['end'] else 'NULL'},{my},{q(r['years_src'])});")
+        classics.append({'make': mk, 'model': r['model'], 'year_from': int(r['start']) if r['start'] else None,
+                         'year_to': int(r['end']) if r['end'] else None,
+                         'model_years': 1 if (r['years_src'] == 'hand' or r['raw_years'].startswith('model_years')) else 0,
+                         'years_src': r['years_src']})
     for m in EXTRA_MAKES:
         addmake(m)
-    make_lines = [f"INSERT INTO makes(name,aliases,nhtsa_name) VALUES({q(n)},{q(a)},{q(nh)});" for n, (a, nh) in sorted(makes.items())]
+    return makes, guide, classics
+
+
+def main():
+    if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
+        sys.exit('usage: python3 tools/make_seed.py PRIVATE_DIR')
+    priv = sys.argv[1]
+    makes, g, c = load(priv)
+    guide = [f"INSERT INTO ali_index(make,model,year_from,year_to,chart,guide_page,pdf_page,status,note) VALUES({q(r['make'])},{q(r['model'])},{r['year_from']},{r['year_to']},{q(r['chart'])},{r['guide_page']},{q(r['pdf_page']) if r['pdf_page'] is not None else 'NULL'},{q(r['status'])},{q(r['note'])});" for r in g]
+    classics = [f"INSERT INTO classics(make,model,year_from,year_to,model_years,years_src) VALUES({q(r['make'])},{q(r['model'])},{q(r['year_from']) if r['year_from'] is not None else 'NULL'},{q(r['year_to']) if r['year_to'] is not None else 'NULL'},{r['model_years']},{q(r['years_src'])});" for r in c]
+    make_lines = [f"INSERT INTO makes(name,aliases,nhtsa_name) VALUES({q(n)},{q(m['aliases'])},{q(m['nhtsa_name'])});" for n, m in sorted(makes.items())]
 
     public = make_lines + car_lines(EXAMPLE_CARS)
     private = guide + classics + make_lines + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv'))))

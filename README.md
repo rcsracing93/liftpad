@@ -35,7 +35,10 @@ You need: a Cloudflare account with a domain, Docker, Python 3, and git.
    ```
    LP_HOSTNAME=lift.example.com
    LP_ACCESS_EMAIL=you@example.com
+   LP_ACCESS_TEAM=yourteam.cloudflareaccess.com
    ```
+
+   `LP_ACCESS_TEAM` is your Zero Trust team domain (Zero Trust dashboard, Settings). The Worker uses it to check the Access login proof (JWT) on the research-queue routes.
 
 4. Optional: put your own data in `private-data/` and build a private seed. `my-cars.csv` has one row per value (`year,make,model,trim,tab,field,value,confidence,source,note,warn`; `tab` is lift, torque or tires).
 

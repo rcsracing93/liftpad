@@ -2,12 +2,13 @@
 # LiftPad deploy. Runs inside node:22-alpine. See README for the full docker command.
 # Mounts:  /app     a build copy of the committed tree (git archive) - this script edits it
 #          /cfg     cf.env (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID) and svc.env. Never printed.
-#          /private deploy.env (LP_HOSTNAME, LP_ACCESS_EMAIL, optional LP_D1_NAME) and,
-#                   optional, seed-private.sql. RESEED backups go to /private/backups.
-# Changes: Cloudflare - creates the Access app, its 2 policies and the self-test service token
-#          only if they do not exist; creates D1 $LP_D1_NAME (default "liftpad") if absent;
-#          loads D1 only through tools/d1_load.sh (absent table, or RESEED=1 after a
-#          verified backup); deploys the Worker.
+#          /private deploy.env (LP_HOSTNAME, LP_ACCESS_EMAIL, LP_ACCESS_TEAM, optional LP_D1_NAME) and,
+#                   optional, seed-private.sql. Pre-migration backups go to /private/backups.
+# Changes: Cloudflare - creates the Access app, its policies, the self-test and the processor
+#          service tokens only if they do not exist; creates D1 $LP_D1_NAME (default "liftpad")
+#          if absent; changes D1 only through tools/d1_load.sh (empty database: migrations +
+#          seed; pending migrations: only with -e LP_APPLY_MIGRATIONS=1, after a verified
+#          backup); deploys the Worker with the Access values as Worker variables.
 # shellcheck disable=SC3040 # runs under busybox ash (node:22-alpine), which has pipefail; STANDARD 11.4
 set -euo pipefail
 cd /app
@@ -45,6 +46,30 @@ if [ "$NPOL" = "0" ]; then
   cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg e "$LP_ACCESS_EMAIL" '{name:"owner",decision:"allow",precedence:1,include:[{email:{email:$e}}]}')" | jq -r '"policy owner: " + (if .success then "ok" else (.errors|tostring) end)'
   cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$SVC_ID" '{name:"selftest token",decision:"non_identity",precedence:2,include:[{service_token:{token_id:$t}}]}')" | jq -r '"policy selftest: " + (if .success then "ok" else (.errors|tostring) end)'
 else echo "policies exist: $NPOL"; fi
+SELF_ID=$CF_ACCESS_CLIENT_ID
+
+# Processor service token (Handoff 2, decision 6; the one Access change Rick approved 2026-10-16):
+# a separate token, saved to processor.env, with its own policy "processor token". Created only
+# if missing; the policies above are never changed.
+if [ ! -s /cfg/processor.env ]; then
+  cf -X POST "$API/accounts/$A/access/service_tokens" -d '{"name":"liftpad-processor","duration":"8760h"}' > /tmp/proc.json
+  jq -e '.success' /tmp/proc.json >/dev/null || { echo "processor token FAILED:"; jq -c '.errors' /tmp/proc.json; exit 1; }
+  umask 077; jq -r '"CF_ACCESS_CLIENT_ID=" + .result.client_id + "\nCF_ACCESS_CLIENT_SECRET=" + .result.client_secret + "\nSVC_ID=" + .result.id' /tmp/proc.json > /cfg/processor.env; rm /tmp/proc.json
+  echo "processor token created and saved to processor.env"
+fi
+PROC_ID=$(. /cfg/processor.env; printf '%s' "$CF_ACCESS_CLIENT_ID")
+PROC_SVC=$(. /cfg/processor.env; printf '%s' "$SVC_ID")
+if cf "$API/accounts/$A/access/apps/$APP/policies" | jq -e '.result | any(.name == "processor token")' >/dev/null; then echo "processor policy exists"
+else
+  PREC=$(( $(cf "$API/accounts/$A/access/apps/$APP/policies" | jq '[.result[].precedence] | max // 0') + 1 ))
+  cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$PROC_SVC" --argjson p "$PREC" '{name:"processor token",decision:"non_identity",precedence:$p,include:[{service_token:{token_id:$t}}]}')" | jq -r '"policy processor: " + (if .success then "ok" else (.errors|tostring) end)'
+fi
+# What the Worker needs to check an Access JWT: the app's AUD tag and the team's certs URL.
+# The team domain comes from deploy.env (LP_ACCESS_TEAM, e.g. myteam.cloudflareaccess.com):
+# reading it from the API needs an Access-organizations permission the deploy token does not have.
+AUD=$(cf "$API/accounts/$A/access/apps/$APP" | jq -r '.result.aud // empty')
+TEAM=${LP_ACCESS_TEAM:-}
+[ -n "$AUD" ] && [ -n "$TEAM" ] && [ -n "$PROC_ID" ] && [ -n "$SELF_ID" ] || { echo "STOP: missing Access AUD, LP_ACCESS_TEAM in deploy.env, or token ids"; exit 1; }
 
 step "C D1"
 [ -d node_modules/wrangler ] || npm i --silent --no-audit --no-fund wrangler@3.114.0 >/dev/null 2>&1
@@ -63,5 +88,7 @@ printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect
 sh tools/d1_load.sh "$SEED"
 
 step "D deploy"
-npx wrangler deploy 2>&1 | grep -v -i token | tail -8
+# The Access values go in as Worker variables, never into git. Lines naming them are not shown.
+npx wrangler deploy --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
+  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
 echo; echo "DEPLOY DONE"

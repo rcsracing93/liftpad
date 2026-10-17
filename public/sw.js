@@ -1,5 +1,5 @@
 // Network first. If the network fails, use the last saved copy, so lookups work in the garage without Wi-Fi.
-const C = 'liftpad-v2';
+const C = 'liftpad-v3';
 const SHELL = ['/', '/index.html', '/app.js', '/app.css', '/manifest.webmanifest', '/icon.svg'];
 self.addEventListener('install', e => e.waitUntil(caches.open(C).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
