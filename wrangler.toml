@@ -12,12 +12,20 @@ routes = [ { pattern = "__LP_HOSTNAME__", custom_domain = true } ]
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = false
+# true: every request runs the Worker first, so a browser navigation to /api/* gets JSON.
+# The Worker passes every other path to ASSETS (SPA fallback kept). wrangler 3.114 has no array form.
+run_worker_first = true
 
 [[d1_databases]]
 binding = "DB"
 database_name = "__LP_D1_NAME__"
 database_id = "__LP_D1_ID__"
+
+# Private R2 bucket (no public access): ALI page images ali/<edition>/p<NNN>.jpg, later the
+# door-jamb photos. Served only by the Worker, behind Access.
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "liftpad-private"
 
 [vars]
 NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"

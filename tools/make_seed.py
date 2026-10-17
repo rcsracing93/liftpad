@@ -21,6 +21,20 @@ MAKEMAP = {"Chevrolet Trucks": "Chevrolet", "Ford Trucks": "Ford", "GMC Trucks":
            "Mercedes Benz": "Mercedes-Benz", "Dodge/Ram Trucks": "Dodge"}
 EXTRA_MAKES = ['Tesla', 'Rivian', 'Lucid', 'Polestar', 'Alfa Romeo', 'Maserati', 'Ferrari', 'Lamborghini', 'McLaren',
                'Bentley', 'Rolls-Royce', 'Aston Martin', 'Lotus', 'Fisker', 'Factory Five']
+# Tabs and fields added after migration 0002, as data (Handoff 3 decision 7: the Oil tab is new
+# rows, no migration). Both seeds hold them; tools/import.py adds the missing ones to a database
+# that has data. The app knows the input kind of the oil fields by name (public/app.js OIL_UI).
+APP_TABS = [('oil', 'Oil', 4)]                                    # name, label, sort
+APP_FIELDS = [('oil', 'Oil type', '', 1, 0), ('oil', 'Quantity', 'qt', 2, 0), ('oil', 'Filter', '', 3, 0),   # tab, name, unit, sort, is_safety
+              ('tires', 'Spare pressure', 'psi', 3, 0)]                                                 # decision 10 (door-jamb label)
+
+
+def app_lines():
+    out = [f"INSERT OR IGNORE INTO tabs(name,label,sort) VALUES({q(n)},{q(lb)},{s});" for n, lb, s in APP_TABS]
+    out += [f"INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,{q(n)},'{u}',{s},{k} FROM tabs WHERE name={q(t)};" for t, n, u, s, k in APP_FIELDS]
+    return out
+
+
 EXAMPLE_CARS = [
     (2016, 'Honda', 'Civic', 'Example car - replace with yours', [
         ('lift', 'Points', 'Example only. Write where the lift pads go.', 'Low', 'Example', 'Not a real value', 0),
@@ -89,7 +103,7 @@ def load(priv):
             addmake(m)
             guide.append({'make': m, 'model': r['model'], 'year_from': int(r['year_from']), 'year_to': int(r['year_to']), 'chart': r['chart'],
                           'guide_page': int(r['guide_page']), 'pdf_page': int(r['pdf_page']) if r['pdf_page'] else None,
-                          'status': r['status'], 'note': r['note']})
+                          'status': r['status'], 'note': r['note'], 'edition': r.get('edition') or '2019'})
     classics = []
     for r in read_csv(os.path.join(priv, 'classics.csv')):
         if r['note']:
@@ -110,12 +124,12 @@ def main():
         sys.exit('usage: python3 tools/make_seed.py PRIVATE_DIR')
     priv = sys.argv[1]
     makes, g, c = load(priv)
-    guide = [f"INSERT INTO ali_index(make,model,year_from,year_to,chart,guide_page,pdf_page,status,note) VALUES({q(r['make'])},{q(r['model'])},{r['year_from']},{r['year_to']},{q(r['chart'])},{r['guide_page']},{q(r['pdf_page']) if r['pdf_page'] is not None else 'NULL'},{q(r['status'])},{q(r['note'])});" for r in g]
+    guide = [f"INSERT INTO ali_index(make,model,year_from,year_to,chart,guide_page,pdf_page,status,note,edition) VALUES({q(r['make'])},{q(r['model'])},{r['year_from']},{r['year_to']},{q(r['chart'])},{r['guide_page']},{q(r['pdf_page']) if r['pdf_page'] is not None else 'NULL'},{q(r['status'])},{q(r['note'])},{q(r['edition'])});" for r in g]
     classics = [f"INSERT INTO classics(make,model,year_from,year_to,model_years,years_src) VALUES({q(r['make'])},{q(r['model'])},{q(r['year_from']) if r['year_from'] is not None else 'NULL'},{q(r['year_to']) if r['year_to'] is not None else 'NULL'},{r['model_years']},{q(r['years_src'])});" for r in c]
     make_lines = [f"INSERT INTO makes(name,aliases,nhtsa_name) VALUES({q(n)},{q(m['aliases'])},{q(m['nhtsa_name'])});" for n, m in sorted(makes.items())]
 
-    public = make_lines + car_lines(EXAMPLE_CARS)
-    private = guide + classics + make_lines + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv'))))
+    public = make_lines + app_lines() + car_lines(EXAMPLE_CARS)
+    private = guide + classics + make_lines + app_lines() + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv'))))
     with open(os.path.join(DB, 'seed-public.sql'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(public) + '\n')
     with open(os.path.join(priv, 'seed-private.sql'), 'w', encoding='utf-8') as f:

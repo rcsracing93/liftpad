@@ -1,69 +1,180 @@
+/* LiftPad styles (Handoff 3 step 7, storyboard T1-T6 and P1-P4; decision 1).
+   Dark by default. Touch targets: 48 px on the phone, 64 px on the lift screen (900 px wide and
+   up), where the body text is 20 px and the key numbers (torque, psi, oil quantity) are 48 px.
+   Confidence and status are always words, never colour only. Proposed values have a dashed amber
+   border; confirmed values a solid one. No hover effects. */
 :root{
-  --bg:#eef0ee; --panel:#ffffff; --ink:#1b1f1d; --muted:#5d6661; --line:#cfd5d1;
-  --accent:#e0a100; --accent-ink:#1b1f1d; --focus:#1f6feb;
-  --hi:#1f7a46; --med:#a26a00; --lo:#b23a2e; --pill-bg:#f2f4f2;
+  --bg:#121514; --panel:#1d2120; --panel2:#181c1b; --ink:#eef1ee; --muted:#a3ada8; --line:#333a37; --line2:#4a524e;
+  --accent:#f2b51d; --accent-ink:#121514; --focus:#5bb8ff; --link:#f2b51d;
+  --hi:#5bd08f; --hi-bg:#1e3326; --med:#ffb84d; --med-bg:#2e2a1c; --lo:#ff8a7a; --lo-bg:#3a1e1b; --warn:#ffb15c; --warn-bg:#3a2a12; --pill-bg:#262b29;
   --display:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;
   --body:"Barlow",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
-  color-scheme:light;
+  --tap:48px; --key:2.6rem;
+  color-scheme:dark;
 }
-@media (prefers-color-scheme: dark){:root{
-  --bg:#141716; --panel:#1d2120; --ink:#e7ebe8; --muted:#9aa49f; --line:#333a37;
-  --accent:#f2b51d; --accent-ink:#141716; --focus:#6ea8ff;
-  --hi:#55c486; --med:#e6a83a; --lo:#f07a6c; --pill-bg:#262b29; color-scheme:dark}}
+@media (min-width:900px){:root{--tap:64px;--key:48px}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}   /* a display rule (e.g. .field grid) must never show a hidden element */
 html,body{margin:0}
 body{background:var(--bg);color:var(--ink);font:17px/1.45 var(--body);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:max(16px,env(safe-area-inset-top,0px)) 40px}
-.wrap{max-width:1080px;margin:0 auto;display:grid;gap:20px}
-header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;border-bottom:4px solid var(--accent);padding-bottom:10px}
-.brand{color:inherit;text-decoration:none}
-header h1{font:700 2rem/1 var(--display);letter-spacing:.02em;text-transform:uppercase;margin:0}
+@media (min-width:900px){body{font-size:20px;padding-left:max(40px,env(safe-area-inset-left,0px));padding-right:max(40px,env(safe-area-inset-right,0px))}}
+.wrap{max-width:1280px;margin:0 auto;display:grid;gap:20px}
+#view{display:grid;gap:24px;min-width:0}
+header{display:flex;align-items:center;gap:12px 18px;flex-wrap:wrap;border-bottom:4px solid var(--accent);padding-bottom:12px}
+.brand{color:inherit;text-decoration:none;display:inline-flex;align-items:center;min-height:var(--tap)}
+header h1{font:700 2.2rem/1 var(--display);letter-spacing:.03em;text-transform:uppercase;margin:0}
 header .sub{color:var(--muted)}
-.net{margin-left:auto;font:600 .8rem var(--display);letter-spacing:.06em;text-transform:uppercase;color:var(--med)}
-h2{font:700 1.7rem/1.1 var(--display);margin:0;text-wrap:balance}
-.grid{display:grid;grid-template-columns:minmax(0,380px) minmax(0,1fr);gap:20px;align-items:start}
-@media (max-width:760px){.grid{grid-template-columns:minmax(0,1fr)}}
-.cars{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.carbtn{display:grid;gap:4px;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;min-height:96px;color:inherit;text-decoration:none;font:inherit}
-.carbtn b{font:700 1.4rem/1.1 var(--display)}
-.carbtn span{color:var(--muted);font-size:.9rem}
-.carbtn.add{border-style:dashed;align-content:center;justify-items:center;color:var(--muted);font:600 1.1rem var(--display);text-transform:uppercase;letter-spacing:.06em}
+.hnav{margin-left:auto;display:flex;gap:12px;flex-wrap:wrap}
+.count{display:inline-block;background:var(--accent);color:var(--accent-ink);border-radius:99px;padding:0 12px;margin-left:10px;font-family:var(--mono)}
+.net{font:600 .85rem var(--display);letter-spacing:.06em;text-transform:uppercase;color:var(--warn)}
+h2{font:700 1.9rem/1.1 var(--display);margin:0;text-wrap:balance}
+h3{margin:0}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,480px);gap:28px;align-items:start}
+@media (max-width:860px){.grid{grid-template-columns:minmax(0,1fr)}}
+
+/* Home (T1): my cars as big tiles with a status line; frequent cars; visitors as chips */
+.cars{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.carbtn{display:grid;gap:6px;align-content:start;text-align:left;background:var(--panel);border:2px solid var(--line);border-radius:12px;padding:20px;min-height:120px;color:inherit;text-decoration:none;font:inherit}
+@media (min-width:900px){.carbtn{min-height:150px}}
+.carbtn b{font:700 1.7rem/1.05 var(--display)}
+.carbtn span{color:var(--muted)}
+.carbtn .status{margin-top:auto;font-weight:600}
+.status.ok{color:var(--hi)} .status.todo{color:var(--accent)} .status.warn{color:var(--warn)} .status.none{color:var(--muted)}
+.cars.small .carbtn{min-height:var(--tap);background:var(--panel2)}
+.cars.small .carbtn b{font-size:1.35rem}
+.chips{display:flex;gap:12px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:12px;min-height:var(--tap);padding:0 20px;border-radius:10px;background:var(--panel2);border:2px solid var(--line);color:var(--ink);text-decoration:none;font-size:1.1rem}
+.chip span{color:var(--muted);font-size:.9rem}
+.empty{display:flex;align-items:center;min-height:var(--tap);padding:0 20px;border-radius:12px;border:2px dashed var(--line);color:var(--muted)}
+
+/* Forms */
 .form{display:grid;gap:16px}
 .field{display:grid;gap:6px;position:relative}
-label,.lbl{font:600 .8rem var(--display);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
-input,select,textarea{font:500 1.2rem var(--body);color:var(--ink);background:var(--panel);border:2px solid var(--line);border-radius:8px;padding:12px 14px;min-height:56px;width:100%}
+label,.lbl{font:600 .85rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+input,select,textarea{font:500 1.2rem var(--body);color:var(--ink);background:var(--panel);border:2px solid var(--line2);border-radius:10px;padding:10px 16px;min-height:var(--tap);width:100%}
 textarea{min-height:80px;font-size:1rem}
-input:focus,select:focus,textarea:focus{outline:none;border-color:var(--focus)}
-input:disabled{opacity:.5}
-.list{position:absolute;top:100%;left:0;right:0;z-index:5;margin:4px 0 0;padding:4px;list-style:none;background:var(--panel);border:2px solid var(--focus);border-radius:8px;max-height:320px;overflow:auto;box-shadow:0 8px 24px rgb(0 0 0 / .18)}
-.list li{padding:12px;min-height:48px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;align-items:center}
-.list li[aria-selected="true"],.list li:hover{background:var(--pill-bg)}
-.list .tag{font:500 .72rem var(--mono);color:var(--muted);white-space:nowrap}
-.list .empty{color:var(--muted);cursor:default}
-.hint,.note{font-size:.88rem;color:var(--muted)}
-.or{display:flex;align-items:center;gap:10px;color:var(--muted);font:600 .8rem var(--display);letter-spacing:.08em;text-transform:uppercase}
+input:focus,select:focus,textarea:focus{outline:none;border:3px solid var(--focus)}
+input:disabled{opacity:.6}
+.list{position:absolute;top:100%;left:0;right:0;z-index:5;margin:4px 0 0;padding:6px;list-style:none;background:var(--panel);border:3px solid var(--focus);border-radius:10px;max-height:360px;overflow:auto;box-shadow:0 8px 24px rgb(0 0 0 / .4)}
+.list li{padding:0 16px;min-height:var(--tap);border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:1.15rem}
+.list li[aria-selected="true"]{background:#26302c}
+.list .tag{font:500 .8rem var(--mono);color:var(--muted);white-space:nowrap}
+.list .empty{color:var(--muted);cursor:default;border:0}
+.hint,.note{font-size:.9rem;color:var(--muted)}
+.or{display:flex;align-items:center;gap:10px;color:var(--muted);font:600 .85rem var(--display);letter-spacing:.08em;text-transform:uppercase}
 .or::before,.or::after{content:"";height:1px;background:var(--line);flex:1}
-.row{display:flex;gap:8px;flex-wrap:wrap}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .row>input{flex:1;min-width:0}
-button,.btn{font:600 1rem var(--display);letter-spacing:.06em;text-transform:uppercase;min-height:56px;padding:0 18px;border-radius:8px;border:2px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
+.row>.field{flex:1;min-width:120px}
+.seg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.seg button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+
+/* Buttons and button-like links: one tap, at least the target size, words not icons */
+button,.btn{font:700 1.05rem var(--display);letter-spacing:.06em;text-transform:uppercase;min-height:var(--tap);min-width:var(--tap);padding:0 20px;border-radius:10px;border:2px solid var(--line2);background:transparent;color:var(--ink);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;text-align:center}
 button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
-button.ghost{border-color:var(--line)}
-button:disabled{opacity:.5;cursor:default}
+button.ok{background:var(--hi);border-color:var(--hi);color:#0e1f15}
+button.ghost{border-color:var(--line2)}
+button:disabled{opacity:.55;cursor:default}
+.btn.big,button.big{min-height:var(--tap);font-size:1.25rem;width:100%}
+@media (min-width:900px){.btn.big,button.big{min-height:72px}}
+label.btn{cursor:pointer}
 :focus-visible{outline:3px solid var(--focus);outline-offset:2px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;display:grid;gap:16px;min-width:0}
-.src{font:500 .78rem var(--mono);color:var(--muted)}
-.tabs{display:flex;gap:6px;border-bottom:2px solid var(--line);overflow-x:auto}
-.tabs button{border:none;border-bottom:5px solid transparent;border-radius:0;min-height:56px;margin-bottom:-2px;color:var(--muted);font-size:1.15rem}
+
+/* Cards, values and pills */
+.card{background:var(--panel);border:2px solid var(--line);border-radius:12px;padding:20px;display:grid;gap:16px;min-width:0}
+.src{font:500 .85rem var(--mono);color:var(--muted)}
+.carhead{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.carhead h2{font-size:2.1rem;line-height:1}
+.tabs{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px;border-bottom:2px solid var(--line)}
+.tabs button{border:none;border-bottom:6px solid transparent;border-radius:0;min-height:calc(var(--tap) + 4px);padding:0 6px;margin-bottom:-2px;color:var(--muted);font-size:1.15rem;min-width:0}
+@media (min-width:900px){.tabs button{font-size:1.4rem}}
 .tabs button[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--ink)}
-dl{margin:0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:14px 18px}
-@media (max-width:480px){dl{grid-template-columns:minmax(0,1fr)}}
-dt{font:600 .8rem var(--display);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding-top:4px}
-dd{margin:0}
-.val{font:500 1.3rem var(--mono);font-variant-numeric:tabular-nums}
-.pill{display:inline-block;font:600 .72rem var(--display);letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:99px;background:var(--pill-bg);margin-left:8px;vertical-align:3px}
-.pill.High{color:var(--hi)} .pill.Medium{color:var(--med)} .pill.Low,.pill.Missing{color:var(--lo)}
-.warn{border-left:5px solid var(--med);background:var(--pill-bg);padding:12px 14px;border-radius:0 6px 6px 0}
-.warn.bad{border-left-color:var(--lo)}
-.edit{font-size:.8rem;min-height:36px;padding:0 10px;margin-top:6px}
+dl{margin:0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:14px 20px}
+@media (max-width:560px){dl{grid-template-columns:minmax(0,1fr)}}
+dt{font:600 .9rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding-top:12px}
+dd{margin:0;display:grid;gap:6px}
+dd>.pill,.typical>.pill,.first .pill{justify-self:start;margin-left:0}
+dd.v-proposed{border:2px dashed var(--med);border-radius:10px;padding:10px 14px}
+dd.v-confirmed{border:2px solid var(--line);border-radius:10px;padding:10px 14px}
+.val{font:500 1.35rem var(--mono);font-variant-numeric:tabular-nums}
+.val.key{font:700 var(--key)/1.05 var(--mono)}
+.pill{display:inline-block;font:700 .8rem var(--display);letter-spacing:.08em;text-transform:uppercase;padding:3px 12px;border-radius:99px;background:var(--pill-bg);margin-left:8px;vertical-align:4px}
+.pill.High,.pill.st-confirmed{color:var(--hi);background:var(--hi-bg)}
+.pill.Medium,.pill.st-proposed{color:var(--med);background:var(--med-bg)}
+.pill.Low,.pill.Missing,.pill.st-rejected{color:var(--lo);background:var(--lo-bg)}
+.tag{font:500 .8rem var(--mono);color:var(--muted);margin-left:8px}
+.warn{border:3px solid var(--warn);background:var(--warn-bg);padding:14px 18px;border-radius:12px}
+.warn.bad{border-color:var(--lo);background:var(--lo-bg)}
 .err{color:var(--lo);font-weight:600}
+.hist ol{margin:0;padding-left:20px}
+/* Links (Handoff 3 step 0): the accent colour, visited too - never the browser blue/purple.
+   Car tiles, buttons, chips and the brand keep their own colour. */
+a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.brand):not(.chip):visited{color:var(--link)}
+/* Toggle (Handoff 3 step 0): a 64x36 switch with the word On/Off beside it, inside a label at least
+   64 px tall. The knob is a gradient, not ::after, which input elements do not render everywhere. */
+.toggle{display:flex;align-items:center;gap:14px;min-height:64px;cursor:pointer;font:500 1.05rem/1.3 var(--body);color:var(--ink);letter-spacing:0;text-transform:none}
+.toggle input{appearance:none;-webkit-appearance:none;flex:none;width:64px;height:36px;min-height:0;padding:0;margin:0;border-radius:18px;border:2px solid var(--muted);
+  background:radial-gradient(circle 12px at 16px 50%,var(--muted) 96%,transparent 100%) var(--pill-bg);cursor:pointer}
+.toggle input:checked{border-color:var(--accent);background:radial-gradient(circle 12px at 44px 50%,var(--accent-ink) 96%,transparent 100%) var(--accent)}
+.toggle .st{flex:none;min-width:2.6em;font:700 .9rem var(--display);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.toggle input:not(:checked)+.st::before{content:"Off"}
+.toggle input:checked+.st{color:var(--ink)}
+.toggle input:checked+.st::before{content:"On"}
+
+/* Needs confirming (T6, P3): one row per value, Confirm and Reject one tap each */
+.crow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px 20px;align-items:center;background:var(--panel);border:2px dashed var(--med);border-radius:12px;padding:16px 20px}
+.crow.flag{border:3px solid var(--warn);background:var(--warn-bg)}
+.crow .meta{font-size:.9rem;color:var(--muted)}
+.crow .acts{display:flex;gap:10px}
+@media (max-width:700px){.crow{grid-template-columns:minmax(0,1fr)}.crow .acts{display:grid;grid-template-columns:1fr 1fr}}
+/* Visiting car, first look (T4): Lift, Torque and Tires side by side */
+.first{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+@media (max-width:860px){.first{grid-template-columns:minmax(0,1fr)}}
+.first section{background:var(--panel2);border:2px solid var(--line);border-radius:12px;padding:16px;display:grid;gap:8px;align-content:start}
+.first h3{font:700 1.4rem var(--display);text-transform:uppercase}
+/* Typical value for the make (Handoff 3 step 4): always marked Low and "not confirmed", never
+   the car's value; after the car's own values it is a small comparison line. */
+.typical{border:2px dashed var(--line2);border-radius:10px;padding:14px 16px;display:grid;gap:6px}
+.typical.after{padding:10px 14px}
+.typical .val{font:700 var(--key)/1.05 var(--mono)}
+.typical.after .val{font-size:1.2rem}
+/* Door-jamb photo flow and VIN (Handoff 3 step 6, storyboard P1 and P2) */
+.phoneflow{max-width:560px}
+.jphoto{display:block;border-radius:10px;overflow:hidden;background:#e9e2c8}
+.jphoto img{display:block;width:100%;max-height:340px;object-fit:contain}
+/* Lookup links (Handoff 3 step 5): one tap each, at least the target size; the note under the name. */
+.links ul{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:8px}
+.links li{display:grid;gap:2px}
+.links a{display:flex;align-items:center;min-height:var(--tap);padding:0 16px;border:2px solid var(--line2);border-radius:10px;font:700 1.1rem var(--display);letter-spacing:.03em}
+.links summary,details summary{cursor:pointer;min-height:var(--tap);display:flex;align-items:center}
+/* Lift tab page panel and the page viewer (Handoff 3 step 2, storyboard T2 and T3). The page is
+   always on its paper colour; the box is the accent, 4 px at any zoom (--s is the viewer scale). */
+.liftgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,460px);gap:28px;align-items:start}
+@media (max-width:860px){.liftgrid{grid-template-columns:minmax(0,1fr)}}
+.tabbody{display:grid;gap:16px;min-width:0}
+.pagecard{display:grid;gap:10px;text-decoration:none;color:inherit}
+.pageimg{position:relative;display:block;width:100%;background:#e9e6dd;border-radius:10px;overflow:hidden}
+.pageimg img{display:block;width:100%;height:100%;object-fit:contain}
+/* On the lift screen the whole page and "Use chart" fit on the screen: the page takes its height
+   from the screen and its width from its own shape, so the chart box stays on the chart. */
+@media (min-width:900px){.pageimg{height:calc(100vh - 430px);min-height:300px;width:auto;max-width:100%;margin:0 auto}}
+.pbox{position:absolute;border:4px solid var(--accent);border-radius:6px;background:rgb(242 181 29 / .12);pointer-events:none}
+.usechart{display:flex;align-items:center;justify-content:center;text-align:center;min-height:var(--tap);padding:8px 16px;border-radius:10px;background:var(--accent);color:var(--accent-ink);font:700 1.4rem/1.15 var(--display);letter-spacing:.04em;text-transform:uppercase}
+.viewer{position:fixed;inset:0;z-index:50;background:#0b0d0c;color:#eef1ee;display:grid;grid-template-rows:auto minmax(0,1fr)}
+.vbar{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;padding:12px max(16px,env(safe-area-inset-left,0px));background:#0b0d0c;border-bottom:2px solid #333a37}
+.vtitle{font:700 1.8rem/1.1 var(--display)}
+.vsub{color:#a3ada8;font:500 .9rem var(--mono)}
+.vtools{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.viewer button{min-width:64px;min-height:64px;background:#1d2120;border-color:#4a524e;color:#eef1ee;font-size:1.1rem}
+.viewer button.primary{background:#f2b51d;border-color:#f2b51d;color:#121514}
+.viewer .btn.primary{min-height:64px;background:#f2b51d;border-color:#f2b51d;color:#121514}
+.viewer .err{color:#ff8a7a}
+.vstage{position:relative;overflow:hidden;touch-action:none;cursor:grab;user-select:none;-webkit-user-select:none}
+.vstage.outline{cursor:crosshair}
+.vpage{position:absolute;left:0;top:0;transform-origin:0 0;background:#e9e6dd}
+.vpage img{display:block;width:100%;height:100%;-webkit-user-drag:none}
+.vpage .pbox,.vpage .pdraw{border-width:calc(4px / var(--s,1));border-radius:calc(6px / var(--s,1))}
+.pdraw{position:absolute;border:4px dashed #5bb8ff;background:rgb(91 184 255 / .15);pointer-events:none}
+.vhint{position:absolute;left:16px;bottom:16px;margin:0 16px 0 0;background:rgb(11 13 12 / .88);border-radius:10px;padding:10px 14px;color:#c9d0cc;font-size:1rem;pointer-events:none}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}

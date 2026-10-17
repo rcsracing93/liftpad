@@ -12,7 +12,8 @@
 // Exit code 0 = no check failed.
 import { writeFileSync, existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { createServer } from 'node:http';
+import { createServer, get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import { generateKeyPairSync, createSign } from 'node:crypto';
 const BASE = (process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '');
 const LOCAL = process.env.LP_LOCAL_JWT === '1';
@@ -66,8 +67,21 @@ await t('health: API answers', async () => {
   const min = priv?.minCounts; if (min) ok(d.a >= min.a && d.c >= min.c && d.v >= min.v, 'below minCounts ' + JSON.stringify(min) + ': ' + JSON.stringify(d));
   return `lift-guide rows ${d.a}, classics ${d.c}, cars ${d.v}, makes ${d.m}, values ${d.vals} (${d.proposed} proposed), open jobs ${d.jobs}, schema ${d.schema}`;
 });
-await t('schema is at migration 0002 or later', async () => { ok(String(health.schema) >= '0002', 'schema ' + health.schema); });
+await t('schema is at migration 0003 or later', async () => { ok(String(health.schema) >= '0003', 'schema ' + health.schema); });
 await t('app page loads', async () => { const r = await fetch(BASE + '/', { headers: hdr('tool') }); const x = await r.text(); ok(r.status === 200 && x.includes('LiftPad'), 'status ' + r.status); });
+// Handoff 3 step 0 (Rick, phone, 2026-10-16): a browser navigation to an /api/ address must reach the
+// Worker and get JSON, not the app's index.html. Headers as a browser sends them for a typed address.
+// Sent with node:http(s), not fetch: Node fetch replaces Sec-Fetch-Mode with "cors" (FIX 2026-10-16).
+const rawGet = (url, headers) => new Promise((done, fail) => {
+  (url.startsWith('https:') ? httpsGet : httpGet)(url, { headers }, r => { let b = ''; r.setEncoding('utf8'); r.on('data', c => b += c); r.on('end', () => done({ s: r.statusCode, ct: r.headers['content-type'] || '', x: b })); }).on('error', fail);
+});
+await t('a browser navigation to /api/whoami gets JSON, not the app page', async () => {
+  const h = { ...hdr('tool'), accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document', 'sec-fetch-site': 'none', 'upgrade-insecure-requests': '1' };
+  delete h['content-type'];
+  const { s, ct, x } = await rawGet(BASE + '/api/whoami', h);
+  ok(s === 200 && ct.startsWith('application/json') && !x.includes('<html'), `status ${s}, ${ct}, starts ${JSON.stringify(x.slice(0, 40))}`);
+  ok(JSON.parse(x).tool === true, 'not the whoami answer: ' + x.slice(0, 80));
+});
 await t('make "stu" -> Studebaker', async () => { const { d } = await call('/api/makes?q=stu'); ok(d[0]?.name === 'Studebaker', JSON.stringify(d)); });
 await t('make "ame" -> AMC (alias)', async () => { const { d } = await call('/api/makes?q=ame'); ok(d.some(m => m.name === 'AMC'), JSON.stringify(d)); });
 await t('make "citroen" -> Citroën', async () => { const { d } = await call('/api/makes?q=citroen'); ok(d.some(m => m.name === 'Citroën'), JSON.stringify(d)); });
@@ -86,6 +100,100 @@ if (health.c > 0) {
 await t('bad year rejected', async () => { const { s } = await call('/api/models?make=Ford&year=19'); ok(s === 400, 'status ' + s); });
 await t('bad VIN rejected', async () => { const { s, d } = await call('/api/vin?vin=ABC'); ok(s === 400 && /17/.test(d.error), JSON.stringify(d)); });
 await t('tabs and fields come from the database', async () => { const { d } = await call('/api/tabs'); ok(['lift', 'torque', 'tires'].every(n => d.tabs.some(t2 => t2.name === n)) && d.fields.some(f => f.tab === 'torque' && f.name === 'Torque' && f.is_safety), JSON.stringify(d.tabs)); return `${d.tabs.length} tabs, ${d.fields.length} fields`; });
+// ---------- ALI page images (Handoff 3 step 1, decisions 3 and 4) ----------
+const pages = (await call('/api/ali/pages')).d || [];
+const okPages = Array.isArray(pages) ? pages.filter(x => x.status === 'ok') : [];
+const pageUrl = x => `/api/ali/${x.edition}/p${String(x.pdf_page).padStart(3, '0')}.jpg`;
+if (okPages.length) {
+  await t('every listed page image is in R2 with the listed size (HEAD)', async () => {
+    const bad2 = [];
+    for (const x of okPages) { const r = await fetch(BASE + pageUrl(x), { method: 'HEAD', headers: hdr('tool') }); if (r.status !== 200 || +r.headers.get('content-length') !== x.bytes) bad2.push(`${pageUrl(x)}: ${r.status} ${r.headers.get('content-length')}`); }
+    ok(!bad2.length, bad2.slice(0, 5).join('; '));
+    const miss = pages.filter(x => x.status === 'missing_from_scan').map(x => x.guide_page);
+    return `${okPages.length} pages, ${okPages.reduce((s, x) => s + x.bytes, 0)} bytes; guide pages missing from the scan: ${miss.join(', ') || 'none'}`;
+  });
+  await t('a page image is a JPEG with a private cache header and the listed size', async () => {
+    const x = okPages[0]; const r = await fetch(BASE + pageUrl(x), { headers: hdr('tool') }); const b = new Uint8Array(await r.arrayBuffer());
+    ok(r.status === 200 && r.headers.get('content-type') === 'image/jpeg' && /private/.test(r.headers.get('cache-control') || ''), `status ${r.status}, ${r.headers.get('content-type')}, ${r.headers.get('cache-control')}`);
+    ok(b.length === x.bytes && b[0] === 0xFF && b[1] === 0xD8, `length ${b.length}, starts ${b[0]} ${b[1]}`);
+  });
+  await t('a car with a chart page gets its image address, newest edition first', async () => {
+    const cars = (await call('/api/vehicles')).d; let n = 0;
+    for (const c of cars) {
+      const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (!v.ali || v.ali.d !== 0) continue;
+      const pg = okPages.find(x => x.edition === v.ali.edition && x.pdf_page === v.ali.pdf_page);
+      ok(v.ali.img === (pg ? pageUrl(pg) : null), `${v.make} ${v.model}: img ${v.ali.img}, page ${JSON.stringify(pg)}`);
+      const ch = ((await call(`/api/models?make=${encodeURIComponent(v.make)}&year=${v.year}&nhtsa=0`)).d.find(m => m.label === v.model) || {}).charts || [];
+      const eds = ch.map(x => x.edition); ok(eds.every((e, i) => !i || eds[i - 1] >= e), `${v.model} charts not newest first: ${eds}`);
+      ok(v.ali.edition === eds[0], `${v.model}: card uses edition ${v.ali.edition}, newest is ${eds[0]}`); n++;
+    }
+    return `${n} car(s) checked`;
+  });
+  // Chart boxes (decision 6). A box Rick drew is never changed: the write checks run only on a
+  // chart with no box, and remove their box again.
+  let boxCar = null;
+  for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && v.ali.img) { boxCar = v; break; } }
+  if (boxCar && !boxCar.ali.box) {
+    const A = boxCar.ali, key = { edition: A.edition, chart: A.chart, pdf_page: A.pdf_page };
+    await t('chart box: drawn once, shown on the car, cleared again', async () => {
+      const r = await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.5, y: 0.25, w: 0.4, h: 0.3 } }); cleanup.push(['box', key]);
+      ok(r.s === 200, 'put ' + r.s + ' ' + JSON.stringify(r.d));
+      const b = (await call(`/api/vehicles/${boxCar.id}?peek=1`)).d.ali.box; ok(b && b.x === 0.5 && b.y === 0.25 && b.w === 0.4 && b.h === 0.3, JSON.stringify(b));
+      ok((await call(`/api/ali/boxes?edition=${encodeURIComponent(A.edition)}&chart=${encodeURIComponent(A.chart)}`, { method: 'DELETE' })).s === 200, 'delete');
+      ok((await call(`/api/vehicles/${boxCar.id}?peek=1`)).d.ali.box === null, 'box still there');
+      return `${A.edition} ${boxCar.make} ${boxCar.model}`;
+    });
+  } else skip('chart box: drawn once, shown on the car, cleared again', boxCar ? 'the first chart page already has a box (not changed)' : 'no car with a chart page');
+  await t('a bad chart box is refused; the processor cannot draw one', async () => {
+    const A = boxCar ? boxCar.ali : { edition: '2019', chart: 'X', pdf_page: 1 };
+    const key = { edition: A.edition, chart: A.chart, pdf_page: A.pdf_page };
+    const out = (await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.8, y: 0.1, w: 0.4, h: 0.3 } })).s;
+    const none = (await call('/api/ali/boxes', { method: 'PUT', body: { ...key, chart: 'NO-SUCH', x: 0.1, y: 0.1, w: 0.2, h: 0.2 } })).s;
+    const proc = hasProc ? (await call('/api/ali/boxes', { as: 'proc', method: 'PUT', body: { ...key, x: 0.1, y: 0.1, w: 0.2, h: 0.2 } })).s : 403;
+    ok(out === 400 && none === 404 && proc === 403, `outside the page ${out}, unknown chart ${none}, processor ${proc}`);
+  });
+} else ['every listed page image is in R2 with the listed size (HEAD)', 'a page image is a JPEG with a private cache header and the listed size', 'a car with a chart page gets its image address, newest edition first',
+  'chart box: drawn once, shown on the car, cleared again', 'a bad chart box is refused; the processor cannot draw one'].forEach(n => skip(n, 'no page images in ali_pages'));
+await t('a bad page address is refused, a missing page is 404', async () => {
+  const a = await fetch(BASE + '/api/ali/2019/p1.jpg', { headers: hdr('tool') }); const b = await fetch(BASE + '/api/ali/2019/p999.jpg', { headers: hdr('tool') });
+  ok(a.status === 400 && b.status === 404, `p1.jpg ${a.status}, p999.jpg ${b.status}`);
+});
+// ---------- Oil tab (Handoff 3 step 3, decision 7) ----------
+await t('the Oil tab has Oil type, Quantity (qt) and Filter', async () => {
+  const { d } = await call('/api/tabs'); const f = d.fields.filter(x => x.tab === 'oil').map(x => x.name + (x.unit ? ` (${x.unit})` : ''));
+  ok(d.tabs.some(x => x.name === 'oil' && x.label === 'Oil') && ['Oil type', 'Quantity (qt)', 'Filter'].every(n => f.includes(n)), JSON.stringify(f));
+  return f.join(', ');
+});
+// A public sample VIN (NHTSA's own API example, a 2013 Ford F-150): it goes to NHTSA only.
+await t('VIN decode gives fuel type and the EV flag (gas car: no EV)', async () => {
+  const { s, d } = await call('/api/vin?vin=1FTFW1CT5DFC10312');
+  if (s >= 500) return 'NHTSA not reachable: ' + JSON.stringify(d).slice(0, 80);
+  ok(s === 200 && d.ev === false && /gasoline/i.test(d.fuel) && typeof d.engine === 'string', JSON.stringify(d)); return `${d.year} ${d.make} ${d.model}, ${d.fuel}, ${d.engine}`;
+});
+// ---------- Lookup links (Handoff 3 step 5, decision 8): the built address only - never fetched ----------
+await t('lookup links: the built K&N and RockAuto addresses for the 5 sample cars (not fetched)', async () => {
+  const KN = 'https://www.knfilters.com/oil-filters/', RA = 'https://www.rockauto.com/en/catalog/';
+  const cars = [
+    [{ year: 2018, make: 'Honda', model: 'Civic', engine: '2.0L 4 cyl' }, KN + 'honda/civic/2.0l-l4-gas/2018', RA + 'honda,2018,civic'],
+    [{ year: 2021, make: 'Jeep', model: 'Grand Cherokee', engine: '5.7L 8 cyl' }, KN + 'jeep/grand-cherokee/5.7l-v8-gas/2021', RA + 'jeep,2021,grand+cherokee'],
+    [{ year: 2007, make: 'Ford', model: 'Mustang', engine: '4.6L 8 cyl' }, KN + 'ford/mustang/4.6l-v8-gas/2007', RA + 'ford,2007,mustang'],
+    [{ year: 2025, make: 'BMW', model: 'i4', engine: '', ev: 1 }, null, RA + 'bmw,2025,i4'],
+    [{ year: 1973, make: 'AMC', model: 'Hornet', engine: '' }, KN + 'american-motors/hornet', RA + 'amc,1973,hornet']];
+  const bad2 = [];
+  for (const [c, kn, ra] of cars) {
+    const { s, d } = await call('/api/links?' + new URLSearchParams({ ...c, ev: c.ev ? '1' : '0' }));
+    if (s !== 200) { bad2.push(`${c.make}: status ${s}`); continue; }
+    const k = d.find(l => l.label.startsWith('K&N')), r = d.find(l => l.label.startsWith('RockAuto'));
+    if ((k ? k.url : null) !== kn) bad2.push(`${c.make} K&N ${k && k.url}`);
+    if (!r || r.url !== ra) bad2.push(`${c.make} RockAuto ${r && r.url}`);
+    if (c.ev && d.some(l => l.tabs.includes('oil'))) bad2.push(`${c.make}: oil links for an EV`);
+  }
+  const ford = (await call('/api/links?year=2021&make=Ford&model=Mustang')).d.find(l => l.label.startsWith('Ford owner manual'));
+  const old = (await call('/api/links?year=2007&make=Ford&model=Mustang')).d.find(l => l.label.startsWith('Ford owner manual'));
+  if (!ford || ford.url !== 'https://www.ford.com/support/vehicle/mustang/2021/owner-manuals/' || old) bad2.push(`Ford manual 2021 ${ford && ford.url}, 2007 ${old && old.url}`);
+  ok(!bad2.length, bad2.join('; '));
+  return '5 cars, 10 addresses, Ford manual pattern 2013+ only';
+});
 if (priv) await priv.default({ t, call, ok });
 
 // ---------- identity (decision 6, 7) ----------
@@ -135,6 +243,60 @@ await t('reject: hidden from the car, kept with history', async () => {
   ok(!(await call(`/api/vehicles/${car}?peek=1`)).d.values.some(x => x.id === val2), 'rejected value still shown');
   const h = (await call(`/api/values/${val2}/history`)).d; ok(h[h.length - 1].action === 'reject' && h[h.length - 1].new_status === 'rejected', JSON.stringify(h));
 });
+// Live fault 2026-10-17: a deleted value's id was given to the next new value, which then showed the
+// old value's history. A new value must get a new id and a history of exactly one row.
+await t('delete a value, add one: the new value has a new id and one history row', async () => {
+  const add = async v => (await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { tab: 'torque', field: 'Socket', value: v, confidence: 'Low', source: 'selftest' } })).d.values.find(x => x.value === v).id;
+  const a = await add('98 mm'); cleanup.push(['val', a]);
+  ok((await call(`/api/values/${a}`, { method: 'DELETE' })).s === 200, 'delete');
+  const b = await add('97 mm'); cleanup.push(['val', b]);
+  ok(b > a, `new id ${b} is not above the deleted id ${a}`);
+  const h = (await call(`/api/values/${b}/history`)).d; ok(h.length === 1 && h[0].action === 'insert', JSON.stringify(h));
+  return `deleted ${a}, new ${b}`;
+});
+// Decision 10: door-jamb photos in the private bucket, never for the processor. A plain grey test
+// JPEG (not a real photo), removed again.
+const GREY = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA0JCgsKCA0LCgsODg0PEyAVExISEyccHhcgLikxMC4pLSwzOko+MzZGNywtQFdBRkxOUlNSMj5aYVpQYEpRUk//wAALCAAsACIBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAA/AKwAAAAAAAAAH//Z', 'base64');
+const raw = (p, o = {}) => { const h = hdr(o.as || 'tool'); h['content-type'] = o.type || 'image/jpeg'; return fetch(BASE + p, { method: o.method || 'GET', headers: h, body: o.body }); };
+await t('door-jamb photo: stored in the private bucket, listed, read back the same, deleted', async () => {
+  const r = await raw(`/api/vehicles/${car}/photos`, { method: 'POST', body: GREY }); const d = await r.json();
+  ok(r.status === 201 && /^\d{4}-\d\d-\d\dT[\d-]+Z\.jpg$/.test(d.name) && d.url === `/api/photos/${car}/${d.name}`, r.status + ' ' + JSON.stringify(d));
+  cleanup.push(['photo', d.url]);
+  const l = (await call(`/api/vehicles/${car}/photos`)).d; ok(l.some(x => x.name === d.name), 'not listed: ' + JSON.stringify(l));
+  const g = await raw(d.url); const b = Buffer.from(await g.arrayBuffer());
+  ok(g.status === 200 && g.headers.get('content-type') === 'image/jpeg' && b.equals(GREY), `get ${g.status} ${g.headers.get('content-type')} ${b.length} bytes`);
+  ok((await call(d.url, { method: 'DELETE' })).s === 200 && (await raw(d.url)).status === 404, 'not deleted');
+  return d.name;
+});
+await t('photos: the processor can neither store nor read one; a non-image is refused', async () => {
+  const pp = hasProc ? (await raw(`/api/vehicles/${car}/photos`, { as: 'proc', method: 'POST', body: GREY })).status : 403;
+  const pg = hasProc ? (await raw(`/api/vehicles/${car}/photos`, { as: 'proc' })).status : 403;
+  const txt = (await raw(`/api/vehicles/${car}/photos`, { method: 'POST', type: 'text/plain', body: 'not a photo' })).status;
+  ok(pp === 403 && pg === 403 && txt === 400, `processor store ${pp}, list ${pg}; text ${txt}`);
+});
+// Decision 11: the VIN is saved on the car, checked, and never given to the processor.
+await t('VIN: a bad VIN is refused, a good one is saved; the processor never sees it', async () => {
+  ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { vin: 'ABCDEFGHIJKLMNOPQ' } })).s === 400, 'a VIN with I and O was accepted');
+  ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { vin: '1ftfw1ct5dfc10312' } })).s === 200, 'save');
+  ok((await call(`/api/vehicles/${car}?peek=1`)).d.vin === '1FTFW1CT5DFC10312', 'not saved in capitals');
+  if (hasProc) { const pv = (await call(`/api/vehicles/${car}?peek=1`, { as: 'proc' })).d; ok(pv && !('vin' in pv), 'the processor got the VIN'); }
+  ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { vin: '' } })).s === 200, 'clear');
+});
+// Decision 9: the make's typical value and the thread range; a torque outside the range is flagged.
+if (health.defaults > 0 && health.ranges > 0) {
+  await t('the car gets the typical value for its make and the range for that thread', async () => {
+    const T = (await call(`/api/vehicles/${car}?peek=1`)).d.typical;
+    ok(T && T.make && T.make.make === 'AMC' && T.make.confidence === 'Low' && T.range && T.range.thread === T.make.thread && T.thread_from === 'make', JSON.stringify(T));
+    return `${T.make.thread}, ~${T.make.torque_ftlb} ft-lb (${T.make.edition}); range ${T.range.torque_min}-${T.range.torque_max}`;
+  });
+  await t('a torque outside the thread range is flagged, one inside is not (car and needs-confirming)', async () => {
+    const r = await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { tab: 'torque', field: 'Torque', value: '500 ft-lb', confidence: 'Low', source: 'selftest' } });
+    const hi = r.d.values.find(x => x.value === '500 ft-lb'); cleanup.push(['val', hi.id]);
+    const mid = r.d.values.find(x => x.id === valId);
+    ok(hi.range_flag === 'outside' && mid && mid.range_flag === 'inside', `500: ${hi.range_flag}, ${mid && mid.value}: ${mid && mid.range_flag}`);
+    const n = (await call('/api/needs-confirming')).d.values.find(x => x.id === hi.id); ok(n && n.range_flag === 'outside', JSON.stringify(n));
+  });
+} else ['the car gets the typical value for its make and the range for that thread', 'a torque outside the thread range is flagged, one inside is not (car and needs-confirming)'].forEach(n => skip(n, 'no make_defaults or thread_ranges rows'));
 await t('needs-confirming counts proposed values', async () => { const { d } = await call('/api/needs-confirming'); ok(typeof d.count === 'number' && d.values.every(x => x.status === 'proposed'), JSON.stringify(d).slice(0, 200)); return `${d.count} proposed`; });
 
 // ---------- research queue (decision 6) ----------
@@ -198,6 +360,8 @@ await t('a frequent car is never hidden', async () => { const c = (await call('/
 // ---------- cleanup ----------
 await t('cleanup: temp values (history kept) and temp car removed', async () => {
   for (const [k, id] of cleanup.reverse()) if (k === 'val') { const s = (await call(`/api/values/${id}`, { method: 'DELETE' })).s; ok(s === 200 || s === 404, 'delete value ' + s); }
+    else if (k === 'photo') { const s = (await call(id, { method: 'DELETE' })).s; ok(s === 200, 'delete test photo ' + s); }
+    else if (k === 'box') ok((await call(`/api/ali/boxes?edition=${encodeURIComponent(id.edition)}&chart=${encodeURIComponent(id.chart)}`, { method: 'DELETE' })).s === 200, 'delete test box');
   const h = (await call(`/api/values/${valId}/history`)).d; ok(h[h.length - 1].action === 'delete', 'no delete history row');
   if (car) { ok((await call('/api/vehicles/' + car, { method: 'DELETE' })).s === 200, 'delete car'); ok((await call('/api/vehicles/' + car)).s === 404, 'car still there'); }
 });

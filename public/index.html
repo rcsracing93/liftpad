@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>LiftPad</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#e0a100">
+<meta name="theme-color" content="#121514">
+<meta name="color-scheme" content="dark">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <div class="wrap">
-  <header><a href="#/" class="brand"><h1>LiftPad</h1></a><span class="sub" id="crumb"></span><span id="net" class="net" hidden>Offline - showing saved data</span></header>
+  <header><a href="#/" class="brand"><h1>LiftPad</h1></a><span class="sub" id="crumb"></span><span id="net" class="net" hidden>Offline - showing saved data</span><nav class="hnav" id="hnav" aria-label="Main"></nav></header>
   <main id="view" aria-live="polite"></main>
 </div>
 <script src="/app.js"></script>
