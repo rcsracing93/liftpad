@@ -100,6 +100,27 @@ if (health.c > 0) {
 await t('bad year rejected', async () => { const { s } = await call('/api/models?make=Ford&year=19'); ok(s === 400, 'status ' + s); });
 await t('bad VIN rejected', async () => { const { s, d } = await call('/api/vin?vin=ABC'); ok(s === 400 && /17/.test(d.error), JSON.stringify(d)); });
 await t('tabs and fields come from the database', async () => { const { d } = await call('/api/tabs'); ok(['lift', 'torque', 'tires'].every(n => d.tabs.some(t2 => t2.name === n)) && d.fields.some(f => f.tab === 'torque' && f.name === 'Torque' && f.is_safety), JSON.stringify(d.tabs)); return `${d.tabs.length} tabs, ${d.fields.length} fields`; });
+// ---------- Apps screen (HANDOFF 6) ----------
+let apps = [];
+await t('apps: /api/apps answers with http(s) tiles, sorted by sort then name', async () => {
+  const { s, d } = await call('/api/apps'); ok(s === 200 && Array.isArray(d), `status ${s}: ${JSON.stringify(d)}`); apps = d;
+  ok(d.every(a => a.name && /^https?:\/\//.test(a.url) && Number.isInteger(a.sort)), JSON.stringify(d));
+  ok(d.every((a, i) => !i || d[i - 1].sort < a.sort || (d[i - 1].sort === a.sort && d[i - 1].name.localeCompare(a.name) <= 0)), 'not sorted: ' + d.map(a => a.name).join(', '));
+  return `${d.length} app(s)`;
+});
+// Your own rows come from LP_PRIVATE_TESTS (export const apps = [{ name, url }]); a public-seed
+// build (no classics rows) has the sample row.
+const wantApps = priv?.apps || (health.c > 0 ? null : [{ name: 'Sample app', url: 'https://example.com' }]);
+if (wantApps) await t('apps: the expected tiles are there with their exact address', async () => {
+  const miss = wantApps.filter(w => !apps.some(a => a.name === w.name && a.url === w.url)); ok(!miss.length, 'missing: ' + miss.map(w => w.name).join(', ')); return wantApps.map(w => w.name).join(', ');
+});
+else skip('apps: the expected tiles are there with their exact address', 'no LP_PRIVATE_TESTS apps list and not a public-seed build');
+if (hasProc) await t('apps: not for the processor (403)', async () => { const { s } = await call('/api/apps', { as: 'proc' }); ok(s === 403, 'status ' + s); });
+else skip('apps: not for the processor (403)', 'no processor token');
+await t('app page has the Apps button in the header', async () => {
+  const x = await (await fetch(BASE + '/', { headers: hdr('tool') })).text();
+  ok(/<header>[\s\S]*<a class="btn appsbtn" id="appsbtn" href="#\/apps">[\s\S]*Apps<\/a><\/header>/.test(x), 'no Apps button in the header of index.html');
+});
 // ---------- ALI page images (Handoff 3 step 1, decisions 3 and 4) ----------
 const pages = (await call('/api/ali/pages')).d || [];
 const okPages = Array.isArray(pages) ? pages.filter(x => x.status === 'ok') : [];
@@ -369,12 +390,18 @@ await t('Frequent queues a workup job for the missing fields', async () => {
 await t('a frequent car is never hidden', async () => { const c = (await call('/api/vehicles', { now: plus(400 * DAY) })).d.find(x => x.id === car); ok(c && !c.hidden, 'hidden'); });
 
 // ---------- cleanup ----------
+// Every step runs and every problem is listed, so one failed step (a network error, or no value id
+// because the value check failed) never leaves the temp car on live (it did on 2026-10-22, car 5).
 await t('cleanup: temp values (history kept) and temp car removed', async () => {
-  for (const [k, id] of cleanup.reverse()) if (k === 'val') { const s = (await call(`/api/values/${id}`, { method: 'DELETE' })).s; ok(s === 200 || s === 404, 'delete value ' + s); }
-    else if (k === 'photo') { const s = (await call(id, { method: 'DELETE' })).s; ok(s === 200, 'delete test photo ' + s); }
-    else if (k === 'box') ok((await call(`/api/ali/boxes?edition=${encodeURIComponent(id.edition)}&chart=${encodeURIComponent(id.chart)}`, { method: 'DELETE' })).s === 200, 'delete test box');
-  const h = (await call(`/api/values/${valId}/history`)).d; ok(h[h.length - 1].action === 'delete', 'no delete history row');
-  if (car) { ok((await call('/api/vehicles/' + car, { method: 'DELETE' })).s === 200, 'delete car'); ok((await call('/api/vehicles/' + car)).s === 404, 'car still there'); }
+  const bad2 = [], chk = (c, m) => { if (!c) bad2.push(m); };
+  const tc = async (p, o) => { try { return await call(p, o); } catch (e) { return { s: 'network error: ' + e.message, d: null }; } };
+  for (const [k, id] of cleanup.reverse()) if (k === 'val') { const s = (await tc(`/api/values/${id}`, { method: 'DELETE' })).s; chk(s === 200 || s === 404, 'delete value ' + s); }
+    else if (k === 'photo') { const s = (await tc(id, { method: 'DELETE' })).s; chk(s === 200, 'delete test photo ' + s); }
+    else if (k === 'box') { const s = (await tc(`/api/ali/boxes?edition=${encodeURIComponent(id.edition)}&chart=${encodeURIComponent(id.chart)}`, { method: 'DELETE' })).s; chk(s === 200, 'delete test box ' + s); }
+  if (valId) { const h = (await tc(`/api/values/${valId}/history`)).d; chk(Array.isArray(h) && h.length && h[h.length - 1].action === 'delete', 'no delete history row'); }
+  else chk(false, 'no value id (the value check failed): history not checked');
+  if (car) { const s = (await tc('/api/vehicles/' + car, { method: 'DELETE' })).s; chk(s === 200, 'delete car ' + s); chk((await tc('/api/vehicles/' + car)).s === 404, 'car still there'); }
+  ok(!bad2.length, bad2.join('; '));
 });
 if (srv) srv.close();
 

@@ -80,6 +80,7 @@ INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,'Oil typ
 INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,'Quantity','qt',2,0 FROM tabs WHERE name='oil';
 INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,'Filter','',3,0 FROM tabs WHERE name='oil';
 INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,'Spare pressure','psi',3,0 FROM tabs WHERE name='tires';
+INSERT INTO apps(name,url,icon,sort) VALUES('Sample app','https://example.com','apps',10);
 INSERT INTO vehicles(id,year,make,model,trim,mine,grp) VALUES(1,2016,'Honda','Civic','Example car - replace with yours',1,'mine');
 INSERT OR IGNORE INTO fields(tab_id,name,sort) SELECT id,'Points',50 FROM tabs WHERE name='lift';
 INSERT INTO vals(field_id,scope,make,model,year_from,year_to,value,confidence,source,note,warn,status,entered_at,entered_by,updated_at) VALUES((SELECT f.id FROM fields f JOIN tabs t ON t.id=f.tab_id WHERE t.name='lift' AND f.name='Points'),'model','Honda','Civic',2016,2016,'Example only. Write where the lift pads go.','Low','Example','Not a real value',0,'proposed',strftime('%Y-%m-%dT%H:%M:%fZ','now'),'seed',strftime('%Y-%m-%dT%H:%M:%fZ','now'));

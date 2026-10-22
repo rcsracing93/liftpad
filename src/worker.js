@@ -313,6 +313,12 @@ export default {
           engine, fuel: d.FuelTypePrimary || '', electrification: d.ElectrificationLevel || '', ev, error: d.ErrorCode !== '0' ? d.ErrorText : '' });
       }
       if (p === '/api/tabs' && m === 'GET') return json(await tabsFields(env));
+      // HANDOFF 6: the Apps screen tiles (rows from private-data/apps.csv), read only. Not for the
+      // processor: a URL can be a LAN address.
+      if (p === '/api/apps' && m === 'GET') {
+        if (me.processor) return bad('Apps are not for the processor', 403);
+        return json((await env.DB.prepare('SELECT id, name, url, icon, sort FROM apps ORDER BY sort, name, id').all()).results);
+      }
       // Decision 8: lookup links for one car (built, never fetched).
       if (p === '/api/links' && m === 'GET') {
         const q = k => url.searchParams.get(k) || '';

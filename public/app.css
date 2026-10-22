@@ -26,6 +26,15 @@ header{display:flex;align-items:center;gap:12px 18px;flex-wrap:wrap;border-botto
 header h1{font:700 2.2rem/1 var(--display);letter-spacing:.03em;text-transform:uppercase;margin:0}
 header .sub{color:var(--muted)}
 .hnav{margin-left:auto;display:flex;gap:12px;flex-wrap:wrap}
+/* HANDOFF 6: the Apps button (header, every screen) and the Apps screen tiles */
+.appsbtn{gap:10px;padding:0 16px}
+.appsbtn svg{width:22px;height:22px;fill:currentColor;flex:none}
+.apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;margin-top:20px}
+.apptile{justify-items:center;align-content:center;text-align:center;min-height:180px}
+.apptile svg{width:64px;height:64px;fill:var(--accent)}
+/* Phone: Apps on the first line beside the name, the screen name under it, then the screen's own
+   buttons (the Apps button must not take a row of its own) */
+@media (max-width:560px){.appsbtn{order:1;margin-left:auto}header .sub{order:2;flex-basis:100%}.hnav{order:3}}
 .count{display:inline-block;background:var(--accent);color:var(--accent-ink);border-radius:99px;padding:0 12px;margin-left:10px;font-family:var(--mono)}
 .net{font:600 .85rem var(--display);letter-spacing:.06em;text-transform:uppercase;color:var(--warn)}
 h2{font:700 1.9rem/1.1 var(--display);margin:0;text-wrap:balance}

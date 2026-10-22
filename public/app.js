@@ -1,4 +1,4 @@
-// LiftPad front end. Hash routes: #/  #/add  #/car/<id>  #/car/<id>/page (page viewer)  #/confirm
+// LiftPad front end. Hash routes: #/  #/add  #/car/<id>  #/car/<id>/page (page viewer)  #/confirm  #/apps
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 // Device label (decision 7): picked once per browser, sent with every call, used in the history.
@@ -515,6 +515,25 @@ async function viewer(id) {
   if (box) toBox(box); else fitPage();
 }
 
+// ---------- Apps (HANDOFF 6) ----------
+// Tiles from /api/apps. A tile is a plain link without a target, so it opens in the same tab and
+// Fully Kiosk stays on one page. Only http(s) addresses become links. Icons are drawn here.
+const ICONS = {
+  apps: '<path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8h-8z"/>',
+  cctv: '<path d="M2 6.5l15-3 1.5 6-15 3zM16 12.5l-1.5 2.5H9v4H6v2H3v-7h3v2h1.5l1-2.5z"/><path d="M19 6l3-1v5l-3 1z"/>' };
+const appIcon = n => `<svg aria-hidden="true" viewBox="0 0 24 24">${ICONS[n] || ICONS.apps}</svg>`;
+let appsBack = '#/', appsTab = null;   // Back on the Apps screen: the screen (and car tab) it came from
+async function appsPage() {
+  const live = fresh();
+  const list = await api('/apps');
+  if (!live()) return;
+  crumb('Apps');
+  const tiles = list.filter(a => /^https?:\/\//i.test(a.url))
+    .map(a => `<a class="carbtn apptile" href="${esc(a.url)}">${appIcon(a.icon)}<b>${esc(a.name)}</b></a>`).join('');
+  $('#view').innerHTML = `<div class="carhead"><a class="btn" href="${esc(appsBack)}">Back</a><h2>Apps</h2></div>
+    ${tiles ? `<div class="apps">${tiles}</div>` : '<div class="empty">No apps yet.</div>'}`;
+}
+
 // ---------- Router ----------
 async function route() {
   const h = location.hash || '#/';
@@ -524,6 +543,7 @@ async function route() {
     if (!device) pickDevice();
     else if (h === '#/add') add();
     else if (h === '#/confirm') await confirmPage();
+    else if (h === '#/apps') await appsPage();
     else if (/^#\/car\/\d+\/page$/.test(h)) await viewer(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb$/.test(h)) await jamb(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb\/[0-9TZ-]+\.(jpg|png|webp)$/.test(h)) await jambRead(h.split('/')[2], h.split('/')[4]);
@@ -532,6 +552,11 @@ async function route() {
   } catch (e) { fail(e); }
 }
 let nextTab = null;   // a screen that sends Rick back to a car can name the tab to open
-addEventListener('hashchange', () => { tab = nextTab || 'lift'; nextTab = null; route(); });
+addEventListener('hashchange', e => {
+  const from = new URL(e.oldURL).hash || '#/', to = location.hash || '#/';
+  if (to === '#/apps' && from !== '#/apps') { appsBack = from; appsTab = tab; }   // remember where Apps was opened
+  else if (from === '#/apps' && to === appsBack && appsTab) nextTab = appsTab;     // Back opens the same car tab
+  tab = nextTab || 'lift'; nextTab = null; route();
+});
 route();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});

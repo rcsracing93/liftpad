@@ -1,9 +1,9 @@
 """Build the LiftPad seed files.
 
 Run:     python3 tools/make_seed.py PRIVATE_DIR
-Reads:   PRIVATE_DIR/ali-index.csv, PRIVATE_DIR/classics.csv, PRIVATE_DIR/my-cars.csv
-         (each is optional; a missing file is skipped and reported)
-Writes:  db/seed-public.sql        makes list + 2 example cars. Safe for git. Example cars must
+Reads:   PRIVATE_DIR/ali-index.csv, PRIVATE_DIR/classics.csv, PRIVATE_DIR/my-cars.csv,
+         PRIVATE_DIR/apps.csv (each is optional; a missing file is skipped and reported)
+Writes:  db/seed-public.sql        makes list + 1 sample app + 2 example cars. Safe for git. Example cars must
                                    not look like a lift-guide chart code (two letters, dash, digit).
          PRIVATE_DIR/seed-private.sql   makes + lift-guide index + classics + your cars.
                                        Never put this file in git.
@@ -33,6 +33,15 @@ def app_lines():
     out = [f"INSERT OR IGNORE INTO tabs(name,label,sort) VALUES({q(n)},{q(lb)},{s});" for n, lb, s in APP_TABS]
     out += [f"INSERT OR IGNORE INTO fields(tab_id,name,unit,sort,is_safety) SELECT id,{q(n)},'{u}',{s},{k} FROM tabs WHERE name={q(t)};" for t, n, u, s, k in APP_FIELDS]
     return out
+
+
+# Apps screen tiles (HANDOFF 6, migration 0006). The public seed has one sample row; the private
+# seed has PRIVATE_DIR/apps.csv (name,url,icon,sort), whose URLs can be LAN addresses.
+SAMPLE_APPS = [{'name': 'Sample app', 'url': 'https://example.com', 'icon': 'apps', 'sort': '10'}]
+
+
+def apps_lines(rows):
+    return [f"INSERT INTO apps(name,url,icon,sort) VALUES({q(r['name'])},{q(r['url'])},{q(r['icon'] or 'apps')},{int(r['sort'])});" for r in rows]
 
 
 EXAMPLE_CARS = [
@@ -128,8 +137,9 @@ def main():
     classics = [f"INSERT INTO classics(make,model,year_from,year_to,model_years,years_src) VALUES({q(r['make'])},{q(r['model'])},{q(r['year_from']) if r['year_from'] is not None else 'NULL'},{q(r['year_to']) if r['year_to'] is not None else 'NULL'},{r['model_years']},{q(r['years_src'])});" for r in c]
     make_lines = [f"INSERT INTO makes(name,aliases,nhtsa_name) VALUES({q(n)},{q(m['aliases'])},{q(m['nhtsa_name'])});" for n, m in sorted(makes.items())]
 
-    public = make_lines + app_lines() + car_lines(EXAMPLE_CARS)
-    private = guide + classics + make_lines + app_lines() + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv'))))
+    public = make_lines + app_lines() + apps_lines(SAMPLE_APPS) + car_lines(EXAMPLE_CARS)
+    private = (guide + classics + make_lines + app_lines() + apps_lines(read_csv(os.path.join(priv, 'apps.csv')))
+               + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv')))))
     with open(os.path.join(DB, 'seed-public.sql'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(public) + '\n')
     with open(os.path.join(priv, 'seed-private.sql'), 'w', encoding='utf-8') as f:
