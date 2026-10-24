@@ -117,6 +117,11 @@ dd.v-confirmed{border:2px solid var(--line);border-radius:10px;padding:10px 14px
 .tag{font:500 .8rem var(--mono);color:var(--muted);margin-left:8px}
 .warn{border:3px solid var(--warn);background:var(--warn-bg);padding:14px 18px;border-radius:12px}
 .warn.bad{border-color:var(--lo);background:var(--lo-bg)}
+.adapters{display:grid;gap:8px;border:3px solid var(--line2);border-radius:12px;padding:14px 18px}   /* HANDOFF 12: adapter notes of the chart; no buttons, body-size text */
+.adapters.unchecked{border-style:dashed;border-color:var(--warn);background:var(--warn-bg)}
+.adapters.stop{border-style:solid;border-color:var(--lo);background:var(--lo-bg)}   /* "Do not use a 2-post": red, first on the tab */
+.stopline{font-size:1.25rem}
+.adfoot{border-top:2px solid var(--line2);padding-top:8px}
 .warn dl{grid-template-columns:minmax(0,1fr);gap:8px}   /* a warning box holds the whole value row (HANDOFF 10): level word, value, source, buttons */
 .warn dt{color:var(--ink);font-size:1.25rem;padding-top:0}
 .err{color:var(--lo);font-weight:600}

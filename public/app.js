@@ -182,6 +182,25 @@ function add() {
 // ---------- Car ----------
 let tab = 'lift';
 let meta = null;
+// HANDOFF 12: the adapter notes of the chart on the Lift tab. Three check levels, always in words (Rick, 2026-10-24):
+// no (or no row at all) "Not checked - read the page", ai "AI-checked - the page is the source", rick "Checked by
+// Rick". The block shows its whole text at every level; the label is the first line.
+const VERIFIED = { no: 'Not checked - read the page.', ai: 'AI-checked - the page is the source.', rick: 'Checked by Rick.' };
+// The kit mark "Do not use a 2-post" makes the block red and puts it first on the tab, with the chart's words. Under
+// every block one fixed line (the lift's own numbers come from the data: foot; the words below are the fallback).
+const FOOT_FALLBACK = 'The chart gives no pad height. Check that the pads reach the lift points and the arms clear the car.';
+const adaptersBlock = (n, foot) => {
+  const lv = n && VERIFIED[n.verified] ? n.verified : 'no', stop = !!n && /^Do not use a 2-post/.test(n.kit_mark || '');
+  const lead = `<div class="vlabel"><b>${VERIFIED[lv]}</b></div>`;
+  const end = `<div class="adfoot">${esc(foot || FOOT_FALLBACK)}</div>`;
+  if (!n) return { stop: false, html: `<div class="adapters unchecked" data-verified="no">${lead}<div>LiftPad has no adapter notes for this chart.</div>${end}</div>` };
+  return { stop, html: `<div class="adapters${lv === 'no' ? ' unchecked' : ''}${stop ? ' stop' : ''}" data-verified="${lv}" data-kit="${stop ? 'stop' : 'note'}">
+    ${stop ? '<div class="stopline"><b>Do not use a 2-post.</b> The chart says so. Read its words below.</div>' : ''}${lead}
+    <div><b>Adapters (from the guide):</b> ${esc(n.adapters || 'no adapter callout on the chart')}</div>
+    ${n.height_note ? `<div><b>Height:</b> ${esc(n.height_note)}</div>` : ''}
+    <div><b>Your kit:</b> ${esc(n.kit_mark || 'height not given')}</div>
+    ${n.cautions ? `<div><b>Cautions:</b> ${esc(n.cautions)}</div>` : ''}${end}</div>` };
+};
 async function car(id) {
   const live = fresh();
   if (!meta) meta = await api('/tabs');
@@ -200,6 +219,7 @@ async function car(id) {
       <span class="usechart">Use chart ${esc(a.chart)} - tap to open</span></a>`;
     else if (a && a.status === 'missing_from_scan') pageCard = `<div class="warn bad">The page for chart ${esc(a.chart)} (guide p.${a.guide_page}) is missing from the ${esc(a.edition)} scan. Use a paper guide.</div>`;
   }
+  const ad = tab === 'lift' && v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer) : { stop: false, html: '' };
   const job = v.jobs[0];
   const jobLine = !job ? '' : job.status === 'done' ? `<span class="warn">Results ready - confirm${job.result_summary ? ' (' + esc(job.result_summary) + ')' : ''}</span>`
     : job.status === 'failed' ? `<span class="warn bad">Research failed: ${esc(job.error)}</span>` : `<span class="note">${job.status === 'claimed' ? 'Researching' : 'Queued'}</span>`;
@@ -247,8 +267,8 @@ async function car(id) {
     <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${v.year} ${esc(v.make)} ${esc(v.model)}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
     <div class="tabs" role="tablist">${meta.tabs.map(t => `<button role="tab" aria-selected="${tab === t.name}" data-t="${t.name}">${esc(t.label)}</button>`).join('')}</div>
     <div class="${pageCard ? 'liftgrid' : 'tabbody'}"><div class="tabbody">
-    ${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
-    ${ali}${evNote}
+    ${ad.stop ? ad.html : ''}${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
+    ${ali}${ad.stop ? '' : ad.html}${evNote}
     ${evNote && !rows.length ? '' : `<dl>${rows.filter(s => !s.warn).map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below, or tap Research.</dd>'}</dl>`}
     ${tab === 'tires' ? `<a class="btn primary big" href="#/car/${v.id}/jamb">Door-jamb photo</a><p class="note">The label on the driver door pillar is the maker's own source. Take a photo, then type what it says.</p>` : ''}
     ${typ}${links}

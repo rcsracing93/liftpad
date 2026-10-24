@@ -257,6 +257,22 @@ if (LOCAL) {
   await t('a phone cannot set the test clock', async () => { const { d } = await call('/api/whoami', { as: 'phone', now: '2001-01-01T00:00:00.000Z' }); ok(!d.now.startsWith('2001'), d.now); });
 } else ['whoami: a phone session is not the processor', 'a phone cannot set the test clock'].forEach(n => skip(n, 'live: no phone session in a script - check /api/whoami on the phone (README)'));
 
+// ---------- adapter notes per chart (HANDOFF 12) ----------
+// A car with a chart carries chart_notes: null (no row for the chart) or the five fields. The processor never gets it.
+// A database before migration 0007 has no chart_notes key to check: skipped.
+{
+  let noteCar = null;
+  for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && 'chart_notes' in v) { noteCar = v; break; } }
+  if (noteCar) {
+    await t('adapter notes: the car record has chart_notes with its five fields, verified is no, ai or rick', async () => {
+      const n = noteCar.chart_notes; if (n === null) return 'no notes row for this chart (null)';
+      ok(['adapters', 'height_note', 'cautions', 'kit_mark', 'verified'].every(k => k in n) && ['no', 'ai', 'rick'].includes(n.verified), JSON.stringify(n)); return 'verified ' + n.verified;
+    });
+    if (hasProc) await t('adapter notes: the processor never gets chart_notes', async () => { const d = (await call(`/api/vehicles/${noteCar.id}?peek=1`, { as: 'proc' })).d; ok(d && !('chart_notes' in d), 'the processor got chart_notes'); });
+    else skip('adapter notes: the processor never gets chart_notes', 'no processor token');
+  } else ['adapter notes: the car record has chart_notes with its five fields, verified is no, ai or rick', 'adapter notes: the processor never gets chart_notes'].forEach(n => skip(n, 'no car with a chart, or no chart_notes in the answer (before migration 0007)'));
+}
+
 // ---------- a temporary visitor car ----------
 let car, valId, val2;
 await t('add a visitor car (temp)', async () => {

@@ -164,6 +164,10 @@ const hidden = (v, nowMs) => v.grp === 'visitor' && (nowMs - Date.parse(v.last_s
 async function vehicleRow(env, id) {
   return env.DB.prepare("SELECT *, strftime('%Y-%m-%dT%H:%M:%fZ', created) created_iso FROM vehicles WHERE id=?").bind(id).first();
 }
+// HANDOFF 12: the adapter notes of one chart, read only (rows come from the import). null = no row for the chart.
+async function chartNotes(env, edition, chart) {
+  return await env.DB.prepare('SELECT adapters, height_note, cautions, kit_mark, verified FROM chart_notes WHERE edition = ? AND chart = ?').bind(edition, chart).first() || null;
+}
 async function vehicle(env, id, me, touch) {
   const v = await vehicleRow(env, id);
   if (!v) return null;
@@ -172,6 +176,9 @@ async function vehicle(env, id, me, touch) {
   v.typical = await typical(env, v.make, v.year, v.values);
   v.values.forEach(x => { x.range_flag = rangeFlag(x, v.typical.range); });
   v.ali = await nearestChart(env, v.make, v.model, v.year);
+  v.chart_notes = v.ali ? await chartNotes(env, v.ali.edition, v.ali.chart) : null;
+  // The fixed line under every adapter block (the lift's own numbers are data: edition all, chart footer).
+  v.chart_notes_footer = v.ali ? ((await chartNotes(env, 'all', 'footer')) || {}).adapters || null : null;
   v.jobs = (await env.DB.prepare("SELECT id, kind, status, result_summary, error, created_at, updated_at FROM jobs WHERE target IN (?, ?) ORDER BY id DESC LIMIT 5")
     .bind('car:' + id, modelKey(v)).all()).results;
   v.hidden = hidden(v, me.nowMs); v.mine = v.grp === 'mine' ? 1 : 0;
@@ -370,7 +377,7 @@ export default {
       }
       let mm = p.match(/^\/api\/vehicles\/(\d+)$/);
       // Decision 11: the VIN is on the car record only and goes to NHTSA only - never to the processor.
-      if (mm && m === 'GET') { const v = await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'); if (v && me.processor) delete v.vin; return v ? json(v) : bad('Car not found', 404); }
+      if (mm && m === 'GET') { const v = await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'); if (v && me.processor) { delete v.vin; delete v.chart_notes; delete v.chart_notes_footer; } return v ? json(v) : bad('Car not found', 404); }
       if (mm && m === 'PATCH') {
         const b = await req.json(); const v = await vehicleRow(env, +mm[1]);
         if (!v) return bad('Car not found', 404);
