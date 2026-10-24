@@ -71,7 +71,8 @@ async function home() {
   if (!live()) return;
   crumb(device);
   $('#hnav').innerHTML = `<a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a><a class="btn primary" href="#/add">+ Car</a>`;
-  const status = c => c.nwarn ? ['warn', 'Warning - see the Lift tab'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
+  // HANDOFF 10: Home shows only a block (warn = 2, an open problem). A caution (warn = 1) is on the Lift tab only.
+  const status = c => c.nblock ? ['warn', 'Warning - see the Lift tab'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
     : c.nvals ? ['ok', 'All values confirmed'] : ['none', 'No values yet'];
   const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span></a>`; };
   const ago = c => { const d = Math.floor((Date.now() - Date.parse(c.last_seen || c.created_iso || 0)) / 864e5); return d <= 0 ? 'today' : d === 1 ? '1 day ago' : `${d} days ago`; };
@@ -98,7 +99,7 @@ async function confirmPage() {
     <div role="list" class="tabbody">${d.values.map(x => `<div role="listitem" class="crow${x.range_flag === 'outside' ? ' flag' : ''}"><div class="tabbody" style="gap:6px">
       <span class="meta">${what(x)} · ${esc(x.tab)} · ${esc(x.field)}</span>
       <span class="val${keyCls(x)}">${esc(showVal(x))}</span>
-      <span class="meta"><span class="pill ${esc(x.confidence)}" style="margin-left:0">${esc(x.confidence)}</span> ${esc(x.source)}</span>${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
+      <span class="meta"><span class="pill ${esc(x.confidence)}" style="margin-left:0">${esc(x.confidence)}</span> ${x.warn ? `<span class="pill lv-${x.warn === 2 ? 'block' : 'caution'}" style="margin-left:0">${x.warn === 2 ? 'Block - do not lift yet' : 'Caution'}</span> ` : ''}${esc(x.source)}</span>${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
       ${x.range_flag === 'outside' && x.range ? `<span class="err">Outside the usual range for ${esc(x.range.thread)} (${x.range.torque_min}-${x.range.torque_max} ft-lb). Check it before you confirm.</span>` : ''}</div>
       <div class="acts"><button class="ok" data-ok="${x.id}">Confirm</button><button data-no="${x.id}">Reject</button></div></div>`).join('') || '<p class="note">Nothing to confirm.</p>'}</div>
     <p class="note">A confirmed model-year value applies to every car of that model and year. Each confirm or reject is kept in the value's history.</p>`;
@@ -246,7 +247,7 @@ async function car(id) {
     <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${v.year} ${esc(v.make)} ${esc(v.model)}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
     <div class="tabs" role="tablist">${meta.tabs.map(t => `<button role="tab" aria-selected="${tab === t.name}" data-t="${t.name}">${esc(t.label)}</button>`).join('')}</div>
     <div class="${pageCard ? 'liftgrid' : 'tabbody'}"><div class="tabbody">
-    ${rows.filter(s => s.warn).map(s => `<div class="warn"><b>${esc(s.field)}:</b> ${esc(s.value)} ${pill(s.status)}</div>`).join('')}
+    ${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
     ${ali}${evNote}
     ${evNote && !rows.length ? '' : `<dl>${rows.filter(s => !s.warn).map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below, or tap Research.</dd>'}</dl>`}
     ${tab === 'tires' ? `<a class="btn primary big" href="#/car/${v.id}/jamb">Door-jamb photo</a><p class="note">The label on the driver door pillar is the maker's own source. Take a photo, then type what it says.</p>` : ''}
@@ -291,6 +292,7 @@ function valueForm(v) {
   <div class="field"><label>Confidence</label><select name="confidence">${['High', 'Medium', 'Low'].map(c => `<option>${c}</option>`).join('')}</select></div>
   <div class="field"><label>Source</label><input name="source" placeholder="Where it came from" value="${esc(lastSource(v.id))}"></div>
   <div class="field"><label>Note</label><input name="note"></div>
+  ${warnSelect(0)}
   <div class="field"><label>Applies to</label><select name="scope"><option value="model">Every ${esc(v.make)} ${esc(v.model)} in these years</option><option value="car">This car only (override)</option></select></div>
   <div class="row"><div class="field"><label>From year</label><input name="year_from" inputmode="numeric" maxlength="4" value="${v.year}"></div><div class="field"><label>To year</label><input name="year_to" inputmode="numeric" maxlength="4" value="${v.year}"></div></div>
   <label class="toggle"><input type="checkbox" name="confirm" value="1"><span class="st"></span>I checked this value - mark it confirmed</label>
@@ -308,12 +310,16 @@ function wireValueInputs(f) {
   grade();
   f.compose = b => (tab === 'oil' && OIL_UI[b.field]) ? OIL_UI[b.field].value(b) : b.value;
 }
+// The warning level of a value (HANDOFF 10). Caution: a standing step, shown on the Lift tab. Block: an open
+// problem, shown on Home too, until the value is fixed or you set it back to None.
+const warnSelect = lv => `<div class="field"><label>Warning</label><select name="warn">${[[0, 'None'], [1, 'Caution - a standing safety step (Lift tab)'], [2, 'Block - do not lift yet (Home and Lift tab)']].map(([n, t]) => `<option value="${n}" ${+lv === n ? 'selected' : ''}>${t}</option>`).join('')}</select></div>`;
 function editForm(s) {
   return `<form class="form" style="margin-top:12px">
   <div class="field"><label>Value</label><input name="value" value="${esc(s.value)}" required></div>
   <div class="field"><label>Confidence</label><select name="confidence">${['High', 'Medium', 'Low'].map(c => `<option ${s.confidence === c ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
   <div class="field"><label>Source</label><input name="source" value="${esc(s.source)}"></div>
   <div class="field"><label>Note</label><input name="note" value="${esc(s.note)}"></div>
+  ${warnSelect(s.warn)}
   <div class="row"><button class="primary" type="submit">Save</button><button type="button" class="ghost" data-rm>Delete value</button></div><p class="err"></p></form>`;
 }
 function wireForm(f, save, remove) {

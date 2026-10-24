@@ -16,7 +16,7 @@ What it is for: pick the car that is on the lift.
 Who uses it: lift screen, phone, Mac.
 Main actions:
 
-- Tap a car tile. Each tile says what needs attention: a warning, values to confirm, or "All values confirmed".
+- Tap a car tile. Each tile says what needs attention: a warning, values to confirm, or "All values confirmed". The warning here is only for a **block**: an open problem such as "do not lift yet". A standing safety step (a **caution**, for example "turn off the air suspension") is not on this screen; it is on the Lift tab.
 - **Needs confirming** (with its count) opens the list of proposed values.
 - **+ Car** adds a car by make, year and model, or by VIN.
 - Visitors are hidden 30 days after the last visit. Mark a visitor Frequent to keep it.
@@ -29,7 +29,7 @@ What it is for: where to put the lift pads.
 Who uses it: lift screen, mainly.
 Main actions:
 
-- Read the chart for this car and the lift points. A warning (for example "keep pads off the battery pack") shows at the top.
+- Read the chart for this car and the lift points. A warning shows at the top, every time, in an amber box that starts with "Caution" (a standing step, for example "keep pads off the battery pack"), or in a red box that starts with "Do not lift yet" (a block, an open problem). You set the level of each value (None, Caution or Block) when you add or edit it.
 - The page of your own copy of the lift guide shows on the right, with the chart outlined, and **Use chart ...** in large text.
 - Tap the page to open it full screen: pinch to zoom, drag, double-tap, Fit page. On a Mac, **Outline this chart** draws the box once for every car on that chart.
 

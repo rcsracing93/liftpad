@@ -14,6 +14,11 @@ function score(name, q) {
 }
 const yearOk = y => Number.isInteger(y) && y >= 1885 && y <= new Date().getFullYear() + 2;
 const CONF = ['High', 'Medium', 'Low'];
+// Warning level of a value (HANDOFF 10): 0 none, 1 caution (a standing safety step, shown on the Lift tab
+// only), 2 block (an open problem: do not lift yet; shown on Home as well). Not given, '' and false are 0;
+// true is 1 (the old yes/no flag). Anything else is null = refused.
+const level = v => v === undefined || v === null || v === '' || v === false ? 0 : v === true ? 1 : [0, 1, 2].includes(Number(v)) ? Number(v) : null;
+const LEVEL_ERR = 'Warning level must be 0 (none), 1 (caution) or 2 (block)';
 const GROUPS = ['mine', 'frequent', 'visitor'];
 const HIDE_DAYS = 30, LEASE_MIN = 10, PHOTO_MAX = 8 * 1048576;
 const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
@@ -185,7 +190,7 @@ function insertValueStmts(env, x, me) {
     env.DB.prepare(`INSERT INTO vals(id, field_id, scope, make, model, year_from, year_to, vehicle_id, value, confidence, source, note, warn, status,
       entered_at, entered_by, confirmed_at, confirmed_by, updated_at) VALUES(${NEW_VAL_ID},?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .bind(x.field_id, x.scope, x.make ?? null, x.model ?? null, x.year_from ?? null, x.year_to ?? null, x.vehicle_id ?? null, x.value, x.confidence,
-        x.source || '', x.note || '', x.warn ? 1 : 0, x.status, me.now, me.device, x.status === 'confirmed' ? me.now : null, x.status === 'confirmed' ? me.device : null, me.now),
+        x.source || '', x.note || '', x.warn || 0, x.status, me.now, me.device, x.status === 'confirmed' ? me.now : null, x.status === 'confirmed' ? me.device : null, me.now),
     env.DB.prepare(`INSERT INTO history(value_id, action, new_value, new_status, new_confidence, at, device) VALUES(last_insert_rowid(), 'insert', ?, ?, ?, ?, ?)`)
       .bind(x.value, x.status, x.confidence, me.now, me.device)];
 }
@@ -194,6 +199,9 @@ async function addValue(env, v, b, me) {
   if (!name || !String(b.value || '').trim() || !CONF.includes(b.confidence)) return bad('Need tab, field, value and confidence (High, Medium or Low)');
   const f = await fieldByName(env, tab, name);
   if (!f) return bad(`Unknown field "${name}" on tab "${tab}"`);
+  const warn = level(b.warn);
+  if (warn === null) return bad(LEVEL_ERR);
+  if (warn && me.processor) return bad('The processor cannot set a warning level', 403);
   const scope = b.scope === 'car' ? 'car' : 'model';
   const yf = scope === 'model' ? parseInt(b.year_from ?? v.year, 10) : null, yt = scope === 'model' ? parseInt(b.year_to ?? v.year, 10) : null;
   if (scope === 'model' && (!yearOk(yf) || !yearOk(yt) || yf > yt)) return bad('Year range is not valid');
@@ -201,7 +209,7 @@ async function addValue(env, v, b, me) {
   const status = !me.processor && b.status === 'confirmed' ? 'confirmed' : 'proposed';
   await env.DB.batch(insertValueStmts(env, { field_id: f.id, scope, make: scope === 'model' ? v.make : null, model: scope === 'model' ? v.model : null,
     year_from: yf, year_to: yt, vehicle_id: scope === 'car' ? v.id : null, value: String(b.value).trim(), confidence: b.confidence,
-    source: b.source, note: b.note, warn: b.warn, status }, me));
+    source: b.source, note: b.note, warn, status }, me));
   return null;
 }
 // Change a value and write its history row in the same batch. The history row copies the old
@@ -341,11 +349,13 @@ export default {
       }
       if (p === '/api/vehicles' && m === 'GET') {
         // Storyboard T1: each tile has a status line - how many values there are, how many wait for a
-        // confirm, and whether a warning value (e.g. air suspension) applies.
+        // confirm, and how many block values (warn = 2, an open problem) apply. Home shows only a block;
+        // a caution (warn = 1, a standing step such as the air suspension) shows on the Lift tab (HANDOFF 10).
         const all = (await env.DB.prepare(`SELECT v.id, v.year, v.make, v.model, v.trim, v.grp, v.last_seen, strftime('%Y-%m-%dT%H:%M:%fZ', v.created) created_iso,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND ${CAR_VALS}) nvals,
           (SELECT count(*) FROM vals x WHERE x.status='proposed' AND ${CAR_VALS}) nproposed,
-          (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=1 AND ${CAR_VALS}) nwarn
+          (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=2 AND ${CAR_VALS}) nblock,
+          (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=1 AND ${CAR_VALS}) ncaution
           FROM vehicles v ORDER BY CASE v.grp WHEN 'mine' THEN 0 WHEN 'frequent' THEN 1 ELSE 2 END, v.make, v.model, v.year`).all()).results
           .map(v => ({ ...v, hidden: hidden(v, me.nowMs), mine: v.grp === 'mine' ? 1 : 0 }));
         return json(url.searchParams.get('hidden') === '1' ? all : all.filter(v => !v.hidden));
@@ -425,6 +435,10 @@ export default {
       if (mm && m === 'PATCH') {
         const b = await req.json(); const set = {};
         for (const k of ['value', 'confidence', 'source', 'note']) if (k in b) set[k] = String(b[k] ?? '').trim();
+        if ('warn' in b) {   // only Rick changes or clears a warning level
+          if (me.processor) return bad('The processor cannot change a warning level', 403);
+          const w = level(b.warn); if (w === null) return bad(LEVEL_ERR); set.warn = w;
+        }
         if (!Object.keys(set).length) return bad('Nothing to change');
         if ('value' in set && !set.value) return bad('A value cannot be empty');
         if ('confidence' in set && !CONF.includes(set.confidence)) return bad('Confidence must be High, Medium or Low');

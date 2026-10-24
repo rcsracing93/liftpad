@@ -288,6 +288,31 @@ await t('bad input refused: confidence, tab, empty value', async () => {
   ok((await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { tab: 'paint', field: 'x', value: 'y', confidence: 'Low' } })).s === 400, 'bad tab accepted');
   ok((await call(`/api/values/${valId}`, { method: 'PATCH', body: { value: '' } })).s === 400, 'empty value accepted');
 });
+// ---------- warning levels (HANDOFF 10): 0 none, 1 caution (Lift tab only), 2 block (Home too) ----------
+await t('warning levels: set on create and by edit, counted on the car list (nblock, ncaution), dated in the history; bad levels and the processor refused', async () => {
+  const counts = async () => { const c = (await call('/api/vehicles')).d.find(x => x.id === car); return [c.nblock, c.ncaution]; };
+  const [b0, c0] = await counts(); ok(b0 === 0 && c0 === 0, `a fresh car has nblock ${b0}, ncaution ${c0}`);
+  const mk = { tab: 'lift', field: 'Air suspension', value: 'selftest warn step', confidence: 'Low', source: 'selftest' };
+  const r = await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { ...mk, warn: 1 } }); ok(r.s === 201, 'create ' + r.s + ' ' + JSON.stringify(r.d));
+  const v = r.d.values.find(x => x.value === mk.value); ok(v && v.warn === 1, 'created with ' + JSON.stringify(v)); const id = v.id; cleanup.push(['val', id]);
+  let [b, c] = await counts(); ok(b === 0 && c === 1, `caution: nblock ${b}, ncaution ${c}`);
+  ok((await call(`/api/values/${id}`, { method: 'PATCH', body: { warn: 2 } })).s === 200, 'patch to block');
+  [b, c] = await counts(); ok(b === 1 && c === 0, `block: nblock ${b}, ncaution ${c}`);
+  let h = (await call(`/api/values/${id}/history`)).d, l = h[h.length - 1]; ok(l.action === 'update' && l.old_value === l.new_value && l.device === 'selftest', 'level change is not dated: ' + JSON.stringify(l));
+  const refused = [];
+  for (const w of [3, -1, 'x', 1.5]) { const s = (await call(`/api/values/${id}`, { method: 'PATCH', body: { warn: w } })).s; if (s !== 400) refused.push(`patch ${w}: ${s}`); }
+  { const s = (await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { ...mk, value: 'selftest warn bad', warn: 5 } })).s; if (s !== 400) refused.push(`create 5: ${s}`); }
+  if (hasProc) {
+    const p1 = (await call(`/api/values/${id}`, { as: 'proc', method: 'PATCH', body: { warn: 0 } })).s; if (p1 !== 403) refused.push(`processor clears a block: ${p1}`);
+    const p2 = (await call(`/api/vehicles/${car}/values`, { as: 'proc', method: 'POST', body: { ...mk, value: 'selftest warn proc', warn: 1 } })).s; if (p2 !== 403) refused.push(`processor sets a level: ${p2}`);
+  }
+  ok(!refused.length, 'not refused: ' + refused.join('; '));
+  [b, c] = await counts(); ok(b === 1 && c === 0, `after the refusals: nblock ${b}, ncaution ${c}`);
+  ok((await call(`/api/values/${id}`, { method: 'PATCH', body: { warn: 0 } })).s === 200, 'patch to none');
+  [b, c] = await counts(); ok(b === 0 && c === 0, `none: nblock ${b}, ncaution ${c}`);
+  ok((await call(`/api/values/${id}`, { method: 'DELETE' })).s === 200, 'delete the test value');
+  return 'create 1, to 2, to 0; counts; 4 bad levels and 1 bad create refused' + (hasProc ? '; processor refused twice' : '');
+});
 await t('reject: hidden from the car, kept with history', async () => {
   const r = await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { tab: 'torque', field: 'Socket', value: '99 mm', confidence: 'Low', source: 'selftest' } });
   val2 = r.d.values.find(x => x.field === 'Socket' && x.source === 'selftest').id; cleanup.push(['val', val2]);
