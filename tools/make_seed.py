@@ -1,7 +1,7 @@
 """Build the LiftPad seed files.
 
 Run:     python3 tools/make_seed.py PRIVATE_DIR
-Reads:   PRIVATE_DIR/ali-index.csv, PRIVATE_DIR/classics.csv, PRIVATE_DIR/my-cars.csv,
+Reads:   PRIVATE_DIR/ali-index.csv (2019), PRIVATE_DIR/ali-index-2026.csv (2026), PRIVATE_DIR/classics.csv, PRIVATE_DIR/my-cars.csv,
          PRIVATE_DIR/apps.csv (each is optional; a missing file is skipped and reported)
 Writes:  db/seed-public.sql        makes list + 1 sample app + 2 example cars. Safe for git. Example cars must
                                    not look like a lift-guide chart code (two letters, dash, digit).
@@ -19,6 +19,7 @@ DB = os.path.join(HERE, '..', 'db')
 q = lambda v: 'NULL' if v is None or v == '' else (str(v) if isinstance(v, int) else "'" + str(v).replace("'", "''") + "'")
 MAKEMAP = {"Chevrolet Trucks": "Chevrolet", "Ford Trucks": "Ford", "GMC Trucks": "GMC", "Nissan/Datsun": "Nissan",
            "Mercedes Benz": "Mercedes-Benz", "Dodge/Ram Trucks": "Dodge"}
+ALI_INDEX_FILES = [('ali-index.csv', '2019'), ('ali-index-2026.csv', '2026')]   # file, edition of its rows
 EXTRA_MAKES = ['Tesla', 'Rivian', 'Lucid', 'Polestar', 'Alfa Romeo', 'Maserati', 'Ferrari', 'Lamborghini', 'McLaren',
                'Bentley', 'Rolls-Royce', 'Aston Martin', 'Lotus', 'Fisker', 'Factory Five']
 # Tabs and fields added after migration 0002, as data (Handoff 3 decision 7: the Oil tab is new
@@ -103,16 +104,18 @@ def load(priv):
             makes[n] = {'aliases': alias, 'nhtsa_name': nh or n}
 
     guide = []
-    for r in read_csv(os.path.join(priv, 'ali-index.csv')):
-        mk = MAKEMAP.get(r['make'], r['make'])
-        rows = [mk]
-        if r['make'] == 'Dodge/Ram Trucks' and r['model'].startswith('Ram') and int(r['year_to']) >= 2011:
-            rows.append('Ram')
-        for m in rows:
-            addmake(m)
-            guide.append({'make': m, 'model': r['model'], 'year_from': int(r['year_from']), 'year_to': int(r['year_to']), 'chart': r['chart'],
-                          'guide_page': int(r['guide_page']), 'pdf_page': int(r['pdf_page']) if r['pdf_page'] else None,
-                          'status': r['status'], 'note': r['note'], 'edition': r.get('edition') or '2019'})
+    # One index file per ALI edition; a row's edition column (if any) wins over the file's default.
+    for fname, default_ed in ALI_INDEX_FILES:
+        for r in read_csv(os.path.join(priv, fname)):
+            mk = MAKEMAP.get(r['make'], r['make'])
+            rows = [mk]
+            if r['make'] == 'Dodge/Ram Trucks' and r['model'].startswith('Ram') and int(r['year_to']) >= 2011:
+                rows.append('Ram')
+            for m in rows:
+                addmake(m)
+                guide.append({'make': m, 'model': r['model'], 'year_from': int(r['year_from']), 'year_to': int(r['year_to']), 'chart': r['chart'],
+                              'guide_page': int(r['guide_page']), 'pdf_page': int(r['pdf_page']) if r['pdf_page'] else None,
+                              'status': r['status'], 'note': r['note'], 'edition': r.get('edition') or default_ed})
     classics = []
     for r in read_csv(os.path.join(priv, 'classics.csv')):
         if r['note']:

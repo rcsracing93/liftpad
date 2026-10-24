@@ -88,14 +88,15 @@ async function models(env, make, year, q, withNhtsa) {
     .map(({ s, ...o }) => o);
 }
 // The chart nearest to the car's year; on a tie the newest edition wins (decision 3: older editions
-// stay as fallback). img: the page image route when the page is in ali_pages (w, h in pixels).
+// stay as fallback). Make and model match without regard to case (HANDOFF 9: the guides spell some
+// names differently, for example CT200H in 2019 and CT200h in 2026; NOCASE folds ASCII letters only). img: the page image route when the page is in ali_pages (w, h in pixels).
 const pageKey = (edition, pdf) => `ali/${edition}/p${String(pdf).padStart(3, '0')}.jpg`;
 async function nearestChart(env, make, model, year) {
   const { results } = await env.DB.prepare(`SELECT a.chart, a.guide_page, a.pdf_page, a.status, a.year_from, a.year_to, a.edition, p.w, p.h,
     b.x bx, b.y by, b.w bw, b.h bh
     FROM ali_index a LEFT JOIN ali_pages p ON p.edition = a.edition AND p.pdf_page = a.pdf_page AND p.status = 'ok'
     LEFT JOIN ali_chart_boxes b ON b.edition = a.edition AND b.chart = a.chart AND b.pdf_page = a.pdf_page
-    WHERE a.make=? AND a.model=? ORDER BY a.edition DESC, a.id`).bind(make, model).all();
+    WHERE a.make = ? COLLATE NOCASE AND a.model = ? COLLATE NOCASE ORDER BY a.edition DESC, a.id`).bind(make, model).all();
   let best = null;
   for (const r of results) { const d = year < r.year_from ? r.year_from - year : year > r.year_to ? year - r.year_to : 0; if (!best || d < best.d) best = { ...r, d }; }
   if (!best) return null;

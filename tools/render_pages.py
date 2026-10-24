@@ -52,7 +52,9 @@ def page_count(pdf):
 def guide_pages(index_csv, edition):
     """(pdf page -> guide page, sorted guide pages that are missing from the scan)."""
     with open(index_csv, encoding='utf-8', newline='') as f:
-        rows = [r for r in csv.DictReader(f) if (r.get('edition') or '2019') == edition]
+        # A CSV without an edition column holds one edition: the one named on the command line
+        # (ali-index-2026.csv has no such column; ali-index.csv rows default to 2019).
+        rows = [r for r in csv.DictReader(f) if (r.get('edition') or edition) == edition]
     per_pdf = defaultdict(Counter)
     status = defaultdict(set)
     for r in rows:

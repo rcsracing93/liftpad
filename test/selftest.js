@@ -150,6 +150,26 @@ if (okPages.length) {
     }
     return `${n} car(s) checked`;
   });
+  // HANDOFF 9: the guides spell some names in another case (CT200H in 2019, CT200h in 2026), so the chart
+  // lookup ignores case. Two temp visitor cars (UPPER and lower case model) must get the same chart as a
+  // car that has one. Each temp car is deleted again, also when a check fails.
+  await t('chart lookup ignores case: the model in UPPER or lower case gets the same chart', async () => {
+    let src = null;
+    for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && v.ali.d === 0) { src = v; break; } }
+    ok(src, 'no car with a chart to copy');
+    let id = null; const bad2 = [];
+    try {
+      for (const model of [src.model.toUpperCase(), src.model.toLowerCase()]) {
+        const r = await call('/api/vehicles', { method: 'POST', body: { year: src.year, make: src.make, model, trim: 'SELFTEST CASE', grp: 'visitor' } });
+        if (r.s !== 201) { bad2.push(`${model}: create ${r.s}`); continue; }
+        id = r.d.id; const a = r.d.ali, w = src.ali;
+        if (!a || a.chart !== w.chart || a.edition !== w.edition || a.pdf_page !== w.pdf_page) bad2.push(`${model}: ${JSON.stringify(a)}, wanted ${w.edition} ${w.chart} p${w.pdf_page}`);
+        const d = await call('/api/vehicles/' + id, { method: 'DELETE' }); if (d.s !== 200) bad2.push(`${model}: delete ${d.s}`); else id = null;
+      }
+    } finally { if (id) { try { await call('/api/vehicles/' + id, { method: 'DELETE' }); } catch (e) { bad2.push('cleanup: ' + e.message); } } }
+    ok(!bad2.length, bad2.join('; '));
+    return `${src.make} ${src.model} ${src.year}: ${src.ali.edition} ${src.ali.chart}`;
+  });
   // Chart boxes (decision 6). A box Rick drew is never changed: the write checks run only on a
   // chart with no box, and remove their box again.
   let boxCar = null;
@@ -174,7 +194,7 @@ if (okPages.length) {
     ok(out === 400 && none === 404 && proc === 403, `outside the page ${out}, unknown chart ${none}, processor ${proc}`);
   });
 } else ['every listed page image is in R2 with the listed size (HEAD)', 'a page image is a JPEG with a private cache header and the listed size', 'a car with a chart page gets its image address, newest edition first',
-  'chart box: drawn once, shown on the car, cleared again', 'a bad chart box is refused; the processor cannot draw one'].forEach(n => skip(n, 'no page images in ali_pages'));
+  'chart lookup ignores case: the model in UPPER or lower case gets the same chart', 'chart box: drawn once, shown on the car, cleared again', 'a bad chart box is refused; the processor cannot draw one'].forEach(n => skip(n, 'no page images in ali_pages'));
 await t('a bad page address is refused, a missing page is 404', async () => {
   const a = await fetch(BASE + '/api/ali/2019/p1.jpg', { headers: hdr('tool') }); const b = await fetch(BASE + '/api/ali/2019/p999.jpg', { headers: hdr('tool') });
   ok(a.status === 400 && b.status === 404, `p1.jpg ${a.status}, p999.jpg ${b.status}`);
