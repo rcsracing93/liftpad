@@ -90,5 +90,5 @@ sh tools/d1_load.sh "$SEED"
 step "D deploy"
 # The Access values go in as Worker variables, never into git. Lines naming them are not shown.
 npx wrangler deploy --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
-  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
+  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
 echo; echo "DEPLOY DONE"

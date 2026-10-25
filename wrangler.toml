@@ -29,3 +29,5 @@ bucket_name = "liftpad-private"
 
 [vars]
 NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
+# Research job by itself when Rick adds a car or changes a trim: "1" = on. Default off; tools/deploy.sh sets it from deploy.env.
+LP_AUTO_RESEARCH = "0"

@@ -150,7 +150,7 @@ function add() {
   const show = async () => {
     const R = $('#res');
     if (!st.make || !st.year || !st.model) { R.innerHTML = `<h2>${esc([st.year || '', st.make].join(' ').trim() || 'Pick a car')}</h2><p class="note">${st.make ? (st.year ? 'Pick a model.' : 'Type the 4-digit year.') : 'Type a make.'}</p>`; return; }
-    R.innerHTML = `<h2>${st.year} ${esc(st.make)} ${esc(st.model)}</h2><p class="note">${st.chartNote || ''}</p><button class="primary" id="save">Save car</button><p class="err" id="saveerr"></p>`;
+    R.innerHTML = `<h2>${st.year} ${esc(st.make)} ${esc(st.model)}</h2><p class="note">${esc(st.chartNote || '')}</p><button class="primary" id="save">Save car</button><p class="err" id="saveerr"></p>`;
     $('#save').onclick = async () => {
       try { const v = await api('/vehicles', { method: 'POST', body: { ...st, trim: $('#trim').value.trim(), grp: $('#grp [aria-pressed="true"]').dataset.grp } }); location.hash = '#/car/' + v.id; }
       catch (e) { $('#saveerr').textContent = e.message; }
@@ -191,7 +191,12 @@ const VERIFIED = { no: 'Not checked - read the page.', ai: 'AI-checked - the pag
 const FOOT_FALLBACK = 'The chart gives no pad height. Check that the pads reach the lift points and the arms clear the car.';
 const adaptersBlock = (n, foot) => {
   const lv = n && VERIFIED[n.verified] ? n.verified : 'no', stop = !!n && /^Do not use a 2-post/.test(n.kit_mark || '');
-  const lead = `<div class="vlabel"><b>${VERIFIED[lv]}</b></div>`;
+  // HANDOFF 13: "I checked this chart" until Rick has checked it; "Undo" while the check holds (it falls back by itself
+  // when the chart text changes). Who and when come from chart_checks.
+  const byBtn = !!n && lv === 'rick' && !!n.verified_by;
+  const act = !n ? '' : lv !== 'rick' ? `<button class="primary chartcheck" data-act="check" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">I checked this chart</button>`
+    : byBtn ? `<button class="chartcheck" data-act="undo" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">Undo</button>` : '';
+  const lead = `<div class="vlabel"><b>${VERIFIED[lv]}</b>${byBtn ? ` <span class="note">${esc(String(n.verified_at || '').slice(0, 10))}</span>` : ''} ${act}<span class="err chartcheckerr"></span></div>`;
   const end = `<div class="adfoot">${esc(foot || FOOT_FALLBACK)}</div>`;
   if (!n) return { stop: false, html: `<div class="adapters unchecked" data-verified="no">${lead}<div>LiftPad has no adapter notes for this chart.</div>${end}</div>` };
   return { stop, html: `<div class="adapters${lv === 'no' ? ' unchecked' : ''}${stop ? ' stop' : ''}" data-verified="${lv}" data-kit="${stop ? 'stop' : 'note'}">
@@ -277,6 +282,9 @@ async function car(id) {
   </section>
   <div class="row"><button id="research">Research missing values</button>${jobLine}</div>
   <div class="row">${Object.keys(GROUP).filter(g => g !== v.grp).map(g => `<button class="ghost" data-g="${g}">Move to ${GROUP[g]}</button>`).join('')}</div>
+  <div class="card" id="trimbox"><div><span class="lbl">Trim</span> <span class="val" id="trimnow">${esc(v.trim || 'none')}</span></div>
+    <div class="row"><input id="trimin" maxlength="60" autocomplete="off" placeholder="for example SE or Limited" aria-label="Trim" value="${esc(v.trim || '')}"><button id="trimsave">Save trim</button></div>
+    <p class="note">The trim goes into the research request. A change is logged with its date.</p><p class="err" id="trimerr"></p></div>
   <div class="card" id="vinbox"><div><span class="lbl">VIN</span> <span class="val" id="vinnow">${esc(v.vin || 'none')}</span></div>
     <div class="row"><input id="vinin" maxlength="17" autocomplete="off" placeholder="17 characters" aria-label="VIN" style="font-family:var(--mono)" value="${esc(v.vin || '')}"><button id="vinsave">Save VIN</button>${scanButton('vinscan')}</div>
     <p class="note">The VIN stays on this car and goes only to NHTSA, to decode the engine and the EV flag.</p><p class="err" id="vinerr"></p></div>
@@ -286,7 +294,7 @@ async function car(id) {
   document.querySelectorAll('[data-h]').forEach(b => b.onclick = async () => {
     const box = b.closest('dd').querySelector('.hist');
     const h = await api(`/values/${b.dataset.h}/history`);
-    box.innerHTML = `<ol class="src">${h.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${r.action}${r.old_value != null && r.old_value !== r.new_value ? ` · "${esc(r.old_value)}" → "${esc(r.new_value ?? '')}"` : r.new_value != null ? ` · "${esc(r.new_value)}"` : ''}${r.old_status !== r.new_status ? ` · ${esc(r.old_status ?? '')} → ${esc(r.new_status ?? '')}` : ''}</li>`).join('')}</ol>`;
+    box.innerHTML = `<ol class="src">${h.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${esc(r.action)}${r.old_value != null && r.old_value !== r.new_value ? ` · "${esc(r.old_value)}" → "${esc(r.new_value ?? '')}"` : r.new_value != null ? ` · "${esc(r.new_value)}"` : ''}${r.old_status !== r.new_status ? ` · ${esc(r.old_status ?? '')} → ${esc(r.new_status ?? '')}` : ''}</li>`).join('')}</ol>`;
   });
   wireValueInputs($('#addspec form'));
   document.querySelectorAll('.links a[data-src]').forEach(a => a.addEventListener('click', () => {
@@ -299,7 +307,10 @@ async function car(id) {
     const s = v.values.find(x => x.id == b.dataset.e); const dd = b.closest('dd'); dd.innerHTML = editForm(s);
     wireForm(dd.querySelector('form'), body => api('/values/' + s.id, { method: 'PATCH', body }).then(() => car(id)), () => api('/values/' + s.id, { method: 'DELETE' }).then(() => car(id)));
   });
-  $('#vinsave').onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value } }).then(() => car(id)).catch(e => { $('#vinerr').textContent = e.message; });
+  document.querySelectorAll('.chartcheck').forEach(b => b.onclick = () => api('/chart-checks', { method: 'POST', body: { edition: b.dataset.ed, chart: b.dataset.chart, action: b.dataset.act } })
+    .then(() => car(id)).catch(e => { b.parentElement.querySelector('.chartcheckerr').textContent = e.message; }));
+  $('#trimsave').onclick =() => api('/vehicles/' + id, { method: 'PATCH', body: { trim: $('#trimin').value } }).then(() => car(id)).catch(e => { $('#trimerr').textContent = e.message; });
+  $('#vinsave').onclick =() => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value } }).then(() => car(id)).catch(e => { $('#vinerr').textContent = e.message; });
   wireScan('vinscan', vin => { $('#vinin').value = vin; $('#vinerr').textContent = 'VIN read from the photo - check it, then Save VIN.'; }, m => { $('#vinerr').textContent = m; });
   document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => car(id)).catch(fail));
   $('#research').onclick = () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => car(id)).catch(e => { $('#delmsg').textContent = e.message; });

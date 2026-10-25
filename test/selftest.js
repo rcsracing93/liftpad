@@ -375,6 +375,84 @@ await t('VIN: a bad VIN is refused, a good one is saved; the processor never see
   if (hasProc) { const pv = (await call(`/api/vehicles/${car}?peek=1`, { as: 'proc' })).d; ok(pv && !('vin' in pv), 'the processor got the VIN'); }
   ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { vin: '' } })).s === 200, 'clear');
 });
+// HANDOFF 13: Rick edits the trim; the change is logged with its date; the processor can neither change it nor read the log.
+await t('trim edit: saved, logged, same value is no change, too long refused; the processor gets 403 and no notes', async () => {
+  const r1 = await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { trim: '  SELFTEST EDIT  ' } }); ok(r1.s === 200 && r1.d.trim === 'SELFTEST EDIT' && r1.d.changed === true, JSON.stringify(r1.d));
+  const v = (await call(`/api/vehicles/${car}?peek=1`)).d; ok(v.trim === 'SELFTEST EDIT', 'trim not saved: ' + v.trim);
+  ok(/^\d{4}-\d\d-\d\d trim ".*" -> "SELFTEST EDIT"/m.test(v.notes || ''), 'no dated log line: ' + JSON.stringify(v.notes));
+  const r2 = await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { trim: 'SELFTEST EDIT' } }); ok(r2.s === 200 && r2.d.changed === false, 'same trim made a change');
+  ok(((await call(`/api/vehicles/${car}?peek=1`)).d.notes || '').split('\n').length === (v.notes || '').split('\n').length, 'same trim added a log line');
+  ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { trim: 'x'.repeat(61) } })).s === 400, 'a 61-character trim was accepted');
+  if (hasProc) {
+    ok((await call(`/api/vehicles/${car}`, { as: 'proc', method: 'PATCH', body: { trim: 'PROC' } })).s === 403, 'the processor changed the trim');
+    const pv = (await call(`/api/vehicles/${car}?peek=1`, { as: 'proc' })).d; ok(pv && !('notes' in pv), 'the processor got the notes');
+  }
+  ok((await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { trim: 'SELFTEST' } })).s === 200, 'restore');
+});
+// HANDOFF 13: a car that Rick adds, or whose trim he changes, gets a research job by itself (his own login: a phone here). The self-test
+// token never does (its test cars would cost real research); an open job for the model stops a second one. Local run only.
+// The switch (Worker variable LP_AUTO_RESEARCH, default OFF) is reported by /api/health. Live must stay 0 until Rick turns it on.
+await t('auto research switch: /api/health reports it as 0 or 1', async () => { ok(health.auto_research === 0 || health.auto_research === 1, 'auto_research: ' + JSON.stringify(health.auto_research)); return 'auto_research ' + health.auto_research; });
+if (LOCAL && hasProc && health.auto_research === 0) await t('auto research OFF (the default): Rick adds a car and changes its trim -> no job', async () => {
+  const bad2 = [], ids = [];
+  try {
+    const a = await call('/api/vehicles', { as: 'phone', method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet Off', trim: 'SELFTEST OFF', grp: 'visitor' } }); ids.push(a.d.id);
+    if (!(a.s === 201 && a.d.jobs.length === 0)) bad2.push('a job was made with the switch off: ' + JSON.stringify(a.d.jobs));
+    const t1 = await call(`/api/vehicles/${a.d.id}`, { as: 'phone', method: 'PATCH', body: { trim: 'SELFTEST OFF 2' } });
+    if (!(t1.s === 200 && t1.d.changed === true && t1.d.research_job === null)) bad2.push('a trim change made a job: ' + JSON.stringify(t1.d));
+  } finally { for (const id of ids) { const d = await call('/api/vehicles/' + id, { method: 'DELETE' }); if (d.s !== 200) bad2.push('cleanup ' + d.s); } }
+  ok(!bad2.length, bad2.join('; '));
+});
+if (LOCAL && hasProc && health.auto_research === 1) await t('auto research ON: Rick adds a car or changes its trim -> one research job; the tool token -> none; no duplicate', async () => {
+  const bad2 = [], ids = [], mk = trim => ({ year: 1973, make: 'AMC', model: 'Hornet Auto', trim, grp: 'visitor' });
+  const jobsOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d.jobs;
+  try {
+    const a = await call('/api/vehicles', { as: 'phone', method: 'POST', body: mk('SELFTEST AUTO') }); ids.push(a.d.id);
+    if (!(a.s === 201 && a.d.jobs.length === 1 && a.d.jobs[0].kind === 'research' && a.d.jobs[0].status === 'queued')) bad2.push('Rick adds a car: ' + a.s + ' ' + JSON.stringify(a.d.jobs));
+    const t1 = await call(`/api/vehicles/${a.d.id}`, { as: 'phone', method: 'PATCH', body: { trim: 'SELFTEST AUTO 2' } });
+    if (!(t1.s === 200 && t1.d.changed === true && t1.d.research_job === null)) bad2.push('open job, trim change made a second job: ' + JSON.stringify(t1.d));
+    if ((await jobsOf(a.d.id)).length !== 1) bad2.push('job count after the trim change: ' + (await jobsOf(a.d.id)).length);
+    const b = await call('/api/vehicles', { method: 'POST', body: { ...mk('SELFTEST AUTO TOOL'), model: 'Hornet Tool' } }); ids.push(b.d.id);
+    if (!(b.s === 201 && b.d.jobs.length === 0)) bad2.push('the tool token got a job: ' + JSON.stringify(b.d.jobs));
+    const t2 = await call(`/api/vehicles/${b.d.id}`, { as: 'phone', method: 'PATCH', body: { trim: 'SELFTEST AUTO TOOL 2' } });
+    if (!(t2.s === 200 && Number.isInteger(t2.d.research_job))) bad2.push('Rick changes the trim, no open job: ' + JSON.stringify(t2.d));
+    const t3 = await call(`/api/vehicles/${b.d.id}`, { as: 'phone', method: 'PATCH', body: { trim: 'SELFTEST AUTO TOOL 2' } });
+    if (!(t3.s === 200 && t3.d.changed === false && t3.d.research_job === undefined)) bad2.push('same trim made a job: ' + JSON.stringify(t3.d));
+    const tj = await call(`/api/vehicles/${b.d.id}`, { method: 'PATCH', body: { trim: 'SELFTEST AUTO TOOL 3' } });
+    if (!(tj.s === 200 && tj.d.research_job === null)) bad2.push('tool token trim change made a job: ' + JSON.stringify(tj.d));
+  } finally {
+    for (const id of ids) {
+      for (const j of await jobsOf(id).catch(() => [])) { await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j.id } }); await call(`/api/jobs/${j.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } }); }
+      const d = await call('/api/vehicles/' + id, { method: 'DELETE' }); if (d.s !== 200) bad2.push('cleanup ' + d.s);
+    }
+  }
+  ok(!bad2.length, bad2.join('; '));
+});
+// HANDOFF 13: "I checked this chart" and "Undo". Rick's login (a phone here) can do it; the tool token only on the temp edition
+// 'selftest'; the processor never. The temp row is made and removed by the endpoint itself.
+if (health.schema >= '0008') {
+  const CK = { edition: 'selftest', chart: 'selftest-a' }, ck = (action, o = {}) => call('/api/chart-checks', { method: 'POST', body: { ...CK, action }, ...o });
+  await t('chart check: check, undo, who and when; refused for others', async () => {
+    const bad2 = [];
+    try {
+      const a = await ck('check'); if (!(a.s === 200 && a.d.chart_notes.verified === 'rick' && a.d.chart_notes.verified_by && a.d.chart_notes.verified_at && a.d.history.length === 1)) bad2.push('check: ' + a.s + ' ' + JSON.stringify(a.d));
+      const a2 = await ck('check'); if (!(a2.s === 200 && a2.d.changed === false)) bad2.push('second check: ' + JSON.stringify(a2.d));
+      const u = await ck('undo'); if (!(u.s === 200 && u.d.chart_notes.verified === 'no' && u.d.chart_notes.verified_by === null && u.d.history.map(h => h.action).join() === 'check,undo')) bad2.push('undo: ' + u.s + ' ' + JSON.stringify(u.d));
+      const u2 = await ck('undo'); if (u2.s !== 409) bad2.push('second undo: ' + u2.s);
+      if (hasProc) { const p = await ck('check', { as: 'proc' }); if (p.s !== 403) bad2.push('processor: ' + p.s); }
+      const real = await call('/api/chart-checks', { method: 'POST', body: { edition: '2026', chart: 'any-chart', action: 'check' } }); if (real.s !== 403) bad2.push('tool token on a real chart: ' + real.s);
+      if (LOCAL) {
+        // Rick's own login (a phone here): who is his email; a changed text makes the label fall back by itself; history is kept.
+        const ph = await ck('check', { as: 'phone' }); if (!(ph.s === 200 && ph.d.chart_notes.verified === 'rick' && ph.d.chart_notes.verified_by === 'owner@example.com')) bad2.push('phone check: ' + ph.s + ' ' + JSON.stringify(ph.d));
+        const ed = await ck('selftest_edit', { body: { ...CK, action: 'selftest_edit', adapters: 'selftest text changed' } }); if (!(ed.s === 200 && ed.d.chart_notes.verified === 'no')) bad2.push('text change did not drop the label: ' + ed.s + ' ' + JSON.stringify(ed.d));
+        const ph2 = await ck('check', { as: 'phone' }); if (!(ph2.s === 200 && ph2.d.chart_notes.verified === 'rick' && ph2.d.history.length === 4)) bad2.push('check after the change: ' + ph2.s + ' ' + JSON.stringify(ph2.d));
+        const pu = await ck('undo', { as: 'phone' }); if (!(pu.s === 200 && pu.d.chart_notes.verified === 'no' && pu.d.history.map(h => h.action).join() === 'check,undo,check,check,undo')) bad2.push('phone undo: ' + pu.s + ' ' + JSON.stringify(pu.d.history));
+        const pe = await ck('selftest_edit', { as: 'phone', body: { ...CK, action: 'selftest_edit', adapters: 'x' } }); if (pe.s !== 403) bad2.push('phone ran a self-test action: ' + pe.s);
+      }
+    } finally { const c = await ck('cleanup'); if (c.s !== 200) bad2.push('cleanup ' + c.s); }
+    ok(!bad2.length, bad2.join('; '));
+  });
+} else skip('chart check: check, undo, who and when; refused for others', 'schema before 0008');
 // Decision 9: the make's typical value and the thread range; a torque outside the range is flagged.
 if (health.defaults > 0 && health.ranges > 0) {
   await t('the car gets the typical value for its make and the range for that thread', async () => {
@@ -416,6 +494,11 @@ if (hasProc) {
   await t('lease expiry: after 10 minutes (test clock) the job is claimed again', async () => {
     const { d } = await call('/api/jobs/claim', { as: 'proc', now: plus(11 * MIN), method: 'POST', body: { only_id: job } }); ok(d.id === job && d.attempts === 2 && d.lease_until > lease, JSON.stringify(d));
   });
+  await t('lease renew (HANDOFF 13): extends a valid lease, refused after expiry, refused for the self-test tool', async () => {
+    const r1 = await call(`/api/jobs/${job}/renew`, { as: 'proc', now: plus(15 * MIN), method: 'POST', body: {} }); ok(r1.s === 200 && r1.d.lease_until > plus(24 * MIN), JSON.stringify(r1.d));
+    const r2 = await call(`/api/jobs/${job}/renew`, { as: 'proc', now: plus(60 * MIN), method: 'POST', body: {} }); ok(r2.s === 409, 'expired lease renewed: ' + r2.s);
+    const r3 = await call(`/api/jobs/${job}/renew`, { method: 'POST', body: {} }); ok(r3.s === 403, 'tool token renewed: ' + r3.s);
+  });
   await t('result: values come back proposed, with history, job done', async () => {
     const r = await call(`/api/jobs/${job}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'tires', field: 'Size', value: 'E78-14 (selftest)', confidence: 'Low', source: 'selftest research' }] } });
     ok(r.s === 200 && r.d.proposed === 1, 'result ' + r.s + ' ' + JSON.stringify(r.d));
@@ -431,8 +514,29 @@ if (hasProc) {
     ok((await call(`/api/jobs/${job2}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest' } })).s === 200, 'fail');
     ok((await call(`/api/vehicles/${car}?peek=1`)).d.jobs.find(j => j.id === job2)?.status === 'failed', 'not failed');
   });
+  // HANDOFF 13 (Rick): the server refuses High on a safety field from the processor unless the source cites a page ("p.").
+  await t('result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise', async () => {
+    const job3 = (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } })).d.id;
+    ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: job3 } })).d.id === job3, 'claim');
+    const mk = (conf, source) => ({ values: [{ tab: 'torque', field: 'Torque', value: '75 ft-lb (102 Nm)', confidence: conf, source }] });
+    const bad1 = await call(`/api/jobs/${job3}/result`, { as: 'proc', method: 'POST', body: mk('High', 'selftest research, no page') });
+    ok(bad1.s === 400 && /page/.test(bad1.d.error || ''), 'High without a page: ' + bad1.s + ' ' + JSON.stringify(bad1.d));
+    ok(!(await call(`/api/vehicles/${car}?peek=1`)).d.values.some(y => y.source === 'selftest research, no page'), 'a value was stored by the refused result');
+    const web = await call(`/api/jobs/${job3}/result`, { as: 'proc', method: 'POST', body: mk('High', 'https://example.com/p.html') });
+    ok(web.s === 400, 'High with a URL that only looks like a page: ' + web.s);
+    const low = await call(`/api/jobs/${job3}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Socket', value: '19 mm (selftest)', confidence: 'High', source: 'selftest research, no page' }] } });
+    ok(low.s === 200, 'High on a field that is not a safety field: ' + low.s + ' ' + JSON.stringify(low.d));
+    const j4 = (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } })).d.id;
+    ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j4 } })).d.id === j4, 'claim 4');
+    const good = await call(`/api/jobs/${j4}/result`, { as: 'proc', method: 'POST', body: mk('High', 'Owner manual p.7-16 (selftest)') });
+    ok(good.s === 200 && good.d.proposed === 1, 'High with a page: ' + good.s + ' ' + JSON.stringify(good.d));
+    const v = (await call(`/api/vehicles/${car}?peek=1`)).d.values;
+    for (const y of v.filter(z => /selftest/.test(z.source || '') && z.entered_by === 'processor' && !cleanup.some(c => c[1] === z.id))) cleanup.push(['val', y.id]);
+  });
 } else ['claim: 10-minute lease, request is private', 'a claimed job is not handed out again while its lease runs', 'lease expiry: after 10 minutes (test clock) the job is claimed again',
-  'result: values come back proposed, with history, job done', 'a result for a job that is not claimed is refused', 'fail: a claimed job can be marked failed'].forEach(n => skip(n, 'no processor token given'));
+  'lease renew (HANDOFF 13): extends a valid lease, refused after expiry, refused for the self-test tool',
+  'result: values come back proposed, with history, job done', 'a result for a job that is not claimed is refused', 'fail: a claimed job can be marked failed',
+  'result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise'].forEach(n => skip(n, 'no processor token given'));
 
 // ---------- groups and visitor hiding (decisions 4, 5) ----------
 await t('opening a car sets last_seen; a visitor hides after 30 days (test clock)', async () => {

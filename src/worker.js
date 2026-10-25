@@ -165,8 +165,53 @@ async function vehicleRow(env, id) {
   return env.DB.prepare("SELECT *, strftime('%Y-%m-%dT%H:%M:%fZ', created) created_iso FROM vehicles WHERE id=?").bind(id).first();
 }
 // HANDOFF 12: the adapter notes of one chart, read only (rows come from the import). null = no row for the chart.
+// HANDOFF 13: the label "Checked by Rick" comes from chart_checks (append-only), not from the CSV level. It holds only while the
+// latest row for the chart is a check AND its hash equals the hash of the text now. Else the level is chart_notes.verified (no or ai).
+// A database before migration 0008 has no chart_checks table: the level is the column.
+async function textHash(n) {
+  const s = [n.adapters, n.height_note, n.cautions, n.kit_mark].map(x => x == null ? '' : String(x)).join('\u001f');
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+async function latestCheck(env, edition, chart) {
+  try { return await env.DB.prepare('SELECT action, text_hash, who, at FROM chart_checks WHERE edition = ? AND chart = ? ORDER BY id DESC LIMIT 1').bind(edition, chart).first() || null; }
+  catch (e) { return null; }
+}
 async function chartNotes(env, edition, chart) {
-  return await env.DB.prepare('SELECT adapters, height_note, cautions, kit_mark, verified FROM chart_notes WHERE edition = ? AND chart = ?').bind(edition, chart).first() || null;
+  const n = await env.DB.prepare('SELECT edition, chart, adapters, height_note, cautions, kit_mark, verified FROM chart_notes WHERE edition = ? AND chart = ?').bind(edition, chart).first();
+  if (!n) return null;
+  n.verified = n.verified === 'ai' ? 'ai' : 'no';
+  n.verified_by = null; n.verified_at = null;
+  if (edition === 'all') return n;   // the fixed line under every block is never checked
+  const k = await latestCheck(env, edition, chart);
+  if (k && k.action === 'check' && k.text_hash === await textHash(n)) { n.verified = 'rick'; n.verified_by = k.who; n.verified_at = k.at; }
+  return n;
+}
+// action: check / undo add one row to chart_checks (nothing is changed or deleted). The self-test tool may also use
+// selftest_edit (change the text of its temp chart) and cleanup (remove its temp edition 'selftest' only).
+async function chartCheck(env, b, me) {
+  const edition = String(b.edition || ''), chart = String(b.chart || ''), action = String(b.action || '');
+  if (!edition || !chart || !['check', 'undo', 'cleanup', 'selftest_edit'].includes(action)) return bad('Need edition, chart and action check or undo');
+  const temp = edition === 'selftest';
+  const rick = !!me.email && !me.token;
+  if (me.processor || !(rick || (me.tool && temp))) return bad('Only Rick can mark a chart as checked', 403);
+  if (action === 'cleanup' || action === 'selftest_edit') {
+    if (!temp || !me.tool) return bad('This action is for the self-test tool on the self-test edition only', 403);
+    if (action === 'cleanup') {
+      await env.DB.batch([env.DB.prepare('DELETE FROM chart_notes WHERE edition = ?').bind(edition), env.DB.prepare('DELETE FROM chart_checks WHERE edition = ?').bind(edition)]);
+      return json({ ok: true });
+    }
+    await env.DB.prepare('UPDATE chart_notes SET adapters = ? WHERE edition = ? AND chart = ?').bind(String(b.adapters || '').slice(0, 200), edition, chart).run();
+    return json({ ok: true, chart_notes: await chartNotes(env, edition, chart) });
+  }
+  if (temp) await env.DB.prepare("INSERT OR IGNORE INTO chart_notes(edition, chart, adapters, verified) VALUES(?, ?, 'selftest', 'no')").bind(edition, chart).run();
+  const raw = await env.DB.prepare('SELECT edition, chart, adapters, height_note, cautions, kit_mark FROM chart_notes WHERE edition = ? AND chart = ?').bind(edition, chart).first();
+  if (!raw) return bad('No adapter notes for this chart', 404);
+  const now = await chartNotes(env, edition, chart), isRick = now.verified === 'rick';
+  if (action === 'check' && isRick) return json({ ok: true, changed: false, chart_notes: now });
+  if (action === 'undo' && !isRick) return bad('This chart is not checked by Rick now, so Undo does not apply', 409);
+  await env.DB.prepare('INSERT INTO chart_checks(edition, chart, text_hash, action, who, at) VALUES(?,?,?,?,?,?)').bind(edition, chart, await textHash(raw), action, me.email || me.device, me.now).run();
+  const history = (await env.DB.prepare('SELECT action, who, at FROM chart_checks WHERE edition = ? AND chart = ? ORDER BY id').bind(edition, chart).all()).results;
+  return json({ ok: true, changed: true, chart_notes: await chartNotes(env, edition, chart), history });
 }
 async function vehicle(env, id, me, touch) {
   const v = await vehicleRow(env, id);
@@ -184,9 +229,10 @@ async function vehicle(env, id, me, touch) {
   v.hidden = hidden(v, me.nowMs); v.mine = v.grp === 'mine' ? 1 : 0;
   return v;
 }
+const TRIM_MAX = 60;
 const modelKey = v => `model:${v.make}|${v.model}|${v.year}`;
 async function fieldByName(env, tab, name) {
-  return env.DB.prepare('SELECT f.id FROM fields f JOIN tabs t ON t.id = f.tab_id WHERE t.name=? AND f.name=?').bind(tab, name).first();
+  return env.DB.prepare('SELECT f.id, f.is_safety FROM fields f JOIN tabs t ON t.id = f.tab_id WHERE t.name=? AND f.name=?').bind(tab, name).first();
 }
 // A new value's id is above every id in vals AND in history, so the id of a deleted value is never
 // given again (a reused id would show the old value's history). Also used by tools/import.py.
@@ -252,6 +298,18 @@ async function queueJob(env, v, kind, wanted, me) {
     .bind(kind, modelKey(v), JSON.stringify(req), 'queued', me.now, me.now).first();
   return r.id;
 }
+// HANDOFF 13: a car that Rick adds, or whose trim he changes, gets a research job by itself for its missing fields. Not for the
+// self-test token (its test cars would cost real research), and not when a job for the car or model is still open (no duplicate).
+// The switch is the Worker variable LP_AUTO_RESEARCH ("1" = on). Default OFF (Rick, 2026-10-24): it is turned on only after the first
+// live run of the research worker on the 2022 Sonata has passed (see the release plan).
+async function openJob(env, v) {
+  return await env.DB.prepare("SELECT id FROM jobs WHERE target IN (?, ?) AND status IN ('queued','claimed') LIMIT 1").bind('car:' + v.id, modelKey(v)).first();
+}
+async function autoResearch(env, v, me) {
+  if (env.LP_AUTO_RESEARCH !== '1' || me.tool || me.processor || await openJob(env, v)) return null;
+  const miss = await missingFields(env, v);
+  return miss.length ? await queueJob(env, v, 'research', miss, me) : null;
+}
 async function claimJob(env, me, onlyId) {
   const until = new Date(me.nowMs + LEASE_MIN * 60e3).toISOString();
   const r = await env.DB.prepare(`UPDATE jobs SET status='claimed', claimed_by=?, lease_until=?, attempts=attempts+1, updated_at=?
@@ -272,6 +330,9 @@ async function jobResult(env, id, b, me) {
     if (!x || !String(x.value || '').trim() || !CONF.includes(x.confidence) || !String(x.source || '').trim()) return bad('Each value needs field, value, confidence and source');
     const f = await fieldByName(env, String(x.tab || ''), String(x.field || ''));
     if (!f) return bad(`Unknown field "${x.field}" on tab "${x.tab}"`);
+    // HANDOFF 13 (Rick, review finding b): the server does not trust the processor's confidence on a safety field. High needs a source
+    // that cites a page ("p.7-16", "p. 12", "PDF p.25"). Without it the whole result is refused and the job stays claimed.
+    if (f.is_safety && x.confidence === 'High' && !/\bp\.\s*\d/i.test(String(x.source))) return bad(`High on the safety field "${x.field}" needs a source that cites a page (p.)`);
     stmts.push(...insertValueStmts(env, { field_id: f.id, scope: 'model', make: rq.make, model: rq.model, year_from: rq.year, year_to: rq.year,
       value: String(x.value).trim(), confidence: x.confidence, source: x.source, note: x.note, status: 'proposed' }, me));
   }
@@ -287,7 +348,7 @@ export default {
     if (!p.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {
       const me = await who(req, env);
-      if (p === '/api/health') { const n = await env.DB.prepare("SELECT (SELECT count(*) FROM ali_index) a, (SELECT count(*) FROM classics) c, (SELECT count(*) FROM vehicles) v, (SELECT count(*) FROM makes) m, (SELECT count(*) FROM vals) vals, (SELECT count(*) FROM vals WHERE status='proposed') proposed, (SELECT count(*) FROM jobs WHERE status IN ('queued','claimed')) jobs, (SELECT count(*) FROM ali_pages WHERE status='ok') pages, (SELECT count(*) FROM make_defaults) defaults, (SELECT count(*) FROM thread_ranges) ranges, (SELECT max(id) FROM schema_migrations) schema").first(); return json({ ok: true, ...n }); }
+      if (p === '/api/health') { const n = await env.DB.prepare("SELECT (SELECT count(*) FROM ali_index) a, (SELECT count(*) FROM classics) c, (SELECT count(*) FROM vehicles) v, (SELECT count(*) FROM makes) m, (SELECT count(*) FROM vals) vals, (SELECT count(*) FROM vals WHERE status='proposed') proposed, (SELECT count(*) FROM jobs WHERE status IN ('queued','claimed')) jobs, (SELECT count(*) FROM ali_pages WHERE status='ok') pages, (SELECT count(*) FROM make_defaults) defaults, (SELECT count(*) FROM thread_ranges) ranges, (SELECT max(id) FROM schema_migrations) schema").first(); return json({ ok: true, ...n, auto_research: env.LP_AUTO_RESEARCH === '1' ? 1 : 0 }); }
       // ALI page images (decision 4): the list from ali_pages, and each image from the private bucket.
       if (p === '/api/ali/pages' && m === 'GET') {
         const ed = url.searchParams.get('edition');
@@ -303,6 +364,9 @@ export default {
         const h = { 'content-type': 'image/jpeg', 'content-length': String(o.size), 'cache-control': 'private, max-age=604800', etag: o.httpEtag };
         return new Response(m === 'HEAD' ? null : o.body, { headers: h });
       }
+      // HANDOFF 13: "I checked this chart" and "Undo". Only Rick's own Access login (an email, no service token) may do it.
+      // The self-test tool token may do it only on the temp edition 'selftest', which it creates and removes itself.
+      if (p === '/api/chart-checks' && m === 'POST') return chartCheck(env, await req.json(), me);
       if (p === '/api/ali/boxes' && m === 'PUT') return setBox(env, await req.json(), me);
       if (p === '/api/ali/boxes' && m === 'DELETE') {
         if (me.processor) return bad('The processor cannot change chart boxes', 403);
@@ -373,14 +437,27 @@ export default {
         const grp = GROUPS.includes(b.grp) ? b.grp : (b.mine === true ? 'mine' : 'visitor');
         const r = await env.DB.prepare('INSERT INTO vehicles(year, make, model, trim, vin, mine, grp, last_seen) VALUES(?,?,?,?,?,?,?,?) RETURNING id')
           .bind(year, b.make, b.model, b.trim || '', b.vin || '', grp === 'mine' ? 1 : 0, grp, me.now).first();
+        await autoResearch(env, await vehicleRow(env, r.id), me);
         return json(await vehicle(env, r.id, me, false), 201);
       }
       let mm = p.match(/^\/api\/vehicles\/(\d+)$/);
       // Decision 11: the VIN is on the car record only and goes to NHTSA only - never to the processor.
-      if (mm && m === 'GET') { const v = await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'); if (v && me.processor) { delete v.vin; delete v.chart_notes; delete v.chart_notes_footer; } return v ? json(v) : bad('Car not found', 404); }
+      if (mm && m === 'GET') { const v = await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'); if (v && me.processor) { delete v.vin; delete v.notes; delete v.chart_notes; delete v.chart_notes_footer; } return v ? json(v) : bad('Car not found', 404); }
       if (mm && m === 'PATCH') {
         const b = await req.json(); const v = await vehicleRow(env, +mm[1]);
         if (!v) return bad('Car not found', 404);
+        // HANDOFF 13: Rick edits the trim. The change is logged as a dated line in vehicles.notes (no new table);
+        // the processor never reads that column and never changes the trim.
+        if ('trim' in b && !('grp' in b) && !('vin' in b)) {
+          if (me.processor) return bad('The processor cannot change a trim', 403);
+          const trim = String(b.trim || '').trim();
+          if (trim.length > TRIM_MAX || /[\u0000-\u001f]/.test(trim)) return bad(`A trim has at most ${TRIM_MAX} characters and no control characters`);
+          if (trim === (v.trim || '')) return json({ ok: true, trim, changed: false });
+          const line = `${me.now.slice(0, 10)} trim "${v.trim || ''}" -> "${trim}" (${me.device})`;
+          await env.DB.prepare("UPDATE vehicles SET trim=?, notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || char(10) || ? END WHERE id=?").bind(trim, line, line, v.id).run();
+          const research_job = await autoResearch(env, { ...v, trim }, me);
+          return json({ ok: true, trim, changed: true, research_job });
+        }
         if ('vin' in b && !('grp' in b)) {
           if (me.processor) return bad('The processor cannot change a VIN', 403);
           const vin = String(b.vin || '').trim().toUpperCase();
@@ -392,7 +469,7 @@ export default {
         await env.DB.prepare('UPDATE vehicles SET grp=?, mine=? WHERE id=?').bind(b.grp, b.grp === 'mine' ? 1 : 0, v.id).run();
         let job = null;
         // Decision 5: marking a car Frequent queues a workup for every missing field.
-        if (b.grp === 'frequent' && v.grp !== 'frequent') { const miss = await missingFields(env, v); if (miss.length) job = await queueJob(env, v, 'workup', miss, me); }
+        if (b.grp === 'frequent' && v.grp !== 'frequent' && !await openJob(env, v)) { const miss = await missingFields(env, v); if (miss.length) job = await queueJob(env, v, 'workup', miss, me); }
         return json({ ok: true, workup_job: job });
       }
       if (mm && m === 'DELETE') {
@@ -477,6 +554,14 @@ export default {
       }
       mm = p.match(/^\/api\/jobs\/(\d+)\/result$/);
       if (mm && m === 'POST') return jobResult(env, +mm[1], await req.json(), me);
+      // HANDOFF 13: the research worker keeps a long job: renew the lease before it runs out (same claimer, lease still valid).
+      mm = p.match(/^\/api\/jobs\/(\d+)\/renew$/);
+      if (mm && m === 'POST') {
+        const until = new Date(me.nowMs + LEASE_MIN * 60e3).toISOString();
+        const r = await env.DB.prepare("UPDATE jobs SET lease_until=?, updated_at=? WHERE id=? AND status='claimed' AND claimed_by=? AND lease_until > ? RETURNING id, lease_until")
+          .bind(until, me.now, +mm[1], me.token, me.now).first();
+        return r ? json(r) : bad('This job is not claimed by you, or the lease ran out. Claim it again.', 409);
+      }
       mm = p.match(/^\/api\/jobs\/(\d+)\/fail$/);
       if (mm && m === 'POST') {
         const b = await req.json().catch(() => ({}));

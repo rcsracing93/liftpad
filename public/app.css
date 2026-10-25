@@ -117,7 +117,8 @@ dd.v-confirmed{border:2px solid var(--line);border-radius:10px;padding:10px 14px
 .tag{font:500 .8rem var(--mono);color:var(--muted);margin-left:8px}
 .warn{border:3px solid var(--warn);background:var(--warn-bg);padding:14px 18px;border-radius:12px}
 .warn.bad{border-color:var(--lo);background:var(--lo-bg)}
-.adapters{display:grid;gap:8px;border:3px solid var(--line2);border-radius:12px;padding:14px 18px}   /* HANDOFF 12: adapter notes of the chart; no buttons, body-size text */
+.adapters{display:grid;gap:8px;border:3px solid var(--line2);border-radius:12px;padding:14px 18px}   /* HANDOFF 12: adapter notes of the chart, body-size text; HANDOFF 13 adds one button (64 px target, words) */
+.chartcheck{min-height:64px;min-width:64px;padding:0 20px;margin-left:12px}
 .adapters.unchecked{border-style:dashed;border-color:var(--warn);background:var(--warn-bg)}
 .adapters.stop{border-style:solid;border-color:var(--lo);background:var(--lo-bg)}   /* "Do not use a 2-post": red, first on the tab */
 .stopline{font-size:1.25rem}
