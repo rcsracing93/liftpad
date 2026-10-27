@@ -9,8 +9,23 @@
 #          if absent; changes D1 only through tools/d1_load.sh (empty database: migrations +
 #          seed; pending migrations: only with -e LP_APPLY_MIGRATIONS=1, after a verified
 #          backup); deploys the Worker with the Access values as Worker variables.
+# Optional env: LP_BUILD (the git commit of the build copy; shown as "build" by /api/health, null when not set).
+#          LP_DEPLOY_DRY=1 (Rick 2026-10-27): a dry run with the real config. Everything is read and checked as in a deploy, the
+#          build copy is filled and every guard runs, then "wrangler deploy --dry-run" builds the Worker and uploads nothing.
+#          Anything a deploy would CREATE (Access app, policy, token, D1) stops the dry run instead. The D1 step reads the migration
+#          plan only; pending migrations other than LP_DRY_ALLOW_PENDING (a space list, e.g. "0010") stop it. Mount /cfg and /private
+#          read-only for it. Changes: only the build copy.
 # shellcheck disable=SC3040 # runs under busybox ash (node:22-alpine), which has pipefail; STANDARD 11.4
 set -euo pipefail
+# 2026-10-27 (yes deploy A, step 6 failed): the build copy must hold the committed placeholders. A copy that another tool filled before
+# (the migration step filled the host with live.invalid) deployed a wrong route. Checked first, before any Cloudflare call.
+for p in '"__LP_HOSTNAME__"' '"__LP_D1_NAME__"' '"__LP_D1_ID__"'; do
+  grep -q "$p" /app/wrangler.toml || { echo "STOP: wrangler.toml is already filled ($p is missing). Deploy from a fresh build copy. Nothing was changed."; exit 1; }
+done
+DRY=${LP_DEPLOY_DRY:-0}
+# need WHAT: a real deploy would create WHAT here; a dry run stops instead.
+need() { if [ "$DRY" = 1 ]; then echo "STOP (dry run): $1 is missing - a real deploy would create it"; exit 1; fi; }
+[ "$DRY" = 1 ] && echo "DRY RUN: nothing is created or uploaded"
 cd /app
 [ -f /private/deploy.env ] || { echo "STOP: /private/deploy.env not found (needs LP_HOSTNAME and LP_ACCESS_EMAIL)"; exit 1; }
 . /private/deploy.env
@@ -30,11 +45,13 @@ cf "$API/accounts/$A" | jq -r '"account: " + (.result.name // ("FAILED " + ((.er
 step "B Access"
 APP=$(cf "$API/accounts/$A/access/apps" | jq -r --arg h "$LP_HOSTNAME" 'first(.result[]? | select(.domain==$h) | .id) // empty')
 if [ -z "$APP" ]; then
+  need "the Access app for $LP_HOSTNAME"
   APP=$(cf -X POST "$API/accounts/$A/access/apps" -d "$(jq -n --arg h "$LP_HOSTNAME" '{name:"LiftPad",domain:$h,type:"self_hosted",session_duration:"720h",app_launcher_visible:false}')" | tee /tmp/app.json | jq -r '.result.id // empty')
   [ -n "$APP" ] || { echo "Access app create FAILED:"; jq -c '.errors' /tmp/app.json; exit 1; }
   echo "Access app created"
 else echo "Access app exists"; fi
 if [ ! -s /cfg/svc.env ]; then
+  need "the self-test service token (svc.env)"
   cf -X POST "$API/accounts/$A/access/service_tokens" -d '{"name":"liftpad-selftest","duration":"8760h"}' > /tmp/svc.json
   jq -e '.success' /tmp/svc.json >/dev/null || { echo "service token FAILED:"; jq -c '.errors' /tmp/svc.json; exit 1; }
   umask 077; jq -r '"CF_ACCESS_CLIENT_ID=" + .result.client_id + "\nCF_ACCESS_CLIENT_SECRET=" + .result.client_secret + "\nSVC_ID=" + .result.id' /tmp/svc.json > /cfg/svc.env; rm /tmp/svc.json
@@ -43,6 +60,7 @@ fi
 . /cfg/svc.env
 NPOL=$(cf "$API/accounts/$A/access/apps/$APP/policies" | jq '.result | length')
 if [ "$NPOL" = "0" ]; then
+  need "the Access policies"
   cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg e "$LP_ACCESS_EMAIL" '{name:"owner",decision:"allow",precedence:1,include:[{email:{email:$e}}]}')" | jq -r '"policy owner: " + (if .success then "ok" else (.errors|tostring) end)'
   cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$SVC_ID" '{name:"selftest token",decision:"non_identity",precedence:2,include:[{service_token:{token_id:$t}}]}')" | jq -r '"policy selftest: " + (if .success then "ok" else (.errors|tostring) end)'
 else echo "policies exist: $NPOL"; fi
@@ -52,6 +70,7 @@ SELF_ID=$CF_ACCESS_CLIENT_ID
 # a separate token, saved to processor.env, with its own policy "processor token". Created only
 # if missing; the policies above are never changed.
 if [ ! -s /cfg/processor.env ]; then
+  need "the processor service token (processor.env)"
   cf -X POST "$API/accounts/$A/access/service_tokens" -d '{"name":"liftpad-processor","duration":"8760h"}' > /tmp/proc.json
   jq -e '.success' /tmp/proc.json >/dev/null || { echo "processor token FAILED:"; jq -c '.errors' /tmp/proc.json; exit 1; }
   umask 077; jq -r '"CF_ACCESS_CLIENT_ID=" + .result.client_id + "\nCF_ACCESS_CLIENT_SECRET=" + .result.client_secret + "\nSVC_ID=" + .result.id' /tmp/proc.json > /cfg/processor.env; rm /tmp/proc.json
@@ -61,6 +80,7 @@ PROC_ID=$(. /cfg/processor.env; printf '%s' "$CF_ACCESS_CLIENT_ID")
 PROC_SVC=$(. /cfg/processor.env; printf '%s' "$SVC_ID")
 if cf "$API/accounts/$A/access/apps/$APP/policies" | jq -e '.result | any(.name == "processor token")' >/dev/null; then echo "processor policy exists"
 else
+  need "the processor Access policy"
   PREC=$(( $(cf "$API/accounts/$A/access/apps/$APP/policies" | jq '[.result[].precedence] | max // 0') + 1 ))
   cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$PROC_SVC" --argjson p "$PREC" '{name:"processor token",decision:"non_identity",precedence:$p,include:[{service_token:{token_id:$t}}]}')" | jq -r '"policy processor: " + (if .success then "ok" else (.errors|tostring) end)'
 fi
@@ -76,6 +96,7 @@ step "C D1"
 DBN=${LP_D1_NAME:-liftpad}; export LP_D1_NAME="$DBN"
 DB=$(npx wrangler d1 list --json 2>/dev/null | jq -r --arg n "$DBN" 'first(.[] | select(.name==$n) | .uuid) // empty')
 if [ -z "$DB" ]; then
+  need "the D1 database $DBN"
   npx wrangler d1 create "$DBN" >/tmp/d1.txt 2>&1 || { tail -5 /tmp/d1.txt; exit 1; }
   DB=$(grep -o '[0-9a-f]\{8\}-[0-9a-f-]\{27\}' /tmp/d1.txt | head -1); echo "D1 created"
 else echo "D1 exists"; fi
@@ -85,10 +106,27 @@ sed -i -e "s/__LP_D1_ID__/$DB/" -e "s/__LP_D1_NAME__/$DBN/" -e "s/__LP_HOSTNAME_
 if grep -q '"__LP_' wrangler.toml; then echo "STOP: wrangler.toml still has a placeholder"; exit 1; fi
 # The app icon is built here, not kept in git (the repo admits no .svg).
 printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#e0a100"/><path d="M14 50V14h6v36zM44 50V14h6v36zM20 30h24v5H20z" fill="#141716"/></svg>' > public/icon.svg
-sh tools/d1_load.sh "$SEED"
+if [ "$DRY" = 1 ]; then
+  # The dry run reads the migration plan only (no table check write path, no migration). Pending migrations must be in the allowed list.
+  sh tools/migrate.sh > /tmp/plan.txt 2>&1 || { cat /tmp/plan.txt; echo "STOP (dry run): the migration plan failed"; exit 1; }
+  grep -e '^migrate: database' -e '^migrate: pending' /tmp/plan.txt
+  PEND=$(sed -n 's/^migrate: pending: *//p' /tmp/plan.txt)
+  for m in $PEND; do
+    case " ${LP_DRY_ALLOW_PENDING:-} none " in *" $m "*) ;; *) echo "STOP (dry run): migration $m is pending and not allowed"; exit 1 ;; esac
+  done
+  echo "migrations: pending '${PEND}' is allowed (${LP_DRY_ALLOW_PENDING:-none}); a real deploy needs them applied first"
+else
+  sh tools/d1_load.sh "$SEED"
+fi
 
 step "D deploy"
 # The Access values go in as Worker variables, never into git. Lines naming them are not shown.
-npx wrangler deploy --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
-  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
-echo; echo "DEPLOY DONE"
+WDRY=''; [ "$DRY" = 1 ] && WDRY='--dry-run --outdir /tmp/dry-out'
+# shellcheck disable=SC2086 # WDRY is empty or two flags, split on purpose
+npx wrangler deploy $WDRY --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
+  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" ${LP_BUILD:+--var "LP_BUILD:$LP_BUILD"} 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
+if [ "$DRY" = 1 ]; then
+  [ -s /tmp/dry-out/worker.js ] || { echo "STOP (dry run): wrangler built no worker.js"; exit 1; }
+  echo "dry run: Worker built ($(wc -c < /tmp/dry-out/worker.js) bytes), nothing uploaded"
+  echo; echo "DRY RUN DONE"
+else echo; echo "DEPLOY DONE"; fi

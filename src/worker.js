@@ -20,8 +20,15 @@ const CONF = ['High', 'Medium', 'Low'];
 const level = v => v === undefined || v === null || v === '' || v === false ? 0 : v === true ? 1 : [0, 1, 2].includes(Number(v)) ? Number(v) : null;
 const LEVEL_ERR = 'Warning level must be 0 (none), 1 (caution) or 2 (block)';
 const GROUPS = ['mine', 'frequent', 'visitor'];
+const FUELS = ['gas', 'diesel', 'hybrid', 'phev', 'ev'];
 const HIDE_DAYS = 30, LEASE_MIN = 10, PHOTO_MAX = 8 * 1048576;
 const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
+// Rick 2026-10-27 (after ultrareview F6/F7): the processor token reaches only these routes; every other route answers 403 before it runs.
+// Read cars, values and fields (private car keys removed), post values (proposed only), the job routes the research worker and queue.sh
+// use (claim, renew, result, fail, whoami), and the service-log CSV for the nightly export. No car add, group change or car delete.
+const PROC_ROUTES = [
+  ['GET', /^\/api\/(whoami|tabs|vehicles|needs-confirming|service-log\.csv)$/], ['GET', /^\/api\/vehicles\/\d+$/],
+  ['POST', /^\/api\/vehicles\/\d+\/values$/], ['POST', /^\/api\/jobs\/claim$/], ['POST', /^\/api\/jobs\/\d+\/(result|renew|fail)$/]];
 
 // ---------- Identity: Access JWT (Cf-Access-Jwt-Assertion), RS256, keys from the team certs URL ----------
 let jwks = null, jwksAt = 0;
@@ -33,8 +40,27 @@ async function claims(req, env) {
   const [h, p, s] = t.split('.'); if (!s) return null;
   try {
     const hd = dec(b64u(h)); if (hd.alg !== 'RS256') return null;
-    if (!jwks || Date.now() - jwksAt > 3600e3) { const r = await fetch(env.LP_ACCESS_CERTS); jwks = (await r.json()).keys || []; jwksAt = Date.now(); }
-    const k = jwks.find(x => x.kid === hd.kid); if (!k) return null;
+    // Ultrareview 2 #1: an empty or failed key list is never cached, and an unknown kid fetches the list again once (key rotation).
+    // Rick 2026-10-27: the last good list is kept in memory and in D1 (table access_keys, written only when the list changes). When a
+    // fetch fails, the saved list is used; a token is refused only when no list is known at all.
+    const load = async () => {
+      let ks = [];
+      try { const r = await fetch(env.LP_ACCESS_CERTS); if (r.ok) ks = (await r.json()).keys || []; } catch (e) { ks = []; }
+      if (ks.length) {
+        jwks = ks; jwksAt = Date.now();
+        try {
+          await env.DB.prepare(`INSERT INTO access_keys(id, jwks, saved_at) VALUES(1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET jwks = excluded.jwks, saved_at = excluded.saved_at WHERE access_keys.jwks <> excluded.jwks`).bind(JSON.stringify(ks), new Date().toISOString()).run();
+        } catch (e) { /* a database before migration 0011 has no access_keys table */ }
+        return ks;
+      }
+      if (!jwks) { try { const row = await env.DB.prepare('SELECT jwks FROM access_keys WHERE id = 1').first(); if (row) jwks = JSON.parse(row.jwks); } catch (e) { /* no table */ } }
+      return jwks || [];
+    };
+    if (!jwks || Date.now() - jwksAt > 3600e3) await load();
+    let k = (jwks || []).find(x => x.kid === hd.kid);
+    if (!k) k = (await load()).find(x => x.kid === hd.kid);
+    if (!k) return null;
     const key = await crypto.subtle.importKey('jwk', k, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
     if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64u(s), new TextEncoder().encode(h + '.' + p))) return null;
     const c = dec(b64u(p));
@@ -52,7 +78,10 @@ async function who(req, env) {
   // Test clock: only a tool service token may set "now" (self-test of leases and visitor hiding).
   const t = tool ? Date.parse(req.headers.get('x-lp-now') || '') : NaN;
   const now = new Date(Number.isFinite(t) ? t : Date.now());
-  return { email: c && c.email || '', token, processor, tool, device, now: now.toISOString(), nowMs: now.getTime() };
+  // Ultrareview 2 #1: a request that carries an Access token the Worker cannot verify (bad signature, expired, unknown key, or the
+  // Access settings missing) is refused, not treated as an ordinary caller: the processor limits must fail closed.
+  const badJwt = !!req.headers.get('cf-access-jwt-assertion') && !c;
+  return { email: c && c.email || '', token, processor, tool, device, badJwt, now: now.toISOString(), nowMs: now.getTime() };
 }
 
 // ---------- Makes and models (unchanged rules) ----------
@@ -62,6 +91,14 @@ async function makes(env, q) {
   return results.map(r => { const ss = [r.name, ...(r.aliases ? r.aliases.split('|') : [])].map(n => score(n, q)).filter(x => x >= 0); return { name: r.name, mine: mine.has(r.name), s: ss.length ? Math.min(...ss) : -1 }; })
     .filter(r => r.s >= 0).sort((a, b) => a.s - b.s || (b.mine - a.mine) || a.name.localeCompare(b.name)).slice(0, 10)
     .map(({ name, mine }) => ({ name, mine }));
+}
+// Ultrareview 2 #9: the make as the makes table spells it (name, nhtsa_name or an alias, any case), else the text as given.
+// The VIN decode gave "Bmw" for BMW, and the value lookups compare make with = (case matters), so that car missed its values.
+async function canonMake(env, s) {
+  const t = String(s || '').trim(); if (!t) return t;
+  const r = await env.DB.prepare(`SELECT name FROM makes WHERE name = ?1 COLLATE NOCASE OR nhtsa_name = ?1 COLLATE NOCASE
+    OR ('|' || COALESCE(aliases, '') || '|') LIKE ('%|' || ?1 || '|%') ORDER BY (name = ?1 COLLATE NOCASE) DESC LIMIT 1`).bind(t).first();
+  return r ? r.name : t;
 }
 async function nhtsaModels(env, make, year) {
   const m = await env.DB.prepare('SELECT nhtsa_name FROM makes WHERE name=?').bind(make).first();
@@ -131,7 +168,8 @@ async function tabsFields(env) {
   return { tabs, fields };
 }
 const VAL_SELECT = `SELECT x.id, x.field_id, f.name field, t.name tab, f.is_safety, x.scope, x.make, x.model, x.year_from, x.year_to, x.vehicle_id,
-  x.value, x.confidence, x.source, x.note, x.warn, x.status, x.entered_at, x.entered_by, x.confirmed_at, x.confirmed_by, x.updated_at
+  x.value, x.confidence, x.source, x.note, x.warn, x.status, x.entered_at, x.entered_by, x.confirmed_at, x.confirmed_by, x.updated_at,
+  x.ftlb_lo, x.ftlb_hi, x.ftlb_src, x.engine
   FROM vals x JOIN fields f ON f.id = x.field_id JOIN tabs t ON t.id = f.tab_id`;
 // The values of car v (alias): its own overrides and the model-year values for its year.
 const CAR_VALS = `((x.scope='car' AND x.vehicle_id=v.id) OR (x.scope='model' AND x.make=v.make AND x.model=v.model AND x.year_from<=v.year AND x.year_to>=v.year))`;
@@ -144,7 +182,6 @@ async function carValues(env, v, withRejected) {
 // ---------- Typical values and thread ranges (Handoff 3 decision 9) ----------
 // Display order: car override, model-year value, then the make's typical value (Low), then the
 // thread's usual torque range as a sanity check only. A torque outside the range is flagged.
-const ftlb = t => { const m = String(t || '').match(/(\d+(?:\.\d+)?)\s*(n\s*·?\s*m\b)?/i); return m ? (m[2] ? +m[1] / 1.35582 : +m[1]) : null; };
 const THREAD = /M\d+\s*x\s*\d+(?:\.\d+)?|\d+\/\d+-\d+/i;
 async function typical(env, make, year, vals) {
   const md = await env.DB.prepare(`SELECT edition, make, era, thread, socket, torque_ftlb, confidence, source, note FROM make_defaults
@@ -157,9 +194,14 @@ async function typical(env, make, year, vals) {
 }
 const rangeFlag = (x, range) => {
   if (!range || range.torque_min == null || x.tab !== 'torque' || x.field !== 'Torque') return null;
-  const n = ftlb(x.value); if (n == null) return null;
-  return n < range.torque_min - 0.5 || n > range.torque_max + 0.5 ? 'outside' : 'inside';
+  // HANDOFF 15: the range check reads the stored ft-lb numbers (migration 0009), not the value text.
+  const lo = x.ftlb_lo, hi = x.ftlb_hi == null ? x.ftlb_lo : x.ftlb_hi; if (lo == null) return null;
+  return lo < range.torque_min - 0.5 || hi > range.torque_max + 0.5 ? 'outside' : 'inside';
 };
+// Ultrareview 2 #3: the door-jamb screen saves the source as "Door-jamb label photo, <date>" (app.js jambRead): a hyphen is allowed.
+const PLACARD = /placard|door[\s-]*(?:card|label|jamb|pillar)/i;
+// Ultrareview F9: the door card wins per field. The field ids that have a confirmed car-scope tire value from a placard.
+const placardFields = vals => new Set(vals.filter(x => x.tab === 'tires' && x.scope === 'car' && x.status === 'confirmed' && PLACARD.test(x.source || '')).map(x => x.field_id));
 const hidden = (v, nowMs) => v.grp === 'visitor' && (nowMs - Date.parse(v.last_seen || v.created_iso || 0)) > HIDE_DAYS * 864e5;
 async function vehicleRow(env, id) {
   return env.DB.prepare("SELECT *, strftime('%Y-%m-%dT%H:%M:%fZ', created) created_iso FROM vehicles WHERE id=?").bind(id).first();
@@ -219,9 +261,14 @@ async function vehicle(env, id, me, touch) {
   if (touch) { await env.DB.prepare('UPDATE vehicles SET last_seen=? WHERE id=?').bind(me.now, id).run(); v.last_seen = me.now; }
   v.values = await carValues(env, v, false);
   v.typical = await typical(env, v.make, v.year, v.values);
-  v.values.forEach(x => { x.range_flag = rangeFlag(x, v.typical.range); });
+  // HANDOFF 15, "the door card wins": a confirmed car-scope tire value from a placard hides the model-scope values of the SAME field
+  // (ultrareview F9; they stay in the database and in history; the flag lets the app and the tests see them).
+  const placard = placardFields(v.values);
+  v.values.forEach(x => { x.range_flag = rangeFlag(x, v.typical.range); x.hidden_by_placard = x.tab === 'tires' && x.scope === 'model' && placard.has(x.field_id); });
   v.ali = await nearestChart(env, v.make, v.model, v.year);
   v.chart_notes = v.ali ? await chartNotes(env, v.ali.edition, v.ali.chart) : null;
+  // HANDOFF 15: the per-car switch hides the chart's caution text (the car's own caution stays; the chart image still shows it).
+  if (v.chart_notes && v.hide_chart_cautions) v.chart_notes = { ...v.chart_notes, cautions: null, cautions_hidden: true };
   // The fixed line under every adapter block (the lift's own numbers are data: edition all, chart footer).
   v.chart_notes_footer = v.ali ? ((await chartNotes(env, 'all', 'footer')) || {}).adapters || null : null;
   v.jobs = (await env.DB.prepare("SELECT id, kind, status, result_summary, error, created_at, updated_at FROM jobs WHERE target IN (?, ?) ORDER BY id DESC LIMIT 5")
@@ -229,6 +276,10 @@ async function vehicle(env, id, me, touch) {
   v.hidden = hidden(v, me.nowMs); v.mine = v.grp === 'mine' ? 1 : 0;
   return v;
 }
+// Decision 11 + HANDOFF 15 (ultrareview F6): a car sent to the processor never holds the VIN, the notes, the owner or the ALI-derived
+// adapter notes. Every route that returns a car object passes it through here; the keys are removed, not blanked.
+const PRIVATE_CAR_KEYS = ['vin', 'notes', 'owner', 'chart_notes', 'chart_notes_footer'];
+const forMe = (v, me) => { if (v && me.processor) PRIVATE_CAR_KEYS.forEach(k => { delete v[k]; }); return v; };
 const TRIM_MAX = 60;
 const modelKey = v => `model:${v.make}|${v.model}|${v.year}`;
 async function fieldByName(env, tab, name) {
@@ -241,11 +292,40 @@ const NEW_VAL_ID = `(SELECT MAX(m) + 1 FROM (SELECT COALESCE(MAX(id), 0) AS m FR
 function insertValueStmts(env, x, me) {
   return [
     env.DB.prepare(`INSERT INTO vals(id, field_id, scope, make, model, year_from, year_to, vehicle_id, value, confidence, source, note, warn, status,
-      entered_at, entered_by, confirmed_at, confirmed_by, updated_at) VALUES(${NEW_VAL_ID},?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      entered_at, entered_by, confirmed_at, confirmed_by, updated_at, ftlb_lo, ftlb_hi, ftlb_src, engine) VALUES(${NEW_VAL_ID},?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .bind(x.field_id, x.scope, x.make ?? null, x.model ?? null, x.year_from ?? null, x.year_to ?? null, x.vehicle_id ?? null, x.value, x.confidence,
-        x.source || '', x.note || '', x.warn || 0, x.status, me.now, me.device, x.status === 'confirmed' ? me.now : null, x.status === 'confirmed' ? me.device : null, me.now),
-    env.DB.prepare(`INSERT INTO history(value_id, action, new_value, new_status, new_confidence, at, device) VALUES(last_insert_rowid(), 'insert', ?, ?, ?, ?, ?)`)
-      .bind(x.value, x.status, x.confidence, me.now, me.device)];
+        x.source || '', x.note || '', x.warn || 0, x.status, me.now, me.device, x.status === 'confirmed' ? me.now : null, x.status === 'confirmed' ? me.device : null, me.now,
+        x.ftlb_lo ?? null, x.ftlb_hi ?? null, x.ftlb_src ?? null, x.engine ?? null),
+    env.DB.prepare(`INSERT INTO history(value_id, action, new_value, new_status, new_confidence, new_ftlb_lo, new_ftlb_hi, new_ftlb_src, new_warn, new_source, new_note, at, device)
+      VALUES(last_insert_rowid(), 'insert', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(x.value, x.status, x.confidence, x.ftlb_lo ?? null, x.ftlb_hi ?? null, x.ftlb_src ?? null, x.warn || 0, x.source || '', x.note || '', me.now, me.device)];
+}
+// HANDOFF 15: the Torque field stores the numbers to show (ft-lb only on screen). A post for it without ftlb_lo is refused (400), for the
+// browser and for the research worker. ftlb_src: 'printed' = the source prints ft-lb; 'converted' = worked out from N-m.
+const isTorque = (tab, name) => tab === 'torque' && name === 'Torque';
+function ftlbOf(b) {
+  const num = k => b[k] === undefined || b[k] === null || b[k] === '' ? null : Number(b[k]);
+  const lo = num('ftlb_lo'), hi = num('ftlb_hi'), src = b.ftlb_src === undefined || b.ftlb_src === null || b.ftlb_src === '' ? 'printed' : b.ftlb_src;
+  if (lo === null) return { err: 'A Torque value needs ftlb_lo (whole ft-lb)' };
+  if (!Number.isInteger(lo) || lo < 1 || lo > 1000 || (hi !== null && (!Number.isInteger(hi) || hi < lo || hi > 1000))) return { err: 'ftlb_lo and ftlb_hi must be whole ft-lb numbers, from 1 to 1000, ftlb_hi not below ftlb_lo' };
+  if (!['printed', 'converted'].includes(src)) return { err: 'ftlb_src must be printed or converted' };
+  return { ftlb_lo: lo, ftlb_hi: hi, ftlb_src: src };
+}
+// Ultrareview F3: a research result for Torque without ftlb_lo (the research worker before HANDOFF 15, or a hand-written queue.sh result)
+// gets its numbers from the value text: an ft-lb figure first, else an N-m figure converted. The unit of the source is not known then,
+// so the value is always marked 'converted' (the app shows the tag; Rick checks it when he confirms). No number = no numbers (400 as before).
+const NM_TO_FTLB = 0.737562;
+function ftlbFromText(text) {
+  const t = String(text || '').toLowerCase();
+  let m = t.match(/(?<![\d.])(\d+)\s*(?:-|–|to)\s*(\d+)(?![\d.])\s*(?:ft[ -]?lbs?|lb[ -]?ft)/);
+  if (m) return { ftlb_lo: +m[1], ftlb_hi: +m[2] };
+  m = t.match(/(?<![\d.])(\d+)(?![\d.])\s*(?:ft[ -]?lbs?|lb[ -]?ft)/);
+  if (m) return { ftlb_lo: +m[1] };
+  m = t.match(/(?<![\d.])(\d+)\s*(?:-|–|to)\s*(\d+)(?![\d.])\s*n[·.\s-]?m\b/);
+  if (m) return { ftlb_lo: Math.round(m[1] * NM_TO_FTLB), ftlb_hi: Math.round(m[2] * NM_TO_FTLB) };
+  m = t.match(/(?<![\d.])(\d+)(?![\d.])\s*n[·.\s-]?m\b/);
+  if (m) return { ftlb_lo: Math.round(m[1] * NM_TO_FTLB) };
+  return {};
 }
 async function addValue(env, v, b, me) {
   const tab = String(b.tab || ''), name = String(b.field || '').trim();
@@ -255,6 +335,8 @@ async function addValue(env, v, b, me) {
   const warn = level(b.warn);
   if (warn === null) return bad(LEVEL_ERR);
   if (warn && me.processor) return bad('The processor cannot set a warning level', 403);
+  const tq = isTorque(tab, name) ? ftlbOf(b) : {};
+  if (tq.err) return bad(tq.err);
   const scope = b.scope === 'car' ? 'car' : 'model';
   const yf = scope === 'model' ? parseInt(b.year_from ?? v.year, 10) : null, yt = scope === 'model' ? parseInt(b.year_to ?? v.year, 10) : null;
   if (scope === 'model' && (!yearOk(yf) || !yearOk(yt) || yf > yt)) return bad('Year range is not valid');
@@ -262,7 +344,7 @@ async function addValue(env, v, b, me) {
   const status = !me.processor && b.status === 'confirmed' ? 'confirmed' : 'proposed';
   await env.DB.batch(insertValueStmts(env, { field_id: f.id, scope, make: scope === 'model' ? v.make : null, model: scope === 'model' ? v.model : null,
     year_from: yf, year_to: yt, vehicle_id: scope === 'car' ? v.id : null, value: String(b.value).trim(), confidence: b.confidence,
-    source: b.source, note: b.note, warn, status }, me));
+    source: b.source, note: b.note, warn, status, ...tq }, me));
   return null;
 }
 // Change a value and write its history row in the same batch. The history row copies the old
@@ -272,15 +354,21 @@ async function changeValue(env, id, action, set, me) {
   if (!old) return bad('Value not found', 404);
   if (action === 'delete') {
     await env.DB.batch([
-      env.DB.prepare(`INSERT INTO history(value_id, action, old_value, old_status, old_confidence, at, device) SELECT id, 'delete', value, status, confidence, ?, ? FROM vals WHERE id=?`).bind(me.now, me.device, id),
+      env.DB.prepare(`INSERT INTO history(value_id, action, old_value, old_status, old_confidence, old_ftlb_lo, old_ftlb_hi, old_ftlb_src, old_warn, old_source, old_note, at, device)
+        SELECT id, 'delete', value, status, confidence, ftlb_lo, ftlb_hi, ftlb_src, warn, source, note, ?, ? FROM vals WHERE id=?`).bind(me.now, me.device, id),
       env.DB.prepare('DELETE FROM vals WHERE id=?').bind(id)]);
     return json({ ok: true });
   }
   const keys = Object.keys(set);
+  // Ultrareview F10 (migration 0010): the row also keeps the old and new torque numbers, so a change of only the ft-lb boxes is auditable.
+  const nw = k => k in set ? set[k] : old[k] ?? null;
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO history(value_id, action, old_value, new_value, old_status, new_status, old_confidence, new_confidence, at, device)
-      SELECT id, ?, value, ?, status, ?, confidence, ?, ?, ? FROM vals WHERE id=?`)
-      .bind(action, set.value ?? old.value, set.status ?? old.status, set.confidence ?? old.confidence, me.now, me.device, id),
+    // Ultrareview 2 #8 (migration 0011): also the warning level, the source and the note, old and new.
+    env.DB.prepare(`INSERT INTO history(value_id, action, old_value, new_value, old_status, new_status, old_confidence, new_confidence,
+      old_ftlb_lo, new_ftlb_lo, old_ftlb_hi, new_ftlb_hi, old_ftlb_src, new_ftlb_src, old_warn, new_warn, old_source, new_source, old_note, new_note, at, device)
+      SELECT id, ?, value, ?, status, ?, confidence, ?, ftlb_lo, ?, ftlb_hi, ?, ftlb_src, ?, warn, ?, source, ?, note, ?, ?, ? FROM vals WHERE id=?`)
+      .bind(action, set.value ?? old.value, set.status ?? old.status, set.confidence ?? old.confidence, nw('ftlb_lo'), nw('ftlb_hi'), nw('ftlb_src'),
+        nw('warn'), nw('source'), nw('note'), me.now, me.device, id),
     env.DB.prepare(`UPDATE vals SET ${keys.map(k => k + '=?').join(', ')}, updated_at=? WHERE id=?`).bind(...keys.map(k => set[k]), me.now, id)]);
   return json({ ok: true });
 }
@@ -288,8 +376,11 @@ async function changeValue(env, id, action, set, me) {
 // ---------- Jobs (research queue, processor-agnostic) ----------
 async function missingFields(env, v) {
   const { fields } = await tabsFields(env);
-  const have = new Set((await carValues(env, v, false)).map(x => x.field_id));
-  return fields.filter(f => !have.has(f.id)).map(f => ({ tab: f.tab, field: f.name }));
+  const vals = await carValues(env, v, false);
+  const have = new Set(vals.map(x => x.field_id));
+  // HANDOFF 15: no research for a tire field that has a confirmed door-card value (per field, ultrareview F9); no oil research for an electric car.
+  const placard = placardFields(vals), ev = v.fuel === 'ev';
+  return fields.filter(f => !have.has(f.id) && !placard.has(f.id) && !(ev && f.tab === 'oil')).map(f => ({ tab: f.tab, field: f.name }));
 }
 // The request holds only make, model, year, trim and field names. Never a VIN, a name, notes or photos.
 async function queueJob(env, v, kind, wanted, me) {
@@ -325,7 +416,7 @@ async function jobResult(env, id, b, me) {
   if (j.status !== 'claimed' || j.claimed_by !== me.token || !(j.lease_until > me.now)) return bad('This job is not claimed by you, or the lease ran out. Claim it again.', 409);
   const rq = JSON.parse(j.request), vals = Array.isArray(b.values) ? b.values : null;
   if (!vals) return bad('Need values: a list of {tab, field, value, confidence, source}');
-  const stmts = [];
+  const stmts = []; let skipped = 0;
   for (const x of vals) {
     if (!x || !String(x.value || '').trim() || !CONF.includes(x.confidence) || !String(x.source || '').trim()) return bad('Each value needs field, value, confidence and source');
     const f = await fieldByName(env, String(x.tab || ''), String(x.field || ''));
@@ -333,13 +424,125 @@ async function jobResult(env, id, b, me) {
     // HANDOFF 13 (Rick, review finding b): the server does not trust the processor's confidence on a safety field. High needs a source
     // that cites a page ("p.7-16", "p. 12", "PDF p.25"). Without it the whole result is refused and the job stays claimed.
     if (f.is_safety && x.confidence === 'High' && !/\bp\.\s*\d/i.test(String(x.source))) return bad(`High on the safety field "${x.field}" needs a source that cites a page (p.)`);
+    const noNums = x.ftlb_lo === undefined || x.ftlb_lo === null || x.ftlb_lo === '';
+    const tq = isTorque(String(x.tab), String(x.field)) ? ftlbOf(noNums ? { ...ftlbFromText(x.value), ftlb_src: 'converted' } : x) : {};
+    if (tq.err) return bad(tq.err);
+    // HANDOFF 15 (REVIEW problem 1): a field that already has a confirmed value for this make, model and year is skipped, not posted again.
+    if (await env.DB.prepare("SELECT 1 FROM vals WHERE field_id=? AND scope='model' AND make=? AND model=? AND year_from<=? AND year_to>=? AND status='confirmed' LIMIT 1").bind(f.id, rq.make, rq.model, rq.year, rq.year).first()) { skipped++; continue; }
     stmts.push(...insertValueStmts(env, { field_id: f.id, scope: 'model', make: rq.make, model: rq.model, year_from: rq.year, year_to: rq.year,
-      value: String(x.value).trim(), confidence: x.confidence, source: x.source, note: x.note, status: 'proposed' }, me));
+      value: String(x.value).trim(), confidence: x.confidence, source: x.source, note: x.note, status: 'proposed', ...tq }, me));
   }
   stmts.push(env.DB.prepare("UPDATE jobs SET status='done', result_summary=?, lease_until=NULL, updated_at=? WHERE id=? AND status='claimed' AND claimed_by=?")
-    .bind(`${vals.length} proposed value(s)`, me.now, id, me.token));
+    .bind(`${vals.length - skipped} proposed value(s)${skipped ? `, ${skipped} skipped (already confirmed)` : ''}`, me.now, id, me.token));
   await env.DB.batch(stmts);
-  return json({ ok: true, proposed: vals.length });
+  return json({ ok: true, proposed: vals.length - skipped, skipped });
+}
+
+// ---------- Service log (HANDOFF 15) ----------
+// A visit = one row in service_entries (date, mileage) with its items in service_entry_items. The items a car offers come from the
+// table service_items filtered by the car's fuel. Edit and delete are Rick only; a delete is soft (deleted_at). Every create, edit and
+// delete adds a service_log_history row. The processor (research worker) has no access, except the CSV route for the nightly export.
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const validDate = s => { if (!DATE_RE.test(s)) return false; const d = new Date(s + 'T00:00:00Z'); return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s; };
+const MILES_MAX = 2000000;
+// withInactive: also the items that are switched off (active=0); used for a visit's own items (ultrareview F5).
+async function serviceItems(env, fuel, withInactive) {
+  const { results } = await env.DB.prepare(`SELECT id, name, options_json, applies_fuels, sort FROM service_items ${withInactive ? '' : 'WHERE active=1'} ORDER BY sort, id`).all();
+  return results.filter(r => !fuel || list(r.applies_fuels).includes(fuel))
+    .map(r => { const o = r.options_json ? JSON.parse(r.options_json) : {}; return { id: r.id, name: r.name, choices: o.choices || null, text: !!o.text }; });
+}
+// Entries with their items, newest first (date, then mileage, then id). where: extra SQL on alias e; binds go with it.
+async function serviceEntries(env, where, binds) {
+  const w = `e.deleted_at IS NULL${where ? ' AND ' + where : ''}`;
+  const es = (await env.DB.prepare(`SELECT e.id, e.vehicle_id, e.date, e.mileage, e.created_at, e.created_by, v.year, v.make, v.model, v.owner
+    FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE ${w} ORDER BY e.date DESC, e.mileage DESC, e.id DESC`).bind(...binds).all()).results;
+  const its = (await env.DB.prepare(`SELECT i.entry_id, i.item_id, s.name, i.option, i.other_text FROM service_entry_items i JOIN service_items s ON s.id = i.item_id
+    JOIN service_entries e ON e.id = i.entry_id JOIN vehicles v ON v.id = e.vehicle_id WHERE ${w} ORDER BY i.id`).bind(...binds).all()).results;
+  const by = new Map(es.map(e => [e.id, { ...e, items: [] }]));
+  its.forEach(i => by.get(i.entry_id).items.push({ item_id: i.item_id, name: i.name, option: i.option, other_text: i.other_text }));
+  return [...by.values()];
+}
+// Check a visit's input. Returns { err, status } or { date, mileage, items }. The mileage-order check is skipped with force.
+// keep: the item ids the visit already has (an edit). They stay valid when the car's fuel or the item list changed since; only an item
+// that is added must apply to the car now (ultrareview F5).
+async function checkVisit(env, v, b, excludeId, me, keep) {
+  const date = String(b.date || me.now.slice(0, 10)), mileage = Number(b.mileage);
+  if (!validDate(date)) return { err: 'The date must be YYYY-MM-DD', status: 400 };
+  if (date > me.now.slice(0, 10)) return { err: 'The date cannot be in the future', status: 400 };
+  if (b.mileage === undefined || b.mileage === null || b.mileage === '' || !Number.isInteger(mileage) || mileage < 0 || mileage > MILES_MAX) return { err: `The mileage must be a whole number from 0 to ${MILES_MAX}`, status: 400 };
+  if (!Array.isArray(b.items) || !b.items.length || b.items.length > 20) return { err: 'Need 1 to 20 items', status: 400 };
+  const avail = new Map((await serviceItems(env, v.fuel)).map(i => [i.id, i])), seen = new Set(), items = [];
+  if (keep && keep.size) for (const i of await serviceItems(env, null, true)) if (keep.has(i.id) && !avail.has(i.id)) avail.set(i.id, i);
+  for (const x of b.items) {
+    const id = Number(x && x.item_id), it = avail.get(id);
+    if (!it) return { err: `Item ${x && x.item_id} does not apply to this car`, status: 400 };
+    if (seen.has(id)) return { err: `${it.name} is in the visit twice`, status: 400 };
+    seen.add(id);
+    let option = '', other = '';
+    if (it.choices) { option = String(x.option || ''); if (!it.choices.includes(option)) return { err: `${it.name} needs one option: ${it.choices.join(', ')}`, status: 400 }; }
+    if (it.text) { other = String(x.other_text || '').trim(); if (!other || other.length > 120 || /[\u0000-\u001f]/.test(other)) return { err: 'Other needs one typed line of 1 to 120 characters', status: 400 }; }
+    items.push({ item_id: id, name: it.name, option, other_text: other });
+  }
+  if (!(b.force === 1 || b.force === '1' || b.force === true)) {
+    const ex = excludeId || 0;
+    const before = await env.DB.prepare('SELECT date, mileage FROM service_entries WHERE vehicle_id=? AND deleted_at IS NULL AND id<>? AND date<? ORDER BY date DESC, mileage DESC, id DESC LIMIT 1').bind(v.id, ex, date).first();
+    const after = await env.DB.prepare('SELECT date, mileage FROM service_entries WHERE vehicle_id=? AND deleted_at IS NULL AND id<>? AND date>? ORDER BY date, mileage, id LIMIT 1').bind(v.id, ex, date).first();
+    const lower = await env.DB.prepare('SELECT 1 x FROM service_entries WHERE vehicle_id=? AND deleted_at IS NULL AND id<>? AND date<? AND mileage>? LIMIT 1').bind(v.id, ex, date, mileage).first();
+    const higher = await env.DB.prepare('SELECT 1 x FROM service_entries WHERE vehicle_id=? AND deleted_at IS NULL AND id<>? AND date>? AND mileage<? LIMIT 1').bind(v.id, ex, date, mileage).first();
+    if (lower || higher) return { conflict: { error: 'This mileage does not fit the visits before and after this date', confirm_needed: true, before: before || null, after: after || null }, status: 409 };
+  }
+  return { date, mileage, items };
+}
+const entryJson = (id, vehicle_id, d) => JSON.stringify({ id, vehicle_id, date: d.date, mileage: d.mileage, items: d.items.map(({ item_id, name, option, other_text }) => ({ item_id, name, option, other_text })) });
+const itemStmts = (env, id, items) => items.map(i => env.DB.prepare('INSERT INTO service_entry_items(entry_id, item_id, option, other_text) VALUES(?,?,?,?)').bind(id, i.item_id, i.option, i.other_text));
+async function addVisit(env, v, b, me) {
+  const d = await checkVisit(env, v, b, 0, me);
+  if (d.err) return bad(d.err, d.status);
+  if (d.conflict) return json(d.conflict, 409);
+  const id = ((await env.DB.prepare('SELECT COALESCE(MAX(id), 0) + 1 n FROM (SELECT id FROM service_entries UNION ALL SELECT entry_id FROM service_log_history)').first()).n);
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO service_entries(id, vehicle_id, date, mileage, created_at, created_by) VALUES(?,?,?,?,?,?)').bind(id, v.id, d.date, d.mileage, me.now, me.device),
+    ...itemStmts(env, id, d.items),
+    env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) VALUES(?, 'insert', NULL, ?, ?, ?)").bind(id, entryJson(id, v.id, d), me.now, me.device)]);
+  return json({ ok: true, id, date: d.date, mileage: d.mileage, items: d.items }, 201);
+}
+async function changeVisit(env, id, method, b, me) {
+  if (me.processor) return bad('Only Rick can change or delete a visit', 403);
+  const cur = (await serviceEntries(env, 'e.id=?', [id]))[0];
+  if (!cur) return bad('Visit not found', 404);
+  const before = entryJson(id, cur.vehicle_id, cur);
+  if (method === 'DELETE') {
+    await env.DB.batch([env.DB.prepare('UPDATE service_entries SET deleted_at=? WHERE id=?').bind(me.now, id),
+      env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) VALUES(?, 'delete', ?, NULL, ?, ?)").bind(id, before, me.now, me.device)]);
+    return json({ ok: true });
+  }
+  const v = await vehicleRow(env, cur.vehicle_id);
+  const d = await checkVisit(env, v, { date: cur.date, mileage: cur.mileage, items: cur.items, ...b }, id, me, new Set(cur.items.map(i => i.item_id)));
+  if (d.err) return bad(d.err, d.status);
+  if (d.conflict) return json(d.conflict, 409);
+  await env.DB.batch([
+    env.DB.prepare('UPDATE service_entries SET date=?, mileage=? WHERE id=?').bind(d.date, d.mileage, id),
+    env.DB.prepare('DELETE FROM service_entry_items WHERE entry_id=?').bind(id),
+    ...itemStmts(env, id, d.items),
+    env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) VALUES(?, 'update', ?, ?, ?, ?)").bind(id, before, entryJson(id, v.id, d), me.now, me.device)]);
+  return json({ ok: true, id, date: d.date, mileage: d.mileage, items: d.items });
+}
+// CSV: one line per item. A cell that starts with = + - @ gets a leading apostrophe so a spreadsheet does not run it as a formula.
+const csvCell = s => { let t = String(s ?? ''); if (/^[=+\-@]/.test(t)) t = "'" + t; return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+async function serviceCsv(env, carId, format, me) {
+  const v = await vehicleRow(env, carId); if (!v) return bad('Car not found', 404);
+  const es = (await serviceEntries(env, 'e.vehicle_id=?', [carId])).reverse();
+  const car = `${v.year} ${v.make} ${v.model}`;
+  let rows;
+  if (format === 'lubelogger') {
+    // LubeLogger import shape: one line per visit. Cost stays empty (LiftPad does not keep costs).
+    rows = [['Date', 'Odometer', 'Description', 'Notes', 'Cost'], ...es.map(e => [e.date, e.mileage,
+      e.items.map(i => i.name + (i.option ? ` (${i.option})` : '')).join('; '), e.items.filter(i => i.other_text).map(i => i.other_text).join('; '), ''])];
+  } else {
+    // The processor never gets the owner's name; its CSV leaves the column empty (the export script fills it from the private owners file).
+    rows = [['date', 'mileage', 'item', 'option', 'other_text', 'car', 'owner'], ...es.flatMap(e => e.items.map(i => [e.date, e.mileage, i.name, i.option, i.other_text, car, me.processor ? '' : (v.owner || '')]))];
+  }
+  return new Response(rows.map(r => r.map(csvCell).join(',')).join('\n') + '\n', { headers: { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
 export default {
@@ -348,7 +551,17 @@ export default {
     if (!p.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {
       const me = await who(req, env);
-      if (p === '/api/health') { const n = await env.DB.prepare("SELECT (SELECT count(*) FROM ali_index) a, (SELECT count(*) FROM classics) c, (SELECT count(*) FROM vehicles) v, (SELECT count(*) FROM makes) m, (SELECT count(*) FROM vals) vals, (SELECT count(*) FROM vals WHERE status='proposed') proposed, (SELECT count(*) FROM jobs WHERE status IN ('queued','claimed')) jobs, (SELECT count(*) FROM ali_pages WHERE status='ok') pages, (SELECT count(*) FROM make_defaults) defaults, (SELECT count(*) FROM thread_ranges) ranges, (SELECT max(id) FROM schema_migrations) schema").first(); return json({ ok: true, ...n, auto_research: env.LP_AUTO_RESEARCH === '1' ? 1 : 0 }); }
+      if (me.badJwt) return bad('The Access token could not be verified', 403);
+      if (me.processor &&!PROC_ROUTES.some(([pm, re]) => pm === m && re.test(p))) return bad('Not for the processor', 403);
+      // Ultrareview F11 (Rick 2026-10-27, D1 read quota): the 15-minute ping reads only the newest migration id (the primary-key index:
+      // about 1 row). The counts (about 3,600 rows read) only with ?full=1 and a tool token, once a day. rows_read is D1's own figure.
+      if (p === '/api/health') {
+        const full = url.searchParams.get('full') === '1';
+        if (full && !me.tool) return bad('The full health check needs a tool service token', 403);
+        const r = await env.DB.prepare(full ? "SELECT (SELECT count(*) FROM ali_index) a, (SELECT count(*) FROM classics) c, (SELECT count(*) FROM vehicles) v, (SELECT count(*) FROM makes) m, (SELECT count(*) FROM vals) vals, (SELECT count(*) FROM vals WHERE status='proposed') proposed, (SELECT count(*) FROM jobs WHERE status IN ('queued','claimed')) jobs, (SELECT count(*) FROM ali_pages WHERE status='ok') pages, (SELECT count(*) FROM make_defaults) defaults, (SELECT count(*) FROM thread_ranges) ranges, (SELECT max(id) FROM schema_migrations) schema"
+          : 'SELECT max(id) schema FROM schema_migrations').all();
+        return json({ ok: true, ...r.results[0], full, rows_read: r.meta && r.meta.rows_read != null ? r.meta.rows_read : null, auto_research: env.LP_AUTO_RESEARCH === '1' ? 1 : 0, build: env.LP_BUILD || null });
+      }
       // ALI page images (decision 4): the list from ali_pages, and each image from the private bucket.
       if (p === '/api/ali/pages' && m === 'GET') {
         const ed = url.searchParams.get('edition');
@@ -389,7 +602,7 @@ export default {
         // only BEV, or a sole fuel "Electric", counts.
         const ev = /^BEV/i.test(d.ElectrificationLevel || '') || (/^electric$/i.test((d.FuelTypePrimary || '').trim()) && !d.FuelTypeSecondary);
         const engine = [d.DisplacementL && `${(+d.DisplacementL).toFixed(1)}L`, d.EngineCylinders && `${d.EngineCylinders} cyl`, d.EngineModel].filter(Boolean).join(' ');
-        return json({ vin, year: parseInt(d.ModelYear, 10) || null, make: d.Make ? d.Make[0] + d.Make.slice(1).toLowerCase() : '', model: d.Model || '', trim: [d.Trim, d.Series].filter(Boolean).join(' '),
+        return json({ vin, year: parseInt(d.ModelYear, 10) || null, make: d.Make ? await canonMake(env, d.Make) : '', model: d.Model || '', trim: [d.Trim, d.Series].filter(Boolean).join(' '),
           engine, fuel: d.FuelTypePrimary || '', electrification: d.ElectrificationLevel || '', ev, error: d.ErrorCode !== '0' ? d.ErrorText : '' });
       }
       if (p === '/api/tabs' && m === 'GET') return json(await tabsFields(env));
@@ -405,6 +618,37 @@ export default {
         if (!q('make') || !yearOk(parseInt(q('year'), 10))) return bad('Need make and a 4-digit year');
         return json(lookupLinks({ year: q('year'), make: q('make'), model: q('model'), engine: q('engine'), ev: q('ev') === '1' }));
       }
+      // HANDOFF 15: service log. The processor has no access, except the CSV route (nightly export; its owner column is empty).
+      if (p === '/api/service-log.csv' && m === 'GET') {
+        const car = parseInt(url.searchParams.get('car'), 10); if (!car) return bad('Need car=<id>');
+        return serviceCsv(env, car, url.searchParams.get('format') === 'lubelogger' ? 'lubelogger' : 'liftpad', me);
+      }
+      if ((p === '/api/service-items' || p === '/api/service' || /^\/api\/service\/\d+(\/history)?$/.test(p) || /^\/api\/vehicles\/\d+\/service$/.test(p)) && me.processor) return bad('Service log is not for the processor', 403);
+      if (p === '/api/service-items' && m === 'GET') {
+        const car = parseInt(url.searchParams.get('car'), 10), v = car ? await vehicleRow(env, car) : null;
+        return json(await serviceItems(env, v && v.fuel));
+      }
+      if (p === '/api/service' && m === 'GET') {
+        const car = parseInt(url.searchParams.get('car'), 10), owner = url.searchParams.get('owner');
+        const w = [], bnd = []; if (car) { w.push('e.vehicle_id=?'); bnd.push(car); } if (owner) { w.push('v.owner=?'); bnd.push(owner); }
+        return json(await serviceEntries(env, w.join(' AND '), bnd));
+      }
+      let sm = p.match(/^\/api\/service\/(\d+)\/history$/);
+      if (sm && m === 'GET') return json((await env.DB.prepare('SELECT id, entry_id, action, before_json, after_json, at, who FROM service_log_history WHERE entry_id=? ORDER BY id').bind(+sm[1]).all()).results);
+      sm = p.match(/^\/api\/service\/(\d+)$/);
+      if (sm && (m === 'PATCH' || m === 'DELETE')) return changeVisit(env, +sm[1], m, m === 'PATCH' ? await req.json() : {}, me);
+      sm = p.match(/^\/api\/vehicles\/(\d+)\/service$/);
+      if (sm && m === 'GET') {
+        const v = await vehicleRow(env, +sm[1]); if (!v) return bad('Car not found', 404);
+        const entries = await serviceEntries(env, 'e.vehicle_id=?', [v.id]), last_done = {};
+        entries.forEach(e => e.items.forEach(i => { if (!last_done[i.item_id]) last_done[i.item_id] = { date: e.date, mileage: e.mileage }; }));
+        // all_items: every item, also switched-off ones, so an edit can show a visit's own items that the car no longer offers (F5)
+        return json({ fuel: v.fuel || null, items: await serviceItems(env, v.fuel), all_items: await serviceItems(env, null, true), entries, last_done, last_mileage: entries.length ? entries[0].mileage : null });   // entries are newest first: the latest visit by date, not the highest mileage
+      }
+      if (sm && m === 'POST') {
+        const v = await vehicleRow(env, +sm[1]); if (!v) return bad('Car not found', 404);
+        return addVisit(env, v, await req.json(), me);
+      }
       if (p === '/api/needs-confirming' && m === 'GET') {
         const { results } = await env.DB.prepare(`${VAL_SELECT} WHERE x.status='proposed' ORDER BY x.make, x.model, x.year_from, t.sort, f.sort, x.id`).all();
         // A proposed torque outside the usual range of the thread is flagged here too (decision 9).
@@ -416,36 +660,73 @@ export default {
             seen.set(k, (await typical(env, x.make, x.year_from, own)).range); }
           x.range_flag = rangeFlag(x, seen.get(k)); x.range = seen.get(k);
         }
+        // HANDOFF 15 (suggestion 9): a proposal for a field that already has a confirmed value shows that value ("replaces").
+        for (const x of results) {
+          const c = await env.DB.prepare(`SELECT c.value, c.ftlb_lo, c.ftlb_hi FROM vals c WHERE c.field_id=? AND c.status='confirmed' AND c.id<>? AND (
+            (? = 'car' AND c.scope='car' AND c.vehicle_id=?) OR (? = 'model' AND c.scope='model' AND c.make=? AND c.model=? AND c.year_from<=? AND c.year_to>=?)) ORDER BY c.id LIMIT 1`)
+            .bind(x.field_id, x.id, x.scope, x.vehicle_id, x.scope, x.make, x.model, x.year_to, x.year_from).first();
+          x.replaces = c ? (c.ftlb_lo != null ? `${c.ftlb_lo}${c.ftlb_hi != null ? '-' + c.ftlb_hi : ''} ft-lb` : c.value) : null;
+        }
         return json({ count: results.length, values: results });
       }
       if (p === '/api/vehicles' && m === 'GET') {
         // Storyboard T1: each tile has a status line - how many values there are, how many wait for a
         // confirm, and how many block values (warn = 2, an open problem) apply. Home shows only a block;
         // a caution (warn = 1, a standing step such as the air suspension) shows on the Lift tab (HANDOFF 10).
-        const all = (await env.DB.prepare(`SELECT v.id, v.year, v.make, v.model, v.trim, v.grp, v.last_seen, strftime('%Y-%m-%dT%H:%M:%fZ', v.created) created_iso,
+        const all = (await env.DB.prepare(`SELECT v.id, v.year, v.make, v.model, v.trim, v.grp, v.last_seen, v.owner, v.fuel, strftime('%Y-%m-%dT%H:%M:%fZ', v.created) created_iso,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND ${CAR_VALS}) nvals,
           (SELECT count(*) FROM vals x WHERE x.status='proposed' AND ${CAR_VALS}) nproposed,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=2 AND ${CAR_VALS}) nblock,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=1 AND ${CAR_VALS}) ncaution
           FROM vehicles v ORDER BY CASE v.grp WHEN 'mine' THEN 0 WHEN 'frequent' THEN 1 ELSE 2 END, v.make, v.model, v.year`).all()).results
           .map(v => ({ ...v, hidden: hidden(v, me.nowMs), mine: v.grp === 'mine' ? 1 : 0 }));
+        // HANDOFF 15: the owner's name is never sent to the processor (and so never to a model): the key is removed, not blanked.
+        if (me.processor) all.forEach(v => forMe(v, me));
+        else {   // suggestion 11: the last visit of each car, one line on its Home card
+          const seenCar = new Set(), last = new Map();
+          for (const e of await serviceEntries(env, '', [])) if (!seenCar.has(e.vehicle_id)) { seenCar.add(e.vehicle_id); last.set(e.vehicle_id, { date: e.date, mileage: e.mileage, items: e.items.map(i => i.name) }); }
+          all.forEach(v => { v.last_service = last.get(v.id) || null; });
+        }
         return json(url.searchParams.get('hidden') === '1' ? all : all.filter(v => !v.hidden));
       }
       if (p === '/api/vehicles' && m === 'POST') {
         const b = await req.json(); const year = parseInt(b.year, 10);
         if (!b.make || !b.model || !yearOk(year)) return bad('Need year, make and model');
+        b.make = await canonMake(env, b.make);   // ultrareview 2 #9
         const grp = GROUPS.includes(b.grp) ? b.grp : (b.mine === true ? 'mine' : 'visitor');
         const r = await env.DB.prepare('INSERT INTO vehicles(year, make, model, trim, vin, mine, grp, last_seen) VALUES(?,?,?,?,?,?,?,?) RETURNING id')
           .bind(year, b.make, b.model, b.trim || '', b.vin || '', grp === 'mine' ? 1 : 0, grp, me.now).first();
         await autoResearch(env, await vehicleRow(env, r.id), me);
-        return json(await vehicle(env, r.id, me, false), 201);
+        return json(forMe(await vehicle(env, r.id, me, false), me), 201);
       }
       let mm = p.match(/^\/api\/vehicles\/(\d+)$/);
       // Decision 11: the VIN is on the car record only and goes to NHTSA only - never to the processor.
-      if (mm && m === 'GET') { const v = await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'); if (v && me.processor) { delete v.vin; delete v.notes; delete v.chart_notes; delete v.chart_notes_footer; } return v ? json(v) : bad('Car not found', 404); }
+      if (mm && m === 'GET') { const v = forMe(await vehicle(env, +mm[1], me, url.searchParams.get('peek') !== '1'), me); return v ? json(v) : bad('Car not found', 404); }
       if (mm && m === 'PATCH') {
         const b = await req.json(); const v = await vehicleRow(env, +mm[1]);
         if (!v) return bad('Car not found', 404);
+        // HANDOFF 15: owner, fuel, engine and the chart-caution switch. Not for the processor. An empty owner, fuel or engine clears it.
+        if (['owner', 'fuel', 'engine', 'hide_chart_cautions'].some(k => k in b) && !('grp' in b) && !('vin' in b) && !('trim' in b)) {
+          if (me.processor) return bad('The processor cannot change these fields', 403);
+          const set = {};
+          for (const k of ['owner', 'engine']) if (k in b) {
+            const t = String(b[k] ?? '').trim();
+            if (t.length > 60 || /[\u0000-\u001f]/.test(t)) return bad(`${k} has at most 60 characters and no control characters`);
+            set[k] = t || null;
+          }
+          if ('fuel' in b) {
+            const t = String(b.fuel ?? '').trim();
+            if (t && !FUELS.includes(t)) return bad(`Fuel must be one of ${FUELS.join(', ')}`);
+            set.fuel = t || null;
+          }
+          if ('hide_chart_cautions' in b) {
+            if (![0, 1, true, false, '0', '1'].includes(b.hide_chart_cautions)) return bad('hide_chart_cautions must be 0 or 1');
+            set.hide_chart_cautions = b.hide_chart_cautions === true || b.hide_chart_cautions === 1 || b.hide_chart_cautions === '1' ? 1 : 0;
+          }
+          const keys = Object.keys(set);
+          await env.DB.prepare(`UPDATE vehicles SET ${keys.map(k => k + '=?').join(', ')} WHERE id=?`).bind(...keys.map(k => set[k]), v.id).run();
+          return json({ ok: true, ...set });
+        }
         // HANDOFF 13: Rick edits the trim. The change is logged as a dated line in vehicles.notes (no new table);
         // the processor never reads that column and never changes the trim.
         if ('trim' in b && !('grp' in b) && !('vin' in b)) {
@@ -473,10 +754,29 @@ export default {
         return json({ ok: true, workup_job: job });
       }
       if (mm && m === 'DELETE') {
+        // Ultrareview F7: the processor never deletes a car (it would also wipe the car's service log). The allowlist refuses it first.
+        if (me.processor) return bad('The processor cannot delete a car', 403);
+        // Ultrareview 2 #2: the car's door-jamb photos go first. vehicles.id can be given again to the next car (no AUTOINCREMENT), and that
+        // car would list and serve them. Photos first: if the delete below fails, the car stays without photos, never photos without a car.
+        if (env.BUCKET) {
+          let cursor;
+          do {
+            const l = await env.BUCKET.list({ prefix: `photos/${+mm[1]}/`, cursor });
+            if (l.objects.length) await env.BUCKET.delete(l.objects.map(o => o.key));
+            cursor = l.truncated ? l.cursor : undefined;
+          } while (cursor);
+        }
         // Car overrides go with the car, each with its history row; model-year values stay (other cars use them).
         const ids = (await env.DB.prepare("SELECT id FROM vals WHERE scope='car' AND vehicle_id=?").bind(+mm[1]).all()).results.map(r => r.id);
         for (const id of ids) await changeValue(env, id, 'delete', {}, me);
-        await env.DB.batch([env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]), env.DB.prepare('DELETE FROM vehicles WHERE id=?').bind(+mm[1])]);
+        // The service log goes with the car, but not silently: one history row per visit says it was deleted with the car.
+        await env.DB.batch([env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
+          env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim NOT LIKE 'SELFTEST%'").bind(me.now, me.device, +mm[1]),
+          // A self-test car (trim starts with SELFTEST) leaves nothing behind: its visits and their history rows go (Rick 2026-10-27).
+          env.DB.prepare("DELETE FROM service_log_history WHERE entry_id IN (SELECT e.id FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
+          env.DB.prepare('DELETE FROM service_entry_items WHERE entry_id IN (SELECT id FROM service_entries WHERE vehicle_id=?)').bind(+mm[1]),
+          env.DB.prepare('DELETE FROM service_entries WHERE vehicle_id=?').bind(+mm[1]),
+          env.DB.prepare('DELETE FROM vehicles WHERE id=?').bind(+mm[1])]);
         return json({ ok: true });
       }
       // Decision 10: door-jamb photos in the private bucket, photos/<car>/<time>.jpg. Never sent to any
@@ -513,7 +813,7 @@ export default {
       if (mm && m === 'POST') {
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         const err = await addValue(env, v, await req.json(), me); if (err) return err;
-        return json(await vehicle(env, v.id, me, false), 201);
+        return json(forMe(await vehicle(env, v.id, me, false), me), 201);
       }
       mm = p.match(/^\/api\/values\/(\d+)$/);
       if (mm && m === 'PATCH') {
@@ -522,6 +822,13 @@ export default {
         if ('warn' in b) {   // only Rick changes or clears a warning level
           if (me.processor) return bad('The processor cannot change a warning level', 403);
           const w = level(b.warn); if (w === null) return bad(LEVEL_ERR); set.warn = w;
+        }
+        if ('ftlb_lo' in b || 'ftlb_hi' in b || 'ftlb_src' in b) {   // HANDOFF 15: the torque numbers, Torque field only
+          const f = await env.DB.prepare('SELECT f.name, t.name tab FROM vals x JOIN fields f ON f.id = x.field_id JOIN tabs t ON t.id = f.tab_id WHERE x.id=?').bind(+mm[1]).first();
+          if (!f) return bad('Value not found', 404);
+          if (!isTorque(f.tab, f.name)) return bad('The ft-lb numbers belong to the Torque field only');
+          const tq = ftlbOf(b); if (tq.err) return bad(tq.err);
+          Object.assign(set, tq);
         }
         if (!Object.keys(set).length) return bad('Nothing to change');
         if ('value' in set && !set.value) return bad('A value cannot be empty');

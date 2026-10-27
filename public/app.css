@@ -97,8 +97,7 @@ label.btn{cursor:pointer}
 .carhead h2{font-size:2.1rem;line-height:1}
 .tabs{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px;border-bottom:2px solid var(--line)}
 .tabs button{border:none;border-bottom:6px solid transparent;border-radius:0;min-height:calc(var(--tap) + 4px);padding:0 6px;margin-bottom:-2px;color:var(--muted);font-size:1.15rem;min-width:0}
-@media (min-width:900px){.tabs button{font-size:1.4rem}}
-.tabs button[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--ink)}
+@media (min-width:900px){.tabs button{font-size:1.4rem}}.tabs button[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--ink)}
 dl{margin:0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:14px 20px}
 @media (max-width:560px){dl{grid-template-columns:minmax(0,1fr)}}
 dt{font:600 .9rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding-top:12px}
@@ -197,3 +196,51 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .pdraw{position:absolute;border:4px dashed #5bb8ff;background:rgb(91 184 255 / .15);pointer-events:none}
 .vhint{position:absolute;left:16px;bottom:16px;margin:0 16px 0 0;background:rgb(11 13 12 / .88);border-radius:10px;padding:10px 14px;color:#c9d0cc;font-size:1rem;pointer-events:none}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* HANDOFF 15: Home button in the header (every page), value cards that open on a tap, the three-number line, the Service tab and the cart. */
+.homebtn{padding:0 22px}
+.vacts{display:none}
+.vcard.open .vacts{display:flex}
+.vcard{cursor:pointer}
+.lastsvc{font:500 .85rem var(--mono)}
+.threeline{display:flex;flex-wrap:wrap;gap:8px 28px;font:600 1.15rem var(--mono);border:2px solid var(--line2);border-radius:10px;padding:10px 16px;background:var(--panel2)}
+.threeline b{font:600 .8rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:6px}
+.chartq{border-left:4px solid var(--line2);padding-left:12px;color:var(--muted);font-style:italic}
+.rangeline,.cautionhidden,.hiddennote{color:var(--muted)}
+.tag{white-space:nowrap}
+/* Service tab and cart: targets 64 px on the lift screen (900 px and up), 48 px on the phone (--tap). */
+.logbtn{min-height:var(--tap)}
+.visits{display:grid;gap:12px}
+.visit{display:grid;gap:6px;border:2px solid var(--line);border-radius:10px;padding:12px 16px;background:var(--panel2)}
+.visit .vhead{display:flex;gap:16px;flex-wrap:wrap;align-items:baseline;font:600 1.15rem var(--mono)}
+.visit ul,.cartsum ul{margin:0;padding-left:22px}
+.cartitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.cartitem{display:grid;gap:8px;align-content:start}
+.itembtn{min-height:var(--tap);width:100%;justify-content:flex-start;padding:0 20px;font-size:1.2rem}
+.cartitem.on .itembtn,.itembtn[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.cartitem .seg{grid-template-columns:repeat(auto-fit,minmax(110px,1fr))}
+.othertext{min-height:var(--tap)}
+.cartfields .field{min-width:200px}
+.cartsum{border:2px solid var(--line2);border-radius:10px;padding:12px 16px;display:grid;gap:6px}
+.submit{margin-top:4px}
+.leaveask{position:fixed;inset:0;z-index:60;background:rgb(0 0 0 / .7);display:grid;place-items:center;padding:16px}
+.leaveask .card{max-width:520px;width:100%}
+/* Phone (suggestions 6 and 7): compact header, tab row that scrolls sideways with a gap, source line only after a tap on the value. */
+@media (max-width:560px){
+  header h1{font-size:1.5rem}
+  header{padding-bottom:8px;gap:8px 12px}
+  .carhead h2{font-size:1.5rem}
+  .tabs{display:flex;overflow-x:auto;gap:12px;scrollbar-width:none}
+  .tabs button{flex:none;padding:0 14px;font-size:1.05rem}
+  dd .src{display:none}
+  dd.open .src{display:block}
+  .homebtn{padding:0 14px}
+}
+/* Print view of the service history: plain black on white. */
+@media print{
+  body{background:#fff;color:#000;font-size:12pt;padding:0}
+  header,.nonprint,.vacts,button,.tabs,#net{display:none!important}
+  .card,.visit{background:#fff;border:1px solid #000;color:#000}
+  .src,.tag,.note{color:#000}
+  .visit{break-inside:avoid}
+}

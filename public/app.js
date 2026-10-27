@@ -20,8 +20,11 @@ function fail(e) { $('#view').innerHTML = `<div class="card"><p class="err">${es
 const GROUP = { mine: 'My cars', frequent: 'Frequent', visitor: 'Visitors' };
 const pill = s => `<span class="pill st-${esc(s)}">${s === 'confirmed' ? 'Confirmed' : s === 'rejected' ? 'Rejected' : 'Proposed'}</span>`;
 // The key numbers (decision 1: 48 px on the lift screen): torque, tire pressures, oil quantity.
-const KEY = new Set(['Torque', 'Pressure', 'Spare pressure', 'Quantity']);
-const keyCls = s => KEY.has(s.field) && /^\s*~?\d/.test(s.value) ? ' key' : '';
+const KEY = new Set(['Torque', 'Pressure', 'Spare pressure', 'Quantity', 'Oil type']);
+const keyCls = s => KEY.has(s.field) && /^\s*~?\d/.test(showVal(s)) ? ' key' : '';
+// HANDOFF 15: "Hyundai Sonata" card text. The owner is shown only when it is not Rick (Rick's cards stay as they were).
+const ownerOf = c => c.owner && !/^rick$/i.test(c.owner.trim()) ? `${c.owner.trim()}'s ` : '';
+const carName = c => `${ownerOf(c)}${c.year} ${c.make} ${c.model}`;
 const when = t => t ? String(t).slice(0, 16).replace('T', ' ') : '';
 const boxStyle = b => `left:${b.x * 100}%;top:${b.y * 100}%;width:${b.w * 100}%;height:${b.h * 100}%`;
 // Oil tab inputs (Handoff 3 decision 7). Each value is saved as text: "0W-20 · dexos1", "4.4 qt",
@@ -43,8 +46,20 @@ const OIL_UI = {
     html: () => `<div class="row"><div class="field"><label for="ob">Filter brand</label><select id="ob" name="brand">${BRANDS.map(x => `<option>${esc(x)}</option>`).join('')}<option value="Other">Other</option></select></div>
       <div class="field"><label for="op">Part number</label><input id="op" name="part" required></div></div>`,
     value: b => `${b.brand === 'Other' ? '' : b.brand + ' '}${(b.part || '').trim()}`.trim() } };
+// Display only (Rick 2026-10-27): the stored text keeps its N-m part, the screen never shows it. "130 ft-lb (176 Nm)" -> "130 ft-lb";
+// "140 N·m (manual: 101 ft-lb)" -> "101 ft-lb"; a text with N-m only is converted.
+const NM = /(?<![A-Za-z])N[·.\s-]?m(?![A-Za-z])/i;
+const noNm = t => {
+  const x = String(t ?? '');
+  if (!NM.test(x)) return x;
+  const ft = x.match(/(\d+(?:\s*[-–]\s*\d+)?)\s*ft[ -]?lbs?/i);
+  if (ft) return ft[1].replace(/\s+/g, '') + ' ft-lb';
+  return x.replace(/(\d+)\s*N[·.\s-]?m(?![A-Za-z])/gi, (_, n) => Math.round(+n * 0.737562) + ' ft-lb');
+};
 const showVal = s => {
-  const m = s.tab === 'oil' && s.field === 'Quantity' && String(s.value).match(/^(\d+(?:\.\d+)?)\s*(qt|L)$/i);
+  // HANDOFF 15: torque is shown from the stored ft-lb numbers. No N-m on screen.
+  if (s.tab === 'torque' && s.field === 'Torque' && s.ftlb_lo != null) return `${s.ftlb_lo}${s.ftlb_hi != null ? '-' + s.ftlb_hi : ''} ft-lb`;
+  const m =s.tab === 'oil' && s.field === 'Quantity' && String(s.value).match(/^(\d+(?:\.\d+)?)\s*(qt|L)$/i);
   if (!m) return s.value;
   const n = +m[1], qt = m[2].toLowerCase() === 'qt';
   return `${n} ${qt ? 'qt' : 'L'} (${(qt ? n * QT_L : n / QT_L).toFixed(1)} ${qt ? 'L' : 'qt'}) with filter`;
@@ -70,11 +85,13 @@ async function home() {
   const [cars, need] = await Promise.all([api('/vehicles' + (showHidden ? '?hidden=1' : '')), api('/needs-confirming')]);
   if (!live()) return;
   crumb(device);
-  $('#hnav').innerHTML = `<a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a><a class="btn primary" href="#/add">+ Car</a>`;
+  $('#hnav').innerHTML = `<a class="btn" href="#/history">History</a><a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a><a class="btn primary" href="#/add">+ Car</a>`;
   // HANDOFF 10: Home shows only a block (warn = 2, an open problem). A caution (warn = 1) is on the Lift tab only.
   const status = c => c.nblock ? ['warn', 'Warning - see the Lift tab'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
     : c.nvals ? ['ok', 'All values confirmed'] : ['none', 'No values yet'];
-  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span></a>`; };
+  // Suggestion 11: one grey line with the last visit, not the history.
+  const lastSvc = c => c.last_service ? `<span class="lastsvc">Last: ${esc(c.last_service.items.join(', '))}, ${esc(c.last_service.date)}, ${Number(c.last_service.mileage).toLocaleString('en-US')} mi</span>` : '';
+  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${esc(ownerOf(c))}${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span>${lastSvc(c)}</a>`; };
   const ago = c => { const d = Math.floor((Date.now() - Date.parse(c.last_seen || c.created_iso || 0)) / 864e5); return d <= 0 ? 'today' : d === 1 ? '1 day ago' : `${d} days ago`; };
   const g = k => cars.filter(c => c.grp === k);
   $('#view').innerHTML = `<section aria-label="My cars" class="tabbody"><h2 class="lbl">My cars</h2><div class="cars">${g('mine').map(tile).join('') || '<div class="empty">No cars yet. Tap + Car.</div>'}</div></section>
@@ -98,7 +115,7 @@ async function confirmPage() {
   $('#view').innerHTML = `<div class="carhead"><a class="btn" href="#/">Home</a><div><h2>Needs confirming</h2><div class="src">${d.count} proposed value${d.count === 1 ? '' : 's'} · check each against the manual or the door label, then confirm or reject</div></div></div>
     <div role="list" class="tabbody">${d.values.map(x => `<div role="listitem" class="crow${x.range_flag === 'outside' ? ' flag' : ''}"><div class="tabbody" style="gap:6px">
       <span class="meta">${what(x)} · ${esc(x.tab)} · ${esc(x.field)}</span>
-      <span class="val${keyCls(x)}">${esc(showVal(x))}</span>
+      <span class="val${keyCls(x)}">${esc(showVal(x))}</span>${x.replaces ? `<span class="note">replaces: ${esc(noNm(x.replaces))}</span>` : ''}
       <span class="meta"><span class="pill ${esc(x.confidence)}" style="margin-left:0">${esc(x.confidence)}</span> ${x.warn ? `<span class="pill lv-${x.warn === 2 ? 'block' : 'caution'}" style="margin-left:0">${x.warn === 2 ? 'Block - do not lift yet' : 'Caution'}</span> ` : ''}${esc(x.source)}</span>${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
       ${x.range_flag === 'outside' && x.range ? `<span class="err">Outside the usual range for ${esc(x.range.thread)} (${x.range.torque_min}-${x.range.torque_max} ft-lb). Check it before you confirm.</span>` : ''}</div>
       <div class="acts"><button class="ok" data-ok="${x.id}">Confirm</button><button data-no="${x.id}">Reject</button></div></div>`).join('') || '<p class="note">Nothing to confirm.</p>'}</div>
@@ -189,7 +206,9 @@ const VERIFIED = { no: 'Not checked - read the page.', ai: 'AI-checked - the pag
 // The kit mark "Do not use a 2-post" makes the block red and puts it first on the tab, with the chart's words. Under
 // every block one fixed line (the lift's own numbers come from the data: foot; the words below are the fallback).
 const FOOT_FALLBACK = 'The chart gives no pad height. Check that the pads reach the lift points and the arms clear the car.';
-const adaptersBlock = (n, foot) => {
+const adaptersBlock = (n, foot, hideCar) => {
+  // HANDOFF 15: the per-car switch for the chart's caution text (set for the Jeep). The chart image still shows the caution.
+  const hideBtn = hideCar ? `<button class="ghost" id="cautiontoggle" data-hide="0">Show the chart caution again</button>` : `<button class="ghost" id="cautiontoggle" data-hide="1">Hide the chart caution for this car</button>`;
   const lv = n && VERIFIED[n.verified] ? n.verified : 'no', stop = !!n && /^Do not use a 2-post/.test(n.kit_mark || '');
   // HANDOFF 13: "I checked this chart" until Rick has checked it; "Undo" while the check holds (it falls back by itself
   // when the chart text changes). Who and when come from chart_checks.
@@ -204,14 +223,17 @@ const adaptersBlock = (n, foot) => {
     <div><b>Adapters (from the guide):</b> ${esc(n.adapters || 'no adapter callout on the chart')}</div>
     ${n.height_note ? `<div><b>Height:</b> ${esc(n.height_note)}</div>` : ''}
     <div><b>Your kit:</b> ${esc(n.kit_mark || 'height not given')}</div>
-    ${n.cautions ? `<div><b>Cautions:</b> ${esc(n.cautions)}</div>` : ''}${end}</div>` };
+    ${n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}${n.cautions_hidden ? `<div class="src cautionhidden">Chart caution hidden. The car's own caution above applies.</div>` : ''}
+    ${hideBtn}${end}</div>` };
 };
 async function car(id) {
   const live = fresh();
   if (!meta) meta = await api('/tabs');
   const v = await api('/vehicles/' + id);
-  if (!meta.tabs.some(t => t.name === tab)) tab = meta.tabs[0]?.name || 'lift';
-  const rows = v.values.filter(s => s.tab === tab);
+  if (!meta.tabs.some(t => t.name === tab) && tab !== 'service') tab = meta.tabs[0]?.name || 'lift';
+  if (tab === 'service') return servicePage(v, id, live);
+  const hiddenTires = tab === 'tires' ? v.values.filter(s => s.hidden_by_placard).length : 0;
+  const rows = v.values.filter(s => s.tab === tab && !s.hidden_by_placard);
   let ali = '', pageCard = '';
   if (tab === 'lift') {
     const a = v.ali;
@@ -224,7 +246,11 @@ async function car(id) {
       <span class="usechart">Use chart ${esc(a.chart)} - tap to open</span></a>`;
     else if (a && a.status === 'missing_from_scan') pageCard = `<div class="warn bad">The page for chart ${esc(a.chart)} (guide p.${a.guide_page}) is missing from the ${esc(a.edition)} scan. Use a paper guide.</div>`;
   }
-  const ad = tab === 'lift' && v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer) : { stop: false, html: '' };
+  const ad = tab === 'lift' && v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { stop: false, html: '' };
+  // Suggestion 5: the three numbers for a wheels-off job on one line, first on the Lift tab.
+  const bestOf = f => v.values.find(x => x.field === f && x.status === 'confirmed' && !x.hidden_by_placard) || v.values.find(x => x.field === f && x.status !== 'rejected' && !x.hidden_by_placard);
+  const three = tab === 'lift' ? [['Torque', bestOf('Torque')], ['Pressure', bestOf('Pressure')], ['Socket', bestOf('Socket')]].filter(x => x[1]).map(([l, s]) => `<span><b>${l}</b> ${esc(showVal(s))}</span>`).join('') : '';
+  const threeLine = three ? `<div class="threeline">${three}</div>` : '';
   const job = v.jobs[0];
   const jobLine = !job ? '' : job.status === 'done' ? `<span class="warn">Results ready - confirm${job.result_summary ? ' (' + esc(job.result_summary) + ')' : ''}</span>`
     : job.status === 'failed' ? `<span class="warn bad">Research failed: ${esc(job.error)}</span>` : `<span class="note">${job.status === 'claimed' ? 'Researching' : 'Queued'}</span>`;
@@ -233,7 +259,8 @@ async function car(id) {
   const dec = lookTab && v.vin ? await api('/vin?vin=' + encodeURIComponent(v.vin)).catch(() => null) : null;
   // Decision 7: NHTSA says battery-electric -> no engine oil.
   let evNote = '';
-  if (tab === 'oil' && dec && dec.ev) evNote = `<div class="warn"><b>No engine oil (EV).</b> NHTSA says this car is battery-electric (${esc(dec.electrification || dec.fuel)}). It has no engine oil to change.</div>`;
+  if (tab === 'oil' && v.fuel === 'ev') evNote = `<div class="warn"><b>No engine oil (EV).</b> This car is battery-electric. It has no engine oil to change.</div>`;
+  else if (tab === 'oil' && dec && dec.ev) evNote = `<div class="warn"><b>No engine oil (EV).</b> NHTSA says this car is battery-electric (${esc(dec.electrification || dec.fuel)}). It has no engine oil to change.</div>`;
   // Decision 8: links Rick opens and reads himself; LiftPad never fetches them. A tap fills the Source box.
   let links = '';
   if (lookTab) {
@@ -247,54 +274,77 @@ async function car(id) {
   const R = v.typical && v.typical.range, MK = v.typical && v.typical.make;
   const rangeWarn = s => s.range_flag === 'outside' && R ? `<div class="warn bad">Outside the usual range for ${esc(R.thread)} (${R.torque_min}-${R.torque_max} ft-lb). Check it before you use it.</div>` : '';
   let typ = '';
-  if (tab === 'torque' && MK) {
+  const ownTq = rows.find(s => s.field === 'Torque' && s.status === 'confirmed' && s.confidence === 'High');
+  // Suggestion 2: when the car's own torque is confirmed High, one grey line replaces the "Typical for" box (no red LOW badge).
+  if (tab === 'torque' && ownTq && R) typ += `<p class="src rangeline">Range check: ${ownTq.range_flag === 'outside' ? 'OUTSIDE' : 'inside'} ${R.torque_min}-${R.torque_max} ft-lb</p>`;
+  else if (tab === 'torque' && MK) {
     const own = rows.some(s => s.field === 'Torque');
     typ += `<div class="typical${own ? ' after' : ''}"><div class="lbl">${own ? 'Typical for ' + esc(v.make) + ' (for comparison)' : 'No value for this car yet - typical for ' + esc(v.make)}</div>
-      ${MK.torque_ftlb != null ? `<span class="val${own ? '' : ' key'}">~${MK.torque_ftlb} ft-lb</span> <span class="src">(${Math.round(MK.torque_ftlb * 1.35582)} Nm)</span>` : ''}<span class="pill Low">Low</span>
+      ${MK.torque_ftlb != null ? `<span class="val${own ? '' : ' key'}">~${MK.torque_ftlb} ft-lb</span>` : ''}<span class="pill Low">Low</span>
       <div>${[MK.thread, MK.socket && MK.socket + ' socket'].filter(Boolean).map(esc).join(' · ')}</div>
       <div class="note">Typical for ${esc(v.make)} ${esc(MK.era)} - not confirmed for this car.${MK.note ? ' ' + esc(MK.note) + '.' : ''} (table ${esc(MK.edition)})</div></div>`;
   }
-  if (tab === 'torque' && R) typ += `<p class="src">Range for ${esc(R.thread)}${v.typical.thread_from === 'make' ? ` (the typical ${esc(v.make)} thread)` : ''}: ${R.torque_min}-${R.torque_max} ft-lb. A sanity check only, never the car's value. (table ${esc(R.edition)})</p>`;
+  if (tab === 'torque' && R && !ownTq) typ += `<p class="src">Range for ${esc(R.thread)}${v.typical.thread_from === 'make' ? ` (the typical ${esc(v.make)} thread)` : ''}: ${R.torque_min}-${R.torque_max} ft-lb. A sanity check only, never the car's value. (table ${esc(R.edition)})</p>`;
   // Decision 1: a proposed value looks different (dashed amber box, the word Proposed) from a confirmed one.
-  const valueDd = s => `<dd data-v="${s.id}" class="v-${esc(s.status)}"><div><span class="val${keyCls(s)}">${esc(showVal(s))}</span></div>
+  // Suggestions 1 and 7: History and Edit show after a tap on the value card (class "open"); on the phone the source line does too.
+  const valueDd = s => `<dd data-v="${s.id}" class="v-${esc(s.status)} vcard" tabindex="0"><div><span class="val${keyCls(s)}">${esc(showVal(s))}</span>${s.ftlb_src === 'converted' ? '<span class="tag">converted</span>' : ''}</div>
     <div><span class="pill ${esc(s.confidence)}" style="margin-left:0">${esc(s.confidence)}</span>${pill(s.status)}${s.scope === 'car' ? '<span class="tag">this car only</span>' : `<span class="tag">${s.year_from}${s.year_to !== s.year_from ? '-' + s.year_to : ''}</span>`}</div>
     <div class="src">${esc(s.source)}</div>${s.note ? `<div class="note">${esc(s.note)}</div>` : ''}${rangeWarn(s)}
-    <div class="row">${s.status === 'proposed' ? `<button class="ok" data-ok="${s.id}">Confirm</button><button class="ghost" data-no="${s.id}">Reject</button>` : ''}<button class="ghost" data-h="${s.id}">History</button><button class="ghost" data-e="${s.id}">Edit</button></div><div class="hist"></div></dd>`;
+    ${s.status === 'proposed' ? `<div class="row"><button class="ok" data-ok="${s.id}">Confirm</button><button class="ghost" data-no="${s.id}">Reject</button></div>` : ''}
+    <div class="row vacts"><button class="ghost" data-h="${s.id}">History</button><button class="ghost" data-e="${s.id}">Edit</button></div><div class="hist"></div></dd>`;
   // Storyboard T4: a visiting car opens with a first look at Lift, Torque and Tires side by side.
-  const best = f => v.values.find(x => x.field === f && x.status === 'confirmed') || v.values.find(x => x.field === f);
+  // A value hidden by the door card (hidden_by_placard) is never the first look: the car's own label wins here too.
+  const best = f => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard); return c.find(x => x.status === 'confirmed') || c[0]; };
   const firstLook = v.grp !== 'visitor' ? '' : `<div class="first">
     <section aria-label="Lift"><h3>Lift</h3>${v.ali ? `<span class="val">Use chart ${esc(v.ali.chart)}</span><span class="src">ALI ${esc(v.ali.edition)} · ${v.ali.year_from}-${v.ali.year_to} · p.${v.ali.guide_page}</span>` : '<span class="note">No ALI chart</span>'}</section>
-    <section aria-label="Torque"><h3>Torque</h3>${best('Torque') ? `<span class="val key">${esc(best('Torque').value)}</span>${pill(best('Torque').status)}` : MK && MK.torque_ftlb != null ? `<span class="val key">~${MK.torque_ftlb} ft-lb</span><span><span class="pill Low" style="margin-left:0">Low</span> <span class="note">Typical for ${esc(v.make)} - not confirmed</span></span>` : '<span class="note">No value yet</span>'}</section>
+    <section aria-label="Torque"><h3>Torque</h3>${best('Torque') ? `<span class="val key">${esc(showVal(best('Torque')))}</span>${pill(best('Torque').status)}` : MK && MK.torque_ftlb != null ? `<span class="val key">~${MK.torque_ftlb} ft-lb</span><span><span class="pill Low" style="margin-left:0">Low</span> <span class="note">Typical for ${esc(v.make)} - not confirmed</span></span>` : '<span class="note">No value yet</span>'}</section>
     <section aria-label="Tires"><h3>Tires</h3>${best('Pressure') ? `<span class="val key">${esc(best('Pressure').value)}</span>${pill(best('Pressure').status)}` : `<span class="note">No values yet. The door-jamb label is the maker's own source.</span><a class="btn primary" href="#/car/${v.id}/jamb">Door-jamb photo</a>`}</section></div>`;
   if (!live()) return;
   crumb(`${v.year} ${v.make} ${v.model}`);
   $('#view').innerHTML = `${firstLook}<section class="card">
-    <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${v.year} ${esc(v.make)} ${esc(v.model)}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
-    <div class="tabs" role="tablist">${meta.tabs.map(t => `<button role="tab" aria-selected="${tab === t.name}" data-t="${t.name}">${esc(t.label)}</button>`).join('')}</div>
+    <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${esc(carName(v))}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
+    ${tabRow(v)}
     <div class="${pageCard ? 'liftgrid' : 'tabbody'}"><div class="tabbody">
-    ${ad.stop ? ad.html : ''}${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
+    ${threeLine}${ad.stop ? ad.html : ''}${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
     ${ali}${ad.stop ? '' : ad.html}${evNote}
     ${evNote && !rows.length ? '' : `<dl>${rows.filter(s => !s.warn).map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below, or tap Research.</dd>'}</dl>`}
+    ${hiddenTires ? `<p class="src hiddennote">The door card wins: ${hiddenTires} value${hiddenTires === 1 ? '' : 's'} for other wheel sizes ${hiddenTires === 1 ? 'is' : 'are'} hidden (kept in the history).</p>` : ''}
     ${tab === 'tires' ? `<a class="btn primary big" href="#/car/${v.id}/jamb">Door-jamb photo</a><p class="note">The label on the driver door pillar is the maker's own source. Take a photo, then type what it says.</p>` : ''}
     ${typ}${links}
     <details id="addspec" ${evNote ? 'hidden' : ''}><summary class="lbl">+ Add a ${esc(meta.tabs.find(t => t.name === tab)?.label || tab)} value</summary>${valueForm(v)}</details>
     </div>${pageCard}</div>
   </section>
   <div class="row"><button id="research">Research missing values</button>${jobLine}</div>
+  <details class="card editcar" id="editcar"><summary class="lbl">Edit car</summary>
   <div class="row">${Object.keys(GROUP).filter(g => g !== v.grp).map(g => `<button class="ghost" data-g="${g}">Move to ${GROUP[g]}</button>`).join('')}</div>
+  <div class="card" id="ownbox"><div class="row"><div class="field"><label for="ownin">Owner (shown on the card when it is not Rick)</label><input id="ownin" maxlength="60" autocomplete="off" value="${esc(v.owner || '')}"></div>
+    <div class="field"><label for="fuelin">Fuel</label><select id="fuelin"><option value="">not set</option>${['gas', 'diesel', 'hybrid', 'phev', 'ev'].map(f => `<option value="${f}" ${v.fuel === f ? 'selected' : ''}>${f}</option>`).join('')}</select></div>
+    <button id="ownsave">Save owner and fuel</button></div><p class="err" id="ownerr"></p></div>
   <div class="card" id="trimbox"><div><span class="lbl">Trim</span> <span class="val" id="trimnow">${esc(v.trim || 'none')}</span></div>
     <div class="row"><input id="trimin" maxlength="60" autocomplete="off" placeholder="for example SE or Limited" aria-label="Trim" value="${esc(v.trim || '')}"><button id="trimsave">Save trim</button></div>
     <p class="note">The trim goes into the research request. A change is logged with its date.</p><p class="err" id="trimerr"></p></div>
   <div class="card" id="vinbox"><div><span class="lbl">VIN</span> <span class="val" id="vinnow">${esc(v.vin || 'none')}</span></div>
     <div class="row"><input id="vinin" maxlength="17" autocomplete="off" placeholder="17 characters" aria-label="VIN" style="font-family:var(--mono)" value="${esc(v.vin || '')}"><button id="vinsave">Save VIN</button>${scanButton('vinscan')}</div>
     <p class="note">The VIN stays on this car and goes only to NHTSA, to decode the engine and the EV flag.</p><p class="err" id="vinerr"></p></div>
-  <div class="row"><button class="ghost" id="del">Delete car</button></div><p id="delmsg"></p>`;
+  <div class="row"><button class="ghost" id="del">Delete car</button></div></details><p id="delmsg"></p>`;
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; car(id); });
+  document.querySelectorAll('.vcard').forEach(d => d.addEventListener('click', e => { if (!e.target.closest('button,a,input,select,textarea,form')) d.classList.toggle('open'); }));
+  const ct = $('#cautiontoggle'); if (ct) ct.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { hide_chart_cautions: +ct.dataset.hide } }).then(() => car(id)).catch(fail);
+  $('#ownsave').onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { owner: $('#ownin').value, fuel: $('#fuelin').value } }).then(() => car(id)).catch(e => { $('#ownerr').textContent = e.message; });
   wireStatus(() => car(id));
   document.querySelectorAll('[data-h]').forEach(b => b.onclick = async () => {
     const box = b.closest('dd').querySelector('.hist');
     const h = await api(`/values/${b.dataset.h}/history`);
-    box.innerHTML = `<ol class="src">${h.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${esc(r.action)}${r.old_value != null && r.old_value !== r.new_value ? ` · "${esc(r.old_value)}" → "${esc(r.new_value ?? '')}"` : r.new_value != null ? ` · "${esc(r.new_value)}"` : ''}${r.old_status !== r.new_status ? ` · ${esc(r.old_status ?? '')} → ${esc(r.new_status ?? '')}` : ''}</li>`).join('')}</ol>`;
+    // Ultrareview F10: the torque numbers too ("100 ft-lb → 80 ft-lb"), also when the text did not change.
+    const ft = (lo, hi, src) => lo == null ? 'none' : `${lo}${hi != null ? '-' + hi : ''} ft-lb${src === 'converted' ? ' (converted)' : ''}`;
+    const ftl = r => { const o = ft(r.old_ftlb_lo, r.old_ftlb_hi, r.old_ftlb_src), n = ft(r.new_ftlb_lo, r.new_ftlb_hi, r.new_ftlb_src);
+      return r.old_ftlb_lo == null && r.new_ftlb_lo == null ? '' : r.action === 'insert' ? ` · ${n}` : r.action === 'delete' ? ` · ${o}` : o !== n ? ` · ${o} → ${n}` : ''; };
+    // Ultrareview 2 #8: a warning level change ("warning block → none") and a source or note change are shown too (update rows only).
+    const WL = ['none', 'caution', 'block'];
+    const more = r => r.action !== 'update' ? '' : (r.old_warn != null && r.new_warn != null && r.old_warn !== r.new_warn ? ` · warning ${WL[r.old_warn] || r.old_warn} → ${WL[r.new_warn] || r.new_warn}` : '')
+      + (r.old_source != null && r.new_source != null && r.old_source !== r.new_source ? ' · source changed' : '')
+      + (r.old_note != null && r.new_note != null && r.old_note !== r.new_note ? ' · note changed' : '');
+    box.innerHTML = `<ol class="src">${h.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${esc(r.action)}${r.old_value != null && r.old_value !== r.new_value ? ` · "${esc(noNm(r.old_value))}" → "${esc(noNm(r.new_value ?? ''))}"` : r.new_value != null ? ` · "${esc(noNm(r.new_value))}"` : ''}${esc(ftl(r))}${esc(more(r))}${r.old_status !== r.new_status ? ` · ${esc(r.old_status ?? '')} → ${esc(r.new_status ?? '')}` : ''}</li>`).join('')}</ol>`;
   });
   wireValueInputs($('#addspec form'));
   document.querySelectorAll('.links a[data-src]').forEach(a => a.addEventListener('click', () => {
@@ -305,7 +355,8 @@ async function car(id) {
   wireForm($('#addspec form'), body => api(`/vehicles/${id}/values`, { method: 'POST', body: { ...body, tab, status: body.confirm ? 'confirmed' : 'proposed' } }).then(() => car(id)));
   document.querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
     const s = v.values.find(x => x.id == b.dataset.e); const dd = b.closest('dd'); dd.innerHTML = editForm(s);
-    wireForm(dd.querySelector('form'), body => api('/values/' + s.id, { method: 'PATCH', body }).then(() => car(id)), () => api('/values/' + s.id, { method: 'DELETE' }).then(() => car(id)));
+    // The Value box shows the text without N-m; an unchanged box sends the stored text back, so the stored N-m part stays.
+    wireForm(dd.querySelector('form'), body => { if (body.value === noNm(s.value)) body.value = s.value; return api('/values/' + s.id, { method: 'PATCH', body }).then(() => car(id)); }, () => api('/values/' + s.id, { method: 'DELETE' }).then(() => car(id)));
   });
   document.querySelectorAll('.chartcheck').forEach(b => b.onclick = () => api('/chart-checks', { method: 'POST', body: { edition: b.dataset.ed, chart: b.dataset.chart, action: b.dataset.act } })
     .then(() => car(id)).catch(e => { b.parentElement.querySelector('.chartcheckerr').textContent = e.message; }));
@@ -314,7 +365,7 @@ async function car(id) {
   wireScan('vinscan', vin => { $('#vinin').value = vin; $('#vinerr').textContent = 'VIN read from the photo - check it, then Save VIN.'; }, m => { $('#vinerr').textContent = m; });
   document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => car(id)).catch(fail));
   $('#research').onclick = () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => car(id)).catch(e => { $('#delmsg').textContent = e.message; });
-  $('#del').onclick = () => { $('#delmsg').innerHTML = `This deletes the car and its own values. Values for the model and year stay. <button class="primary" id="del2">Yes, delete</button>`; $('#del2').onclick = () => api('/vehicles/' + id, { method: 'DELETE' }).then(() => location.hash = '#/'); };
+  $('#del').onclick = () => { $('#delmsg').innerHTML = `This deletes the car, its own values and its service log. Values for the model and year stay. <button class="primary" id="del2">Yes, delete</button>`; $('#del2').onclick = () => api('/vehicles/' + id, { method: 'DELETE' }).then(() => location.hash = '#/'); };
 }
 function valueForm(v) {
   const fs = meta.fields.filter(f => f.tab === tab);
@@ -332,7 +383,12 @@ function valueForm(v) {
 // The lookup link Rick tapped last for this car (decision 8: source pre-filled, date automatic).
 const lastSource = id => { try { const s = JSON.parse(store.get('lp-lastsrc') || 'null'); return s && s.car === id ? s.src : ''; } catch (e) { return ''; } };
 // The value inputs for one field: the oil inputs on the Oil tab, else one text box.
-const valueInputs = name => (tab === 'oil' && OIL_UI[name]) ? OIL_UI[name].html() : '<div class="field"><label for="vv">Value</label><input id="vv" name="value" placeholder="e.g. 100 ft-lb" required></div>';
+// HANDOFF 15: the Torque field also takes the ft-lb numbers that the screen shows (two boxes and printed / converted).
+const ftlbBoxes = s => `<div class="row"><div class="field"><label for="fl">ft-lb (low)</label><input id="fl" name="ftlb_lo" inputmode="numeric" required value="${s && s.ftlb_lo != null ? s.ftlb_lo : ''}"></div>
+  <div class="field"><label for="fh">ft-lb (high, optional)</label><input id="fh" name="ftlb_hi" inputmode="numeric" value="${s && s.ftlb_hi != null ? s.ftlb_hi : ''}"></div>
+  <div class="field"><label for="fs">Number is</label><select id="fs" name="ftlb_src"><option value="printed" ${s && s.ftlb_src === 'converted' ? '' : 'selected'}>printed in the source</option><option value="converted" ${s && s.ftlb_src === 'converted' ? 'selected' : ''}>converted from N-m</option></select></div></div>`;
+const valueInputs = name => (tab === 'oil' && OIL_UI[name]) ? OIL_UI[name].html()
+  : `<div class="field"><label for="vv">Value</label><input id="vv" name="value" placeholder="e.g. 100 ft-lb" required></div>${tab === 'torque' && name === 'Torque' ? ftlbBoxes(null) : ''}`;
 function wireValueInputs(f) {
   if (!f) return;
   const sel = f.querySelector('select[name=field]');
@@ -346,7 +402,8 @@ function wireValueInputs(f) {
 const warnSelect = lv => `<div class="field"><label>Warning</label><select name="warn">${[[0, 'None'], [1, 'Caution - a standing safety step (Lift tab)'], [2, 'Block - do not lift yet (Home and Lift tab)']].map(([n, t]) => `<option value="${n}" ${+lv === n ? 'selected' : ''}>${t}</option>`).join('')}</select></div>`;
 function editForm(s) {
   return `<form class="form" style="margin-top:12px">
-  <div class="field"><label>Value</label><input name="value" value="${esc(s.value)}" required></div>
+  <div class="field"><label>Value</label><input name="value" value="${esc(noNm(s.value))}" required></div>
+  ${s.tab === 'torque' && s.field === 'Torque' ? ftlbBoxes(s) : ''}
   <div class="field"><label>Confidence</label><select name="confidence">${['High', 'Medium', 'Low'].map(c => `<option ${s.confidence === c ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
   <div class="field"><label>Source</label><input name="source" value="${esc(s.source)}"></div>
   <div class="field"><label>Note</label><input name="note" value="${esc(s.note)}"></div>
@@ -357,7 +414,11 @@ function wireForm(f, save, remove) {
   if (!f) return;
   f.onsubmit = async e => { e.preventDefault(); const b = Object.fromEntries(new FormData(f)); if (f.compose) b.value = f.compose(b);
     try { await save(b); } catch (x) { f.querySelector('.err').textContent = x.message; } };
-  const rm = f.querySelector('[data-rm]'); if (rm && remove) rm.onclick = () => remove().catch(x => f.querySelector('.err').textContent = x.message);
+  // Delete needs a second tap (REVIEW problem 10): the first tap only arms the button.
+  const rm = f.querySelector('[data-rm]'); if (rm && remove) rm.onclick = () => {
+    if (!rm.dataset.armed) { rm.dataset.armed = '1'; rm.textContent = 'Tap again to delete'; setTimeout(() => { delete rm.dataset.armed; rm.textContent = 'Delete value'; }, 5000); return; }
+    remove().catch(x => f.querySelector('.err').textContent = x.message);
+  };
 }
 
 // ---------- Door-jamb photo (Handoff 3 decision 10, storyboard P1 and P2) ----------
@@ -571,6 +632,170 @@ async function appsPage() {
     ${tiles ? `<div class="apps">${tiles}</div>` : '<div class="empty">No apps yet.</div>'}`;
 }
 
+// ---------- Service log (HANDOFF 15) ----------
+// The fifth tab, the cart ("Log work"), the history of one car (#/car/<id>/history) and of all cars (#/history).
+// A visit = one date and one mileage with several items. The server checks the date (400) and the mileage order (409, then
+// "Yes, that is right" sends force=1). Edit and delete are for Rick; a delete is soft and keeps a history row.
+const tabRow = () => `<div class="tabs" role="tablist">${meta.tabs.concat([{ name: 'service', label: 'Service' }]).map(t => `<button role="tab" aria-selected="${tab === t.name}" data-t="${t.name}">${esc(t.label)}</button>`).join('')}</div>`;
+const todayStr = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
+const miles = n => Number(n).toLocaleString('en-US');
+const itemLine = i => `${esc(i.name)}${i.option ? ' - ' + esc(i.option) : ''}${i.other_text ? ': ' + esc(i.other_text) : ''}`;
+const visitHtml = (e, withCar) => `<div class="visit vcard" data-e="${e.id}" tabindex="0"><div class="vhead"><b>${esc(e.date)}</b><span>${miles(e.mileage)} mi</span>${withCar ? `<span class="tag">${esc(carName(e))}</span>` : ''}</div>
+  <ul>${e.items.map(i => `<li>${itemLine(i)}</li>`).join('')}</ul>
+  <div class="row vacts"><button class="ghost" data-repeat="${e.id}">Repeat</button><button class="ghost" data-vedit="${e.id}">Edit</button><button class="ghost" data-vdel="${e.id}">Delete</button></div></div>`;
+let cart = null;   // { car, items: Map(item_id -> { option, other }), date, mileage, editId }
+function wireVisits(entries, reload) {
+  document.querySelectorAll('.visit').forEach(d => d.addEventListener('click', e => { if (!e.target.closest('button,a')) d.classList.toggle('open'); }));
+  const find = b => entries.find(e => e.id == b);
+  const start = (e, editId) => {
+    // keep: an edit keeps the visit's own items, also one the car no longer offers (ultrareview F5).
+    cart = { car: e.vehicle_id, items: new Map(e.items.map(i => [i.item_id, { option: i.option, other: i.other_text }])), date: editId ? e.date : todayStr(), mileage: editId ? String(e.mileage) : '', editId,
+      keep: editId ? new Set(e.items.map(i => i.item_id)) : null };
+    location.hash = `#/car/${e.vehicle_id}/log`;
+  };
+  document.querySelectorAll('[data-repeat]').forEach(b => b.onclick = () => start(find(b.dataset.repeat), null));   // Repeat: same items, date today, mileage empty
+  document.querySelectorAll('[data-vedit]').forEach(b => b.onclick = () => start(find(b.dataset.vedit), +b.dataset.vedit));
+  document.querySelectorAll('[data-vdel]').forEach(b => b.onclick = () => {
+    if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'Tap again to delete'; return; }
+    api('/service/' + b.dataset.vdel, { method: 'DELETE' }).then(reload).catch(fail);
+  });
+}
+async function servicePage(v, id, live) {
+  const d = await api(`/vehicles/${id}/service`);
+  if (!live()) return;
+  crumb(carName(v));
+  $('#view').innerHTML = `<section class="card"><div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${esc(carName(v))}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
+    ${tabRow()}
+    <div class="tabbody"><a class="btn primary big logbtn" href="#/car/${id}/log">Log work</a>
+    <div class="visits">${d.entries.map(e => visitHtml(e)).join('') || '<p class="note">No visits logged yet. Tap Log work.</p>'}</div>
+    <div class="row"><a class="btn" href="#/car/${id}/history">Full screen</a></div></div></section>`;
+  document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; car(id); });
+  wireVisits(d.entries, () => car(id));
+}
+async function logPage(id) {
+  const live = fresh();
+  const [d, v] = await Promise.all([api(`/vehicles/${id}/service`), api(`/vehicles/${id}?peek=1`)]);
+  if (!live()) return;
+  if (!cart || cart.car !== +id) cart = { car: +id, items: new Map(), date: todayStr(), mileage: '', editId: null, keep: null };
+  crumb('Log work');
+  // Ultrareview F5: the items shown are the ones the car offers now, plus (in an edit) the visit's own items that it no longer offers.
+  // An item in the cart that is in neither list is named on the screen, never dropped without a word.
+  const all = d.all_items || [], keep = cart.editId && cart.keep ? cart.keep : new Set();
+  const shown = [...d.items, ...all.filter(i => keep.has(i.id) && !d.items.some(x => x.id === i.id)).map(i => ({ ...i, kept: true }))];
+  let busy = false;   // one send at a time (ultrareview F4)
+  // The first summary line (date, mileage, miles since the last visit). Typing a mileage updates only this line: a redraw on blur
+  // would replace the Submit button between the finger going down and up, and the tap would be lost.
+  const sumLine = () => {
+    const ok = /^\d+$/.test(cart.mileage);
+    const since = ok && d.last_mileage != null ? +cart.mileage - d.last_mileage : null;
+    return `${esc(cart.date)} · ${cart.mileage ? miles(cart.mileage) + ' mi' : 'no mileage yet'}${since != null ? ` <span class="src">(${since >= 0 ? '+' : ''}${miles(since)} mi since the last visit)</span>` : ''}`;
+  };
+  const draw = () => {
+    const sel = [...cart.items.entries()].map(([iid, c]) => ({ it: shown.find(i => i.id === iid), c })).filter(x => x.it);
+    const lost = [...cart.items.keys()].filter(k => !shown.some(i => i.id === k)).map(k => (all.find(i => i.id === k) || { name: 'item ' + k }).name);
+    const miOk = /^\d+$/.test(cart.mileage);
+    const ready = sel.length && miOk && sel.every(({ it, c }) => (!it.choices || c.option) && (!it.text || (c.other || '').trim()));
+    $('#view').innerHTML = `<section class="card cartpage"><div class="carhead"><a class="btn" href="#/car/${id}">Back</a><div><h2>${cart.editId ? 'Edit visit' : 'Log work'}</h2><div class="src">${esc(carName(v))}</div></div></div>
+      <div class="cartitems">${shown.map(it => {
+        const on = cart.items.has(it.id), c = cart.items.get(it.id) || {}, ld = d.last_done[it.id];
+        return `<div class="cartitem${on ? ' on' : ''}"><button type="button" class="itembtn" data-item="${it.id}" aria-pressed="${on}">${esc(it.name)}</button>
+          ${it.kept ? '<span class="src keptnote">In this visit. Not offered for this car now.</span>' : ''}
+          ${ld ? `<span class="src lastdone">Last: ${esc(ld.date)} at ${miles(ld.mileage)} mi</span>` : ''}
+          ${on && it.choices ? `<div class="seg">${it.choices.map(o => `<button type="button" data-opt="${it.id}" data-v="${esc(o)}" aria-pressed="${c.option === o}">${esc(o)}</button>`).join('')}</div>` : ''}
+          ${on && it.text ? `<input class="othertext" data-other="${it.id}" maxlength="120" placeholder="One line, for example transmission fluid" value="${esc(c.other || '')}" aria-label="Other work">` : ''}</div>`; }).join('')}</div>
+      <div class="row cartfields"><div class="field"><label for="cdate">Date</label><input type="date" id="cdate" value="${esc(cart.date)}" max="${todayStr()}"></div>
+        <div class="field"><label for="cmiles">Mileage</label><input id="cmiles" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="${d.last_mileage != null ? miles(d.last_mileage) : 'miles'}" value="${esc(cart.mileage)}"></div></div>
+      <div class="cartsum" aria-label="Summary"><b>Summary</b><div id="sumline">${sumLine()}</div>
+        <ul>${sel.map(({ it, c }) => `<li>${itemLine({ name: it.name, option: c.option || '', other_text: c.other || '' })}</li>`).join('') || '<li class="note">No items yet. Tap an item above.</li>'}</ul></div>
+      ${lost.length ? `<div class="warn" id="cartlost"><b>Left out:</b> ${esc(lost.join(', '))}. This car does not offer ${lost.length === 1 ? 'it' : 'them'} now, so ${lost.length === 1 ? 'it is' : 'they are'} not in this visit.</div>` : ''}
+      <div id="cartwarn"></div>
+      <button class="primary big submit" id="csubmit" ${ready ? '' : 'disabled'}>${cart.editId ? 'Save visit' : 'Submit'}</button><p class="err" id="cerr"></p></section>`;
+    document.querySelectorAll('[data-item]').forEach(b => b.onclick = () => { const k = +b.dataset.item; if (cart.items.has(k)) cart.items.delete(k); else cart.items.set(k, { option: '', other: '' }); draw(); });
+    document.querySelectorAll('[data-opt]').forEach(b => b.onclick = () => { cart.items.get(+b.dataset.opt).option = b.dataset.v; draw(); });
+    const readyNow = () => sel.length > 0 && /^\d+$/.test(cart.mileage) && sel.every(({ it, c }) => (!it.choices || c.option) && (!it.text || (c.other || '').trim()));
+    document.querySelectorAll('[data-other]').forEach(i => i.oninput = () => { cart.items.get(+i.dataset.other).other = i.value; $('#csubmit').disabled = !readyNow(); });
+    $('#cdate').onchange = e => { cart.date = e.target.value || todayStr(); $('#sumline').innerHTML = sumLine(); };
+    $('#cmiles').oninput = e => { cart.mileage = e.target.value.replace(/\D/g, ''); e.target.value = cart.mileage; $('#sumline').innerHTML = sumLine(); $('#csubmit').disabled = !readyNow(); };
+    const send = async force => {
+      const body = { date: cart.date, mileage: +cart.mileage, force: force ? 1 : 0, items: sel.map(({ it, c }) => ({ item_id: it.id, option: c.option || '', other_text: c.other || '' })) };
+      const r = await fetch(cart.editId ? '/api/service/' + cart.editId : `/api/vehicles/${id}/service`, { method: cart.editId ? 'PATCH' : 'POST', headers: { 'content-type': 'application/json', 'x-lp-device': device }, body: JSON.stringify(body) });
+      const j = await r.json().catch(() => ({ error: 'Bad response from server' }));
+      if (r.status === 409 && j.confirm_needed) {
+        const nb = x => x ? `${esc(x.date)} at ${miles(x.mileage)} mi` : 'none';
+        $('#cartwarn').innerHTML = `<div class="warn bad"><b>Check the mileage.</b> The visit before is ${nb(j.before)}. The visit after is ${nb(j.after)}. <button class="primary" id="forcego">Yes, that is right</button></div>`;
+        $('#forcego').onclick = () => go(true);
+        return;
+      }
+      if (!r.ok) { $('#cerr').textContent = j.error || 'HTTP ' + r.status; return; }
+      cart = null; nextTab = 'service'; location.hash = '#/car/' + id;
+    };
+    // One tap sends one visit: Submit and "Yes, that is right" are both off while any request runs, POST or PATCH (a double tap would
+    // log the visit twice; ultrareview F4). busy also stops a second tap that comes before the button is drawn as off.
+    const go = force => {
+      if (busy) return;
+      busy = true; ['#csubmit', '#forcego'].forEach(s => { const b = $(s); if (b) b.disabled = true; });
+      send(force).catch(x => { $('#cerr').textContent = x.message; }).finally(() => { busy = false; const b = $('#csubmit'); if (b) b.disabled = !readyNow(); const f = $('#forcego'); if (f) f.disabled = false; });
+    };
+    $('#csubmit').onclick = () => go(false);
+  };
+  draw();
+}
+// Full-screen history: one car, or all cars (filter by car and owner), with a print view (plain black on white).
+async function historyPage(id) {
+  const live = fresh();
+  const [es, cars] = await Promise.all([api('/service' + (id ? '?car=' + id : '')), api('/vehicles?hidden=1')]);
+  if (!live()) return;
+  crumb('Service history');
+  const owners = [...new Set(es.map(e => e.owner).filter(Boolean))];
+  $('#view').innerHTML = `<section class="card historypage"><div class="carhead"><a class="btn" href="${id ? '#/car/' + id : '#/'}">Back</a><div><h2>Service history</h2><div class="src">${id ? '' : 'All cars'}</div></div></div>
+    ${id ? '' : `<div class="row nonprint"><div class="field"><label for="fcar">Car</label><select id="fcar"><option value="">All cars</option>${cars.map(c => `<option value="${c.id}">${esc(carName(c))}</option>`).join('')}</select></div>
+      <div class="field"><label for="fown">Owner</label><select id="fown"><option value="">All owners</option>${owners.map(o => `<option>${esc(o)}</option>`).join('')}</select></div></div>`}
+    <div class="row nonprint"><button id="hprint">Print</button></div>
+    <div class="visits" id="hlist"></div></section>`;
+  const show = () => {
+    const fc = id ? '' : $('#fcar').value, fo = id ? '' : $('#fown').value;
+    const rows = es.filter(e => (!fc || e.vehicle_id == fc) && (!fo || e.owner === fo));
+    $('#hlist').innerHTML = rows.map(e => visitHtml(e, !id)).join('') || '<p class="note">No visits.</p>';
+    wireVisits(rows, () => historyPage(id));
+  };
+  if (!id) { $('#fcar').onchange = show; $('#fown').onchange = show; }
+  $('#hprint').onclick = () => print();
+  show();
+}
+// Leaving the cart with items or a mileage in it asks first (hash routes: links and the hash change, not only beforeunload).
+const cartDirty = hash => !!cart && /\/log$/.test(hash) && (cart.items.size > 0 || cart.mileage !== '');
+function leaveAsk(to) {
+  if ($('#leave')) return;
+  const d = document.createElement('div'); d.id = 'leave'; d.className = 'leaveask'; d.setAttribute('role', 'alertdialog');
+  d.innerHTML = `<div class="card"><h2>Leave without saving?</h2><p>The visit in the cart is not saved.</p><div class="row"><button class="primary big" id="lstay">Stay</button><button class="big" id="lgo">Leave and lose the cart</button></div></div>`;
+  document.body.appendChild(d);
+  $('#lstay').onclick = () => d.remove();
+  $('#lgo').onclick = () => { d.remove(); cart = null; location.hash = to; };
+}
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[href^="#"]');
+  if (!a || !cartDirty(location.hash) || a.getAttribute('href') === location.hash) return;
+  e.preventDefault(); e.stopPropagation(); leaveAsk(a.getAttribute('href'));
+}, true);
+addEventListener('beforeunload', e => { if (cartDirty(location.hash)) { e.preventDefault(); e.returnValue = ''; } });
+// Suggestion 8: after 10 minutes with no touch the screen goes back to Home. It waits while a cart or an editor is open.
+const IDLE_MS = Number(store.get('lp-idle-ms')) || 600000;
+let idleT;
+// Ultrareview F1: an editor is open = the cart, an open <details> (add a value, Edit car; not the lookup links), or a form that is not inside
+// a closed <details> (a value editor in its card, the door-jamb form). The add-value form is always in a car page inside its closed <details>,
+// so "#view form" alone matched on every car tab and the screen never went back to Home.
+const editorOpen = () => !!document.querySelector('.cartpage, #view details[open]:not(.links)') ||[...document.querySelectorAll('#view form')].some(f => !f.closest('details:not([open])'));
+function armIdle() {
+  clearTimeout(idleT);
+  idleT = setTimeout(() => {
+    if ((location.hash || '#/') === '#/') return armIdle();
+    if (editorOpen()) return armIdle();
+    cart = null; location.hash = '#/';
+  }, IDLE_MS);
+}
+['pointerdown', 'keydown', 'touchstart'].forEach(ev => addEventListener(ev, armIdle, { passive: true }));
+armIdle();
+
 // ---------- Router ----------
 async function route() {
   const h = location.hash || '#/';
@@ -581,6 +806,9 @@ async function route() {
     else if (h === '#/add') add();
     else if (h === '#/confirm') await confirmPage();
     else if (h === '#/apps') await appsPage();
+    else if (h === '#/history') await historyPage(0);
+    else if (/^#\/car\/\d+\/history$/.test(h)) await historyPage(h.split('/')[2]);
+    else if (/^#\/car\/\d+\/log$/.test(h)) await logPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/page$/.test(h)) await viewer(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb$/.test(h)) await jamb(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb\/[0-9TZ-]+\.(jpg|png|webp)$/.test(h)) await jambRead(h.split('/')[2], h.split('/')[4]);
@@ -589,8 +817,12 @@ async function route() {
   } catch (e) { fail(e); }
 }
 let nextTab = null;   // a screen that sends Rick back to a car can name the tab to open
+let holdHash = false;
 addEventListener('hashchange', e => {
   const from = new URL(e.oldURL).hash || '#/', to = location.hash || '#/';
+  if (holdHash) { holdHash = false; return; }
+  // The browser's Back button leaves the cart through the hash too: put the hash back and ask.
+  if (cartDirty(from) && !/\/log$/.test(to)) { holdHash = true; location.hash = from; leaveAsk(to); return; }
   if (to === '#/apps' && from !== '#/apps') { appsBack = from; appsTab = tab; }   // remember where Apps was opened
   else if (from === '#/apps' && to === appsBack && appsTab) nextTab = appsTab;     // Back opens the same car tab
   tab = nextTab || 'lift'; nextTab = null; route();
