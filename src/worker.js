@@ -1,6 +1,7 @@
 // LiftPad API. Every request comes here first (run_worker_first); paths outside /api/ go to the
 // static app in /public (Workers Assets).
 import { lookupLinks } from './links.js';
+import { vinCheckDigit, feItems, feVariants, matchFeOption, canadianTrims, engineMatches, parseDoorcardRead, feRowFresh, VIN_SHAPE } from './lib.js';
 // Cloudflare Access sits in front of the whole hostname. This code adds one check of its own:
 // processor routes (and the test clock) need the Access JWT of a service token on an allow-list.
 // Values: one row per value in `vals`; every change writes a `history` row in the same D1 batch.
@@ -26,8 +27,10 @@ const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
 // Rick 2026-10-27 (after ultrareview F6/F7): the processor token reaches only these routes; every other route answers 403 before it runs.
 // Read cars, values and fields (private car keys removed), post values (proposed only), the job routes the research worker and queue.sh
 // use (claim, renew, result, fail, whoami), and the service-log CSV for the nightly export. No car add, group change or car delete.
+// HANDOFF 17 (B9): one more route, GET /api/photos/<car>/<file>. It works only while a read_doorcard job for exactly that photo is claimed by
+// the caller (checked in the route). ALI page images (/api/ali/...) are not in this list, so they stay 403.
 const PROC_ROUTES = [
-  ['GET', /^\/api\/(whoami|tabs|vehicles|needs-confirming|service-log\.csv)$/], ['GET', /^\/api\/vehicles\/\d+$/],
+  ['GET', /^\/api\/(whoami|tabs|vehicles|needs-confirming|service-log\.csv)$/], ['GET', /^\/api\/vehicles\/\d+$/], ['GET', /^\/api\/photos\/\d+\/[0-9TZ-]+\.(?:jpg|png|webp)$/],
   ['POST', /^\/api\/vehicles\/\d+\/values$/], ['POST', /^\/api\/jobs\/claim$/], ['POST', /^\/api\/jobs\/\d+\/(result|renew|fail)$/]];
 
 // ---------- Identity: Access JWT (Cf-Access-Jwt-Assertion), RS256, keys from the team certs URL ----------
@@ -172,12 +175,30 @@ const VAL_SELECT = `SELECT x.id, x.field_id, f.name field, t.name tab, f.is_safe
   x.ftlb_lo, x.ftlb_hi, x.ftlb_src, x.engine
   FROM vals x JOIN fields f ON f.id = x.field_id JOIN tabs t ON t.id = f.tab_id`;
 // The values of car v (alias): its own overrides and the model-year values for its year.
-const CAR_VALS = `((x.scope='car' AND x.vehicle_id=v.id) OR (x.scope='model' AND x.make=v.make AND x.model=v.model AND x.year_from<=v.year AND x.year_to>=v.year))`;
+// HANDOFF 17 (B5): a value with an engine applies only to a car with that engine; a car with no engine set sees all of them; a value with no engine applies to all.
+// The engines are compared by a normalized key (lib.js engineMatches: displacement, cylinders, turbo, electric), which SQL cannot do. So the SQL counts
+// below take only the values with NO engine tag (CAR_VALS); the few tagged values are added per car in JS (tagCounts).
+const CAR_VALS_ANY = `((x.scope='car' AND x.vehicle_id=v.id) OR (x.scope='model' AND x.make=v.make AND x.model=v.model AND x.year_from<=v.year AND x.year_to>=v.year))`;
+const CAR_VALS = `(${CAR_VALS_ANY} AND x.engine IS NULL)`;
+async function tagCounts(env, cars) {
+  const tagged = (await env.DB.prepare("SELECT x.id, x.scope, x.vehicle_id, x.make, x.model, x.year_from, x.year_to, x.status, x.warn, x.engine FROM vals x WHERE x.engine IS NOT NULL AND x.status<>'rejected'").all()).results;
+  const out = new Map(cars.map(c => [c.id, { nvals: 0, nproposed: 0, nblock: 0, ncaution: 0 }]));
+  for (const c of cars) for (const x of tagged) {
+    const mine = (x.scope === 'car' && x.vehicle_id === c.id) || (x.scope === 'model' && x.make === c.make && x.model === c.model && x.year_from <= c.year && x.year_to >= c.year);
+    if (!mine || !engineMatches(c.engine, x.engine)) continue;
+    const o = out.get(c.id); o.nvals++; if (x.status === 'proposed') o.nproposed++; if (x.warn === 2) o.nblock++; if (x.warn === 1) o.ncaution++;
+  }
+  return out;
+}
 // Display order: car override, then model-year value; confirmed before proposed; rejected hidden.
+// Ultrareview B #4: a car with an engine shows its engine's value first; a car with NO engine shows the untagged value first, and the
+// app keeps the engine-tagged values out of the headline picks (no_headline) and labels them on the value card.
 async function carValues(env, v, withRejected) {
   const { results } = await env.DB.prepare(`${VAL_SELECT} WHERE ((x.scope='car' AND x.vehicle_id=?) OR (x.scope='model' AND x.make=? AND x.model=? AND x.year_from<=? AND x.year_to>=?))
-    ${withRejected ? '' : "AND x.status<>'rejected'"} ORDER BY t.sort, f.sort, f.id, (x.scope='car') DESC, (x.status='confirmed') DESC, x.id`).bind(v.id, v.make, v.model, v.year, v.year).all();
-  return results;
+    ${withRejected ? '' : "AND x.status<>'rejected'"}
+    ORDER BY t.sort, f.sort, f.id, (x.scope='car') DESC, (x.status='confirmed') DESC, ((x.engine IS NOT NULL) * ?) DESC, x.id`).bind(v.id, v.make, v.model, v.year, v.year, v.engine ? 1 : -1).all();
+  results.forEach(x => { x.no_headline = !v.engine && !!x.engine; });
+  return results.filter(x => engineMatches(v.engine, x.engine));   // HANDOFF 17: by the normalized engine key, not by text
 }
 // ---------- Typical values and thread ranges (Handoff 3 decision 9) ----------
 // Display order: car override, model-year value, then the make's typical value (Low), then the
@@ -273,14 +294,43 @@ async function vehicle(env, id, me, touch) {
   v.chart_notes_footer = v.ali ? ((await chartNotes(env, 'all', 'footer')) || {}).adapters || null : null;
   v.jobs = (await env.DB.prepare("SELECT id, kind, status, result_summary, error, created_at, updated_at FROM jobs WHERE target IN (?, ?) ORDER BY id DESC LIMIT 5")
     .bind('car:' + id, modelKey(v)).all()).results;
+  // Opus review finding 8: the summary of a photo read says whether the car has a saved VIN ("VIN matches / differs / read"): not for the processor.
+  if (me.processor) v.jobs.forEach(j => { if (j.kind === 'read_doorcard') j.result_summary = null; });
   v.hidden = hidden(v, me.nowMs); v.mine = v.grp === 'mine' ? 1 : 0;
+  v.no_vin = !v.vin; v.no_doorcard = !placardFields(v.values).size;   // HANDOFF 17 (B10), computed
   return v;
 }
 // Decision 11 + HANDOFF 15 (ultrareview F6): a car sent to the processor never holds the VIN, the notes, the owner or the ALI-derived
 // adapter notes. Every route that returns a car object passes it through here; the keys are removed, not blanked.
-const PRIVATE_CAR_KEYS = ['vin', 'notes', 'owner', 'chart_notes', 'chart_notes_footer'];
+const PRIVATE_CAR_KEYS = ['vin', 'notes', 'owner', 'chart_notes', 'chart_notes_footer', 'no_vin', 'no_doorcard'];
 const forMe = (v, me) => { if (v && me.processor) PRIVATE_CAR_KEYS.forEach(k => { delete v[k]; }); return v; };
 const TRIM_MAX = 60;
+// HANDOFF 17: the car fields that the Add car lists and the one-time "Pick engine from the list" set. Only keys present in b are returned.
+function carExtras(b) {
+  const out = {};
+  for (const k of ['variant', 'engine']) if (k in b) {
+    const t = String(b[k] ?? '').trim();
+    if (t.length > 80 || /[\u0000-\u001f]/.test(t)) return { err: `${k} has at most 80 characters and no control characters` };
+    out[k] = t || null;
+  }
+  if ('fe_id' in b) {
+    if (b.fe_id === null || b.fe_id === '') out.fe_id = null;
+    else { const n = Number(b.fe_id); if (!Number.isInteger(n) || n < 1 || n > 9999999) return { err: 'fe_id must be a whole number' }; out.fe_id = n; }
+  }
+  if ('fuel' in b) {
+    const t = String(b.fuel ?? '').trim();
+    if (t && !FUELS.includes(t)) return { err: `Fuel must be one of ${FUELS.join(', ')}` };
+    out.fuel = t || null;
+  }
+  return out;
+}
+// B7: every VIN, typed or read, must pass the ISO 3779 check digit. A car first sold outside North America may fail it: Rick saves it with not_us.
+const notUs = b => b.not_us === true || b.not_us === 1 || b.not_us === '1';
+function vinProblem(vin, b) {
+  if (!VIN_SHAPE.test(vin)) return bad('A VIN has 17 letters and digits, with no I, O or Q');
+  if (!vinCheckDigit(vin) && !notUs(b)) return json({ error: 'The VIN check digit fails. Check the VIN, or save it as a VIN that is not US-market.', check_failed: true }, 400);
+  return null;
+}
 const modelKey = v => `model:${v.make}|${v.model}|${v.year}`;
 async function fieldByName(env, tab, name) {
   return env.DB.prepare('SELECT f.id, f.is_safety FROM fields f JOIN tabs t ON t.id = f.tab_id WHERE t.name=? AND f.name=?').bind(tab, name).first();
@@ -344,7 +394,7 @@ async function addValue(env, v, b, me) {
   const status = !me.processor && b.status === 'confirmed' ? 'confirmed' : 'proposed';
   await env.DB.batch(insertValueStmts(env, { field_id: f.id, scope, make: scope === 'model' ? v.make : null, model: scope === 'model' ? v.model : null,
     year_from: yf, year_to: yt, vehicle_id: scope === 'car' ? v.id : null, value: String(b.value).trim(), confidence: b.confidence,
-    source: b.source, note: b.note, warn, status, ...tq }, me));
+    source: b.source, note: b.note, warn, status, engine: b.engine ? String(b.engine).trim().slice(0, 80) : null, ...tq }, me));
   return null;
 }
 // Change a value and write its history row in the same batch. The history row copies the old
@@ -385,6 +435,7 @@ async function missingFields(env, v) {
 // The request holds only make, model, year, trim and field names. Never a VIN, a name, notes or photos.
 async function queueJob(env, v, kind, wanted, me) {
   const req = { make: v.make, model: v.model, year: v.year, trim: v.trim || '', fields: wanted };
+  if (v.engine) req.engine = v.engine;   // HANDOFF 17 (B5): the worker answers for this engine and posts the values with the engine tag
   const r = await env.DB.prepare('INSERT INTO jobs(kind, target, request, status, created_at, updated_at) VALUES(?,?,?,?,?,?) RETURNING id')
     .bind(kind, modelKey(v), JSON.stringify(req), 'queued', me.now, me.now).first();
   return r.id;
@@ -393,19 +444,29 @@ async function queueJob(env, v, kind, wanted, me) {
 // self-test token (its test cars would cost real research), and not when a job for the car or model is still open (no duplicate).
 // The switch is the Worker variable LP_AUTO_RESEARCH ("1" = on). Default OFF (Rick, 2026-10-24): it is turned on only after the first
 // live run of the research worker on the 2022 Sonata has passed (see the release plan).
+// Ultrareview B #3 and #7: an open job blocks a new one only when it is a research or workup job (a pending photo read is a read_doorcard job
+// on the target car:<id> and must not stop research) AND it is for the same engine (a car of the same model and year with another engine
+// is not blocked; a car with an engine and a job without one are different requests too).
+const sameEngine = (a, b) => { const x = String(a ?? '').trim(), y = String(b ?? '').trim(); return !x || !y ? x === y : engineMatches(x, y); };
 async function openJob(env, v) {
-  return await env.DB.prepare("SELECT id FROM jobs WHERE target IN (?, ?) AND status IN ('queued','claimed') LIMIT 1").bind('car:' + v.id, modelKey(v)).first();
+  const open = (await env.DB.prepare("SELECT id, request FROM jobs WHERE target IN (?, ?) AND kind IN ('research','workup') AND status IN ('queued','claimed')").bind('car:' + v.id, modelKey(v)).all()).results;
+  return open.find(j => { try { return sameEngine(JSON.parse(j.request).engine, v.engine); } catch (e) { return true; } }) || null;
 }
 async function autoResearch(env, v, me) {
   if (env.LP_AUTO_RESEARCH !== '1' || me.tool || me.processor || await openJob(env, v)) return null;
   const miss = await missingFields(env, v);
   return miss.length ? await queueJob(env, v, 'research', miss, me) : null;
 }
-async function claimJob(env, me, onlyId) {
+// HANDOFF 17 (B12): kinds = the job kinds the caller works on. The research worker asks for research and workup, the photo script for
+// read_doorcard, so neither takes the other's job. No kinds given = research and workup only (an old caller never gets a photo job).
+const JOB_KINDS = ['research', 'workup', 'read_doorcard'];
+async function claimJob(env, me, onlyId, kinds) {
   const until = new Date(me.nowMs + LEASE_MIN * 60e3).toISOString();
+  const ks = Array.isArray(kinds) && kinds.length ? kinds.filter(k => JOB_KINDS.includes(k)) : ['research', 'workup'];
+  if (!ks.length) return null;
   const r = await env.DB.prepare(`UPDATE jobs SET status='claimed', claimed_by=?, lease_until=?, attempts=attempts+1, updated_at=?
-    WHERE id = (SELECT id FROM jobs WHERE (status='queued' OR (status='claimed' AND lease_until < ?)) ${onlyId ? 'AND id=?' : ''} ORDER BY created_at, id LIMIT 1)
-    RETURNING id, kind, target, request, attempts, lease_until`).bind(...[me.token, until, me.now, me.now, ...(onlyId ? [onlyId] : [])]).first();
+    WHERE id = (SELECT id FROM jobs WHERE (status='queued' OR (status='claimed' AND lease_until < ?)) AND kind IN (${ks.map(() => '?').join(',')}) ${onlyId ? 'AND id=?' : ''} ORDER BY created_at, id LIMIT 1)
+    RETURNING id, kind, target, request, attempts, lease_until`).bind(...[me.token, until, me.now, me.now, ...ks, ...(onlyId ? [onlyId] : [])]).first();
   if (!r) return null;
   r.request = JSON.parse(r.request);
   return r;
@@ -414,6 +475,7 @@ async function jobResult(env, id, b, me) {
   const j = await env.DB.prepare('SELECT * FROM jobs WHERE id=?').bind(id).first();
   if (!j) return bad('Job not found', 404);
   if (j.status !== 'claimed' || j.claimed_by !== me.token || !(j.lease_until > me.now)) return bad('This job is not claimed by you, or the lease ran out. Claim it again.', 409);
+  if (j.kind === 'read_doorcard') return doorcardResult(env, j, b, me);
   const rq = JSON.parse(j.request), vals = Array.isArray(b.values) ? b.values : null;
   if (!vals) return bad('Need values: a list of {tab, field, value, confidence, source}');
   const stmts = []; let skipped = 0;
@@ -428,14 +490,173 @@ async function jobResult(env, id, b, me) {
     const tq = isTorque(String(x.tab), String(x.field)) ? ftlbOf(noNums ? { ...ftlbFromText(x.value), ftlb_src: 'converted' } : x) : {};
     if (tq.err) return bad(tq.err);
     // HANDOFF 15 (REVIEW problem 1): a field that already has a confirmed value for this make, model and year is skipped, not posted again.
-    if (await env.DB.prepare("SELECT 1 FROM vals WHERE field_id=? AND scope='model' AND make=? AND model=? AND year_from<=? AND year_to>=? AND status='confirmed' LIMIT 1").bind(f.id, rq.make, rq.model, rq.year, rq.year).first()) { skipped++; continue; }
+    // HANDOFF 17 (B5): only a value that the worker marked for the request's engine (its own "engine" field; the worker does that for the fields that
+    // differ by engine) carries the tag. A value without it (lug-nut torque, lift points) applies to every engine. A confirmed value for no engine or
+    // for the same engine blocks it. (Opus review finding 1.)
+    const eng = rq.engine && x.engine && engineMatches(rq.engine, x.engine) ? String(rq.engine) : null;
+    const conf = (await env.DB.prepare("SELECT engine FROM vals WHERE field_id=? AND scope='model' AND make=? AND model=? AND year_from<=? AND year_to>=? AND status='confirmed'").bind(f.id, rq.make, rq.model, rq.year, rq.year).all()).results;
+    if (conf.some(c => !c.engine || engineMatches(eng, c.engine))) { skipped++; continue; }
     stmts.push(...insertValueStmts(env, { field_id: f.id, scope: 'model', make: rq.make, model: rq.model, year_from: rq.year, year_to: rq.year,
-      value: String(x.value).trim(), confidence: x.confidence, source: x.source, note: x.note, status: 'proposed', ...tq }, me));
+      value: String(x.value).trim(), confidence: x.confidence, source: x.source, note: x.note, status: 'proposed', engine: eng, ...tq }, me));
   }
   stmts.push(env.DB.prepare("UPDATE jobs SET status='done', result_summary=?, lease_until=NULL, updated_at=? WHERE id=? AND status='claimed' AND claimed_by=?")
     .bind(`${vals.length - skipped} proposed value(s)${skipped ? `, ${skipped} skipped (already confirmed)` : ''}`, me.now, id, me.token));
   await env.DB.batch(stmts);
   return json({ ok: true, proposed: vals.length - skipped, skipped });
+}
+
+// ---------- Engine lists: fueleconomy.gov through the Worker (HANDOFF 17, B1-B3) ----------
+// The answers are cached in fe_menu. Ultrareview B #2: an EMPTY answer is never cached (it is asked again next time), and a row is kept for ever only
+// when it was fetched AFTER its model year ended (the list is complete then). A row fetched during or before its model year (new models are added
+// all year) is fetched again after a year.
+// If the fetch fails the old row is used (even an expired one); with no row the caller gets an empty list and "error".
+const FE_REFRESH_MS = 365 * 864e5;
+async function feMenu(env, year, make, model) {
+  const row = await env.DB.prepare('SELECT options_json, fetched_at FROM fe_menu WHERE year=? AND make=? AND model=?').bind(year, make, model || '').first();
+  const cached = row ? JSON.parse(row.options_json) : null;
+  if (feRowFresh(row, year, Date.now(), FE_REFRESH_MS)) return { items: cached };
+  const q = `year=${year}&make=${encodeURIComponent(make)}${model ? '&model=' + encodeURIComponent(model) : ''}`;
+  try {
+    const r = await fetch(`${env.FE}/menu/${model ? 'options' : 'model'}?${q}`, { headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const items = feItems(await r.json());
+    if (!items.length) return cached && cached.length ? { items: cached, stale: true } : { items };   // empty: not cached (a later ask fetches again); an old list is not replaced by nothing
+    await env.DB.prepare('INSERT INTO fe_menu(year, make, model, options_json, fetched_at) VALUES(?,?,?,?,?) ON CONFLICT(year, make, model) DO UPDATE SET options_json=excluded.options_json, fetched_at=excluded.fetched_at')
+      .bind(year, make, model || '', JSON.stringify(items), new Date().toISOString()).run();
+    return { items };
+  } catch (e) {
+    return row ? { items: JSON.parse(row.options_json), stale: true } : { items: [], error: 'fueleconomy.gov did not answer' };
+  }
+}
+// The VIN decode names displacement, cylinders and electrification. Look through every variant of the plain model for exactly one option
+// with that engine. Several matches are narrowed by the drive type (4WD/AWD or 2WD) only when that leaves exactly one.
+async function feMatch(env, year, make, model, dec) {
+  const all = [];
+  for (const vr of feVariants((await feMenu(env, year, make, '')).items, model))
+    for (const o of (await feMenu(env, year, make, vr.text)).items) all.push({ variant: vr.text, ...o });
+  if (!all.length) return null;
+  const one = matchFeOption(all, dec);
+  if (one) return one;
+  const cand = all.filter(o => matchFeOption([o], dec));
+  if (cand.length < 2 || !dec.drive) return null;
+  const wd = /4x4|4wd|4-wheel|awd|all-wheel/i.test(dec.drive) ? /4WD|AWD/ : /2wd|rwd|fwd|front|rear/i.test(dec.drive) ? /2WD|RWD|FWD/ : null;
+  const by = wd ? cand.filter(o => wd.test(o.variant)) : [];
+  return by.length === 1 ? by[0] : null;
+}
+// Trim names for the Add car list: those LiftPad already has for this make, model and year, then the Canadian specs (labelled).
+async function trimNames(env, year, make, model) {
+  const out = [], seen = new Set();
+  const add = (name, source) => { const k = fold(name); if (name && !seen.has(k)) { seen.add(k); out.push({ name, source }); } };
+  const mine = await env.DB.prepare("SELECT DISTINCT trim FROM vehicles WHERE make=? AND model=? AND year=? AND trim<>'' AND trim NOT LIKE 'SELFTEST%' ORDER BY trim").bind(make, model, year).all();
+  mine.results.forEach(r => add(r.trim, 'LiftPad'));
+  try {
+    const nm = (await env.DB.prepare('SELECT nhtsa_name FROM makes WHERE name=?').bind(make).first() || {}).nhtsa_name || make;
+    const r = await fetch(`${env.NHTSA}/GetCanadianVehicleSpecifications/?Year=${year}&Make=${encodeURIComponent(nm)}&Model=${encodeURIComponent(model)}&units=&format=json`, { cf: { cacheTtl: 86400, cacheEverything: true } });
+    if (r.ok) canadianTrims(await r.json()).forEach(t => add(t.name, 'Canadian specs'));
+  } catch (e) { /* NHTSA down (503 is common): the list has the LiftPad names only */ }
+  return out;
+}
+// How the VIN decode tells the fuel (the Oil tab and the service cart read vehicles.fuel).
+function fuelOf(d) {
+  const el = d.ElectrificationLevel || '', fp = d.FuelTypePrimary || '';
+  if (/^BEV/i.test(el) || (/^electric$/i.test(fp.trim()) && !d.FuelTypeSecondary)) return 'ev';
+  if (/plug-?in|^PHEV/i.test(el)) return 'phev';
+  if (/hybrid|^(HEV|MHEV)/i.test(el)) return 'hybrid';
+  if (/diesel/i.test(fp)) return 'diesel';
+  if (/gasoline|e85|flex/i.test(fp)) return 'gas';
+  return '';
+}
+
+// ---------- Door-jamb photo read (HANDOFF 17, B6-B7, B9) ----------
+// The job request holds exactly these keys and nothing else (a test asserts it): the photo, and year, make, model and engine.
+// The saved VIN is NOT in the request (Rick 2026-10-27): the Worker compares the VIN that was read with the saved VIN when the result arrives.
+// The photo goes to Claude direct from the N100 script. Owner, notes, service text and other photos never go.
+const PHOTO_RE = /^[0-9TZ-]+\.(?:jpg|png|webp)$/;
+async function queueDoorcard(env, v, photo, me) {
+  if (me.processor) return bad('The processor cannot start a photo read', 403);
+  if (!PHOTO_RE.test(photo)) return bad('Need photo=<file name of a photo of this car>');
+  if (!env.BUCKET) return bad('Photo storage is not set up (no R2 binding)', 404);
+  if (!await env.BUCKET.head(`photos/${v.id}/${photo}`)) return bad('No such photo', 404);
+  const open = await env.DB.prepare("SELECT id FROM jobs WHERE kind='read_doorcard' AND target=? AND status IN ('queued','claimed') AND json_extract(request, '$.photo')=? LIMIT 1").bind('car:' + v.id, photo).first();
+  if (open) return json({ ok: true, id: open.id, already: true });
+  const req = { car: v.id, photo, year: v.year, make: v.make, model: v.model, engine: v.engine || '' };
+  const r = await env.DB.prepare('INSERT INTO jobs(kind, target, request, status, created_at, updated_at) VALUES(?,?,?,?,?,?) RETURNING id')
+    .bind('read_doorcard', 'car:' + v.id, JSON.stringify(req), 'queued', me.now, me.now).first();
+  return json({ ok: true, id: r.id }, 201);
+}
+// The result of a read_doorcard job: the values read from the photo become PROPOSED car-scope tire values (the door card is car scope),
+// and a VIN becomes a photo_reads row (a proposal; it never replaces a saved VIN). Rick confirms both beside the photo.
+async function doorcardResult(env, j, b, me) {
+  const rq = JSON.parse(j.request), r = b.read;
+  if (!r || typeof r !== 'object' || Array.isArray(r)) return bad('Need read: the values read from the photo');
+  const v = await vehicleRow(env, rq.car);
+  if (!v) return bad('Car not found', 404);
+  const pr0 = parseDoorcardRead(r);   // lib.js: the one rule set; ops/read_doorcard.py mirrors it (ultrareview B #1)
+  if (pr0.err) return bad(pr0.err);
+  const { sf, sr, pf, pr, sp, spPsi } = pr0;
+  const vin = r.vin ? String(r.vin).trim().toUpperCase() : null;
+  if (vin && !VIN_SHAPE.test(vin)) return bad('A VIN has 17 letters and digits, with no I, O or Q');
+  const day = me.now.slice(0, 10), source = `Door-jamb label photo, ${day} (read from photo)`, note = `photo ${rq.photo}`;
+  const rows = [];
+  if (pf !== null && pr !== null) rows.push(['Pressure', `${pf} / ${pr} psi`]);
+  if (sf || sr) rows.push(['Size', sf && sr && sf !== sr ? `${sf} / ${sr}` : (sf || sr)]);
+  if (sp.state === 'psi') rows.push(['Spare pressure', `${spPsi} psi`]);
+  else if (sp.state === 'none') rows.push(['Spare pressure', 'none']);   // 'not_on_label' proposes nothing: it is not the same as none
+  // Rick 2026-10-27: a read that EQUALS a confirmed car-scope value shows "matches" and creates no proposal; the same for a VIN equal to the saved VIN.
+  // A read equal to a value that is still only proposed is not proposed twice.
+  const stmts = [], matches = []; let proposed = 0;
+  for (const [name, value] of rows) {
+    const f = await fieldByName(env, 'tires', name);
+    if (!f) return bad(`Unknown field "${name}" on tab "tires"`);
+    const same = (await env.DB.prepare("SELECT status FROM vals WHERE field_id=? AND scope='car' AND vehicle_id=? AND value=? AND status<>'rejected'").bind(f.id, v.id, value).all()).results;
+    if (same.some(s => s.status === 'confirmed')) { matches.push(name); continue; }
+    if (same.length) continue;
+    stmts.push(...insertValueStmts(env, { field_id: f.id, scope: 'car', vehicle_id: v.id, value, confidence: 'High', source, note, status: 'proposed' }, me));
+    proposed++;
+  }
+  let vinNote = 'no VIN on this photo', vinState = 'none';
+  if (vin) {
+    const ok = vinCheckDigit(vin) ? 1 : 0;
+    if (v.vin === vin) { vinNote = 'VIN matches the saved VIN'; vinState = 'matches'; }   // no proposal
+    else {
+      if (!await env.DB.prepare("SELECT 1 FROM photo_reads WHERE vehicle_id=? AND vin=? AND status IN ('proposed','confirmed') LIMIT 1").bind(v.id, vin).first())
+        stmts.push(env.DB.prepare("INSERT INTO photo_reads(vehicle_id, photo, job_id, vin, vin_ok, status, created_at) VALUES(?,?,?,?,?,'proposed',?)").bind(v.id, rq.photo, j.id, vin, ok, me.now));
+      vinNote = (v.vin ? 'VIN differs from the saved VIN' : 'VIN read') + (ok ? '' : ', check digit fails'); vinState = 'proposed';
+    }
+  }
+  stmts.push(env.DB.prepare("UPDATE jobs SET status='done', result_summary=?, lease_until=NULL, updated_at=? WHERE id=? AND status='claimed' AND claimed_by=?")
+    .bind(`${proposed} proposed value(s)${matches.length ? '; matches the confirmed value: ' + matches.join(', ') : ''}; ${vinNote}`, me.now, j.id, me.token));
+  await env.DB.batch(stmts);
+  // Ultrareview B #10: the processor gets no "vin" word. "matches / differs / read" says something about the saved VIN, so it is stored in the
+  // job summary (hidden from the processor in the car payload) and shown to Rick only. The tire counts stay (no VIN information).
+  return json(me.processor ? { ok: true, proposed, matches } : { ok: true, proposed, matches, vin: vinState });
+}
+// A VIN proposal from a photo: confirm or reject (Rick only). A saved VIN is NEVER replaced: a proposal that differs from it cannot be
+// confirmed. With no saved VIN the proposal fills it, if the check digit passes or Rick says it is not a US-market VIN.
+async function decideVinProposal(env, id, action, b, me) {
+  if (me.processor) return bad('The processor cannot confirm or reject a VIN', 403);   // like the value routes: the self-test tool may, so the live self-test can grade it
+  const p = await env.DB.prepare('SELECT * FROM photo_reads WHERE id=?').bind(id).first();
+  if (!p) return bad('No such VIN proposal', 404);
+  if (p.status !== 'proposed') return bad('This VIN proposal is already decided', 409);
+  const stmts = [];
+  if (action === 'confirm') {
+    const v = await vehicleRow(env, p.vehicle_id);
+    if (!v) return bad('Car not found', 404);
+    if (v.vin && v.vin !== p.vin) return bad('The car has a saved VIN that differs. A saved VIN is not replaced by a photo. Reject this proposal, or change the VIN by hand in Edit car.', 409);
+    if (!v.vin) {
+      if (!p.vin_ok && !(b.not_us === true || b.not_us === 1 || b.not_us === '1')) return json({ error: 'The VIN check digit fails. Save it only as a VIN that is not US-market.', check_failed: true }, 409);
+      stmts.push(env.DB.prepare("UPDATE vehicles SET vin=? WHERE id=? AND (vin IS NULL OR vin='')").bind(p.vin, v.id));
+    }
+  }
+  stmts.push(env.DB.prepare('UPDATE photo_reads SET status=?, decided_at=?, decided_by=? WHERE id=? AND status=\'proposed\'').bind(action === 'confirm' ? 'confirmed' : 'rejected', me.now, me.device, id));
+  await env.DB.batch(stmts);
+  return json({ ok: true });
+}
+// "No VIN" and "No door card" are computed, never stored. The door card counts when a confirmed car-scope tire value cites a placard.
+async function badgeMap(env) {
+  const placard = new Set((await env.DB.prepare("SELECT x.vehicle_id id, x.source FROM vals x JOIN fields f ON f.id = x.field_id JOIN tabs t ON t.id = f.tab_id WHERE t.name='tires' AND x.scope='car' AND x.status='confirmed'").all()).results
+    .filter(r => PLACARD.test(r.source || '')).map(r => r.id));
+  return placard;
 }
 
 // ---------- Service log (HANDOFF 15) ----------
@@ -545,13 +766,39 @@ async function serviceCsv(env, carId, format, me) {
   return new Response(rows.map(r => r.map(csvCell).join(',')).join('\n') + '\n', { headers: { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
-export default {
+// HANDOFF 17 (B0): D1's own count of rows written (meta.rows_written, indexes included) for the requests of the self-test tool token only.
+// The count goes back in the header x-lp-rows-written, so a rehearsal or a self-test run can print and grade its real cost. Other callers
+// (Rick's browser, the processor) use the plain database object and get no header.
+function meterDb(db, acc) {
+  const add = r => { if (r && r.meta && r.meta.rows_written) acc.w += r.meta.rows_written; return r; };
+  const wrap = s => new Proxy(s, { get(t, k) {
+    if (k === '__raw') return t;
+    if (k === 'bind') return (...a) => wrap(t.bind(...a));
+    if (k === 'run' || k === 'all') return async () => add(await t[k]());
+    if (k === 'first') return async col => { const r = add(await t.all()), row = r.results[0]; return row === undefined ? null : (col ? row[col] : row); };
+    return typeof t[k] === 'function' ? t[k].bind(t) : t[k];
+  } });
+  return new Proxy(db, { get(t, k) {
+    if (k === 'prepare') return q => wrap(t.prepare(q));
+    if (k === 'batch') return async stmts => { const rs = await t.batch(stmts.map(s => s.__raw || s)); rs.forEach(add); return rs; };
+    return typeof t[k] === 'function' ? t[k].bind(t) : t[k];
+  } });
+}
+const app = {
   async fetch(req, env) {
+    const acc = { w: 0, on: false };
+    const r = await app.handle(req, env, acc);
+    if (!acc.on) return r;
+    const h = new Headers(r.headers); h.set('x-lp-rows-written', String(acc.w));
+    return new Response(r.body, { status: r.status, headers: h });
+  },
+  async handle(req, env, acc) {
     const url = new URL(req.url); const p = url.pathname; const m = req.method;
     if (!p.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {
       const me = await who(req, env);
       if (me.badJwt) return bad('The Access token could not be verified', 403);
+      if (me.tool) { acc.on = true; env = { ...env, DB: meterDb(env.DB, acc) }; }
       if (me.processor &&!PROC_ROUTES.some(([pm, re]) => pm === m && re.test(p))) return bad('Not for the processor', 403);
       // Ultrareview F11 (Rick 2026-10-27, D1 read quota): the 15-minute ping reads only the newest migration id (the primary-key index:
       // about 1 row). The counts (about 3,600 rows read) only with ?full=1 and a tool token, once a day. rows_read is D1's own figure.
@@ -602,8 +849,31 @@ export default {
         // only BEV, or a sole fuel "Electric", counts.
         const ev = /^BEV/i.test(d.ElectrificationLevel || '') || (/^electric$/i.test((d.FuelTypePrimary || '').trim()) && !d.FuelTypeSecondary);
         const engine = [d.DisplacementL && `${(+d.DisplacementL).toFixed(1)}L`, d.EngineCylinders && `${d.EngineCylinders} cyl`, d.EngineModel].filter(Boolean).join(' ');
-        return json({ vin, year: parseInt(d.ModelYear, 10) || null, make: d.Make ? await canonMake(env, d.Make) : '', model: d.Model || '', trim: [d.Trim, d.Series].filter(Boolean).join(' '),
-          engine, fuel: d.FuelTypePrimary || '', electrification: d.ElectrificationLevel || '', ev, error: d.ErrorCode !== '0' ? d.ErrorText : '' });
+        const year = parseInt(d.ModelYear, 10) || null, make = d.Make ? await canonMake(env, d.Make) : '';
+        // HANDOFF 17 (B3): the decode first. fe = the one fueleconomy.gov option that matches the decode (variant, id, text), or null (the app shows the dropdown).
+        let fe = null;
+        // Ultrareview B #8: only the Add car decode asks (?fe=1). The car page decodes for the engine text and the EV flag alone, with no fueleconomy.gov calls.
+        if (url.searchParams.get('fe') === '1' && year && make && d.Model && d.ErrorCode === '0') {
+          try { fe = await feMatch(env, year, make, d.Model, { disp: d.DisplacementL, cyl: d.EngineCylinders, ev, drive: d.DriveType }); } catch (e) { fe = null; }
+        }
+        return json({ vin, year, make, model: d.Model || '', trim: [d.Trim, d.Series].filter(Boolean).join(' '),
+          engine, fuel: d.FuelTypePrimary || '', fuel_class: fuelOf(d), electrification: d.ElectrificationLevel || '', ev, fe: fe ? { variant: fe.variant, id: +fe.value || null, text: fe.text } : null,
+          check: vinCheckDigit(vin), error: d.ErrorCode !== '0' ? d.ErrorText : '' });
+      }
+      // HANDOFF 17 (B1, B2): the Add car lists. variants of a model, and the engine options of a variant, from fueleconomy.gov (cached in D1).
+      if (p === '/api/fe' && m === 'GET') {
+        const year = parseInt(url.searchParams.get('year'), 10), make = url.searchParams.get('make') || '', model = url.searchParams.get('model') || '', variant = url.searchParams.get('variant') || '';
+        if (!make || !model || !yearOk(year)) return bad('Need year, make and model');
+        if (year < 1984) return json({ variants: [], options: [], classic: true });
+        const vs = await feMenu(env, year, make, '');
+        const variants = feVariants(vs.items, model);
+        const op = variant ? await feMenu(env, year, make, variant) : { items: [] };
+        return json({ variants, options: variant ? op.items : [], error: vs.error || op.error || '', stale: !!(vs.stale || op.stale) });
+      }
+      if (p === '/api/trims' && m === 'GET') {
+        const year = parseInt(url.searchParams.get('year'), 10), make = url.searchParams.get('make') || '', model = url.searchParams.get('model') || '';
+        if (!make || !model || !yearOk(year)) return bad('Need year, make and model');
+        return json({ trims: await trimNames(env, year, make, model) });
       }
       if (p === '/api/tabs' && m === 'GET') return json(await tabsFields(env));
       // HANDOFF 6: the Apps screen tiles (rows from private-data/apps.csv), read only. Not for the
@@ -661,25 +931,38 @@ export default {
           x.range_flag = rangeFlag(x, seen.get(k)); x.range = seen.get(k);
         }
         // HANDOFF 15 (suggestion 9): a proposal for a field that already has a confirmed value shows that value ("replaces").
+        // Ultrareview B #6: only a confirmed value of the same engine, or with no engine tag, is replaced (engineMatches, as the car page does).
+        // A proposal with no engine tag is compared with untagged rows only, so it never shows another engine's value as the one it replaces.
         for (const x of results) {
-          const c = await env.DB.prepare(`SELECT c.value, c.ftlb_lo, c.ftlb_hi FROM vals c WHERE c.field_id=? AND c.status='confirmed' AND c.id<>? AND (
-            (? = 'car' AND c.scope='car' AND c.vehicle_id=?) OR (? = 'model' AND c.scope='model' AND c.make=? AND c.model=? AND c.year_from<=? AND c.year_to>=?)) ORDER BY c.id LIMIT 1`)
-            .bind(x.field_id, x.id, x.scope, x.vehicle_id, x.scope, x.make, x.model, x.year_to, x.year_from).first();
+          const cs = (await env.DB.prepare(`SELECT c.value, c.ftlb_lo, c.ftlb_hi, c.engine FROM vals c WHERE c.field_id=? AND c.status='confirmed' AND c.id<>? AND (
+            (? = 'car' AND c.scope='car' AND c.vehicle_id=?) OR (? = 'model' AND c.scope='model' AND c.make=? AND c.model=? AND c.year_from<=? AND c.year_to>=?)) ORDER BY c.id`)
+            .bind(x.field_id, x.id, x.scope, x.vehicle_id, x.scope, x.make, x.model, x.year_to, x.year_from).all()).results;
+          const c = cs.find(r => x.engine ? (!r.engine || engineMatches(x.engine, r.engine)) : !r.engine);
           x.replaces = c ? (c.ftlb_lo != null ? `${c.ftlb_lo}${c.ftlb_hi != null ? '-' + c.ftlb_hi : ''} ft-lb` : c.value) : null;
         }
-        return json({ count: results.length, values: results });
+        // HANDOFF 17: VIN proposals read from a photo (never for the processor: it must not see a VIN) and the missing-data badges per car.
+        if (me.processor) return json({ count: results.length, values: results });
+        const vp = (await env.DB.prepare(`SELECT r.id, r.vehicle_id, r.photo, r.vin, r.vin_ok, r.created_at, v.year, v.make, v.model, v.vin saved FROM photo_reads r JOIN vehicles v ON v.id = r.vehicle_id
+          WHERE r.status='proposed' ORDER BY r.id`).all()).results.map(({ saved, ...r }) => ({ ...r, car: `${r.year} ${r.make} ${r.model}`, saved_state: !saved ? 'none' : saved === r.vin ? 'matches' : 'differs' }));
+        const placard = await badgeMap(env);
+        const badges = (await env.DB.prepare("SELECT id, year, make, model, vin FROM vehicles ORDER BY make, model, year").all()).results
+          .map(c => ({ vehicle_id: c.id, car: `${c.year} ${c.make} ${c.model}`, no_vin: !c.vin, no_doorcard: !placard.has(c.id) })).filter(c => c.no_vin || c.no_doorcard);
+        return json({ count: results.length, values: results, vin_proposals: vp, badges });
       }
       if (p === '/api/vehicles' && m === 'GET') {
         // Storyboard T1: each tile has a status line - how many values there are, how many wait for a
         // confirm, and how many block values (warn = 2, an open problem) apply. Home shows only a block;
         // a caution (warn = 1, a standing step such as the air suspension) shows on the Lift tab (HANDOFF 10).
-        const all = (await env.DB.prepare(`SELECT v.id, v.year, v.make, v.model, v.trim, v.grp, v.last_seen, v.owner, v.fuel, strftime('%Y-%m-%dT%H:%M:%fZ', v.created) created_iso,
+        const placard = await badgeMap(env);   // HANDOFF 17 (B10): "No VIN" and "No door card", computed, never stored
+        const all = (await env.DB.prepare(`SELECT v.id, v.year, v.make, v.model, v.trim, v.grp, v.last_seen, v.owner, v.fuel, v.engine, (v.vin IS NULL OR v.vin = '') no_vin, strftime('%Y-%m-%dT%H:%M:%fZ', v.created) created_iso,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND ${CAR_VALS}) nvals,
           (SELECT count(*) FROM vals x WHERE x.status='proposed' AND ${CAR_VALS}) nproposed,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=2 AND ${CAR_VALS}) nblock,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=1 AND ${CAR_VALS}) ncaution
           FROM vehicles v ORDER BY CASE v.grp WHEN 'mine' THEN 0 WHEN 'frequent' THEN 1 ELSE 2 END, v.make, v.model, v.year`).all()).results
-          .map(v => ({ ...v, hidden: hidden(v, me.nowMs), mine: v.grp === 'mine' ? 1 : 0 }));
+          .map(v => ({ ...v, no_vin: !!v.no_vin, no_doorcard: !placard.has(v.id), hidden: hidden(v, me.nowMs), mine: v.grp === 'mine' ? 1 : 0 }));
+        const tcs = await tagCounts(env, all);   // HANDOFF 17: the values tagged with an engine that matches the car's engine
+        all.forEach(v => { const t = tcs.get(v.id); v.nvals += t.nvals; v.nproposed += t.nproposed; v.nblock += t.nblock; v.ncaution += t.ncaution; });
         // HANDOFF 15: the owner's name is never sent to the processor (and so never to a model): the key is removed, not blanked.
         if (me.processor) all.forEach(v => forMe(v, me));
         else {   // suggestion 11: the last visit of each car, one line on its Home card
@@ -694,8 +977,12 @@ export default {
         if (!b.make || !b.model || !yearOk(year)) return bad('Need year, make and model');
         b.make = await canonMake(env, b.make);   // ultrareview 2 #9
         const grp = GROUPS.includes(b.grp) ? b.grp : (b.mine === true ? 'mine' : 'visitor');
-        const r = await env.DB.prepare('INSERT INTO vehicles(year, make, model, trim, vin, mine, grp, last_seen) VALUES(?,?,?,?,?,?,?,?) RETURNING id')
-          .bind(year, b.make, b.model, b.trim || '', b.vin || '', grp === 'mine' ? 1 : 0, grp, me.now).first();
+        // HANDOFF 17 (B2, B7): variant, engine, fe_id and fuel from the Add car lists; a VIN must pass the check digit unless Rick says not_us.
+        const x = carExtras(b); if (x.err) return bad(x.err);
+        const vin = String(b.vin || '').trim().toUpperCase();
+        if (vin) { const ve = vinProblem(vin, b); if (ve) return ve; }
+        const r = await env.DB.prepare('INSERT INTO vehicles(year, make, model, trim, vin, mine, grp, last_seen, variant, engine, fe_id, fuel) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
+          .bind(year, b.make, b.model, b.trim || '', vin, grp === 'mine' ? 1 : 0, grp, me.now, x.variant ?? null, x.engine ?? null, x.fe_id ?? null, x.fuel ?? null).first();
         await autoResearch(env, await vehicleRow(env, r.id), me);
         return json(forMe(await vehicle(env, r.id, me, false), me), 201);
       }
@@ -706,19 +993,17 @@ export default {
         const b = await req.json(); const v = await vehicleRow(env, +mm[1]);
         if (!v) return bad('Car not found', 404);
         // HANDOFF 15: owner, fuel, engine and the chart-caution switch. Not for the processor. An empty owner, fuel or engine clears it.
-        if (['owner', 'fuel', 'engine', 'hide_chart_cautions'].some(k => k in b) && !('grp' in b) && !('vin' in b) && !('trim' in b)) {
+        if (['owner', 'fuel', 'engine', 'variant', 'fe_id', 'hide_chart_cautions'].some(k => k in b) && !('grp' in b) && !('vin' in b) && !('trim' in b)) {
           if (me.processor) return bad('The processor cannot change these fields', 403);
           const set = {};
-          for (const k of ['owner', 'engine']) if (k in b) {
-            const t = String(b[k] ?? '').trim();
-            if (t.length > 60 || /[\u0000-\u001f]/.test(t)) return bad(`${k} has at most 60 characters and no control characters`);
-            set[k] = t || null;
+          if ('owner' in b) {
+            const t = String(b.owner ?? '').trim();
+            if (t.length > 60 || /[\u0000-\u001f]/.test(t)) return bad('owner has at most 60 characters and no control characters');
+            set.owner = t || null;
           }
-          if ('fuel' in b) {
-            const t = String(b.fuel ?? '').trim();
-            if (t && !FUELS.includes(t)) return bad(`Fuel must be one of ${FUELS.join(', ')}`);
-            set.fuel = t || null;
-          }
+          // HANDOFF 17 (B4): engine, variant, fe_id and fuel from the list. Only Rick, one explicit save; nothing changes by itself.
+          const ex = carExtras(b); if (ex.err) return bad(ex.err);
+          Object.assign(set, ex);
           if ('hide_chart_cautions' in b) {
             if (![0, 1, true, false, '0', '1'].includes(b.hide_chart_cautions)) return bad('hide_chart_cautions must be 0 or 1');
             set.hide_chart_cautions = b.hide_chart_cautions === true || b.hide_chart_cautions === 1 || b.hide_chart_cautions === '1' ? 1 : 0;
@@ -742,7 +1027,7 @@ export default {
         if ('vin' in b && !('grp' in b)) {
           if (me.processor) return bad('The processor cannot change a VIN', 403);
           const vin = String(b.vin || '').trim().toUpperCase();
-          if (vin && !/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) return bad('A VIN has 17 letters and digits, with no I, O or Q');
+          if (vin) { const ve = vinProblem(vin, b); if (ve) return ve; }   // HANDOFF 17 (B7): shape and check digit
           await env.DB.prepare('UPDATE vehicles SET vin=? WHERE id=?').bind(vin, v.id).run();
           return json({ ok: true, vin });
         }
@@ -771,6 +1056,7 @@ export default {
         for (const id of ids) await changeValue(env, id, 'delete', {}, me);
         // The service log goes with the car, but not silently: one history row per visit says it was deleted with the car.
         await env.DB.batch([env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
+          env.DB.prepare('DELETE FROM photo_reads WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim NOT LIKE 'SELFTEST%'").bind(me.now, me.device, +mm[1]),
           // A self-test car (trim starts with SELFTEST) leaves nothing behind: its visits and their history rows go (Rick 2026-10-27).
           env.DB.prepare("DELETE FROM service_log_history WHERE entry_id IN (SELECT e.id FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
@@ -801,7 +1087,12 @@ export default {
       }
       mm = p.match(/^\/api\/photos\/(\d+)\/([0-9TZ-]+\.(?:jpg|png|webp))$/);
       if (mm && (m === 'GET' || m === 'DELETE')) {
-        if (me.processor) return bad('Photos are not for the processor', 403);
+        // HANDOFF 17 (B9): the processor may GET one photo, only while a read_doorcard job for exactly that car and photo is claimed by its token.
+        if (me.processor) {
+          const own = m === 'GET' && await env.DB.prepare("SELECT 1 FROM jobs WHERE kind='read_doorcard' AND status='claimed' AND claimed_by=? AND lease_until>? AND json_extract(request, '$.car')=? AND json_extract(request, '$.photo')=? LIMIT 1")
+            .bind(me.token, me.now, +mm[1], mm[2]).first();
+          if (!own) return bad('Photos are not for the processor', 403);
+        }
         if (!env.BUCKET) return bad('Photo storage is not set up (no R2 binding)', 404);
         const key = `photos/${mm[1]}/${mm[2]}`;
         if (m === 'DELETE') { await env.BUCKET.delete(key); return json({ ok: true }); }
@@ -809,6 +1100,14 @@ export default {
         return new Response(o.body, { headers: { 'content-type': o.httpMetadata?.contentType || 'image/jpeg', 'content-length': String(o.size), 'cache-control': 'private, max-age=604800' } });
       }
       if (p.startsWith('/api/photos/')) return bad('Not a photo address', 400);
+      // HANDOFF 17 (B6): start the photo read for one photo of this car.
+      mm = p.match(/^\/api\/vehicles\/(\d+)\/doorcard$/);
+      if (mm && m === 'POST') {
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        return queueDoorcard(env, v, String((await req.json().catch(() => ({}))).photo || ''), me);
+      }
+      mm = p.match(/^\/api\/vin-proposals\/(\d+)\/(confirm|reject)$/);
+      if (mm && m === 'POST') return decideVinProposal(env, +mm[1], mm[2], await req.json().catch(() => ({})), me);
       mm = p.match(/^\/api\/vehicles\/(\d+)\/values$/);
       if (mm && m === 'POST') {
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
@@ -856,7 +1155,7 @@ export default {
       if (p.startsWith('/api/jobs/') && !me.processor) return bad('Processor only. This route needs the processor service token.', 403);
       if (p === '/api/jobs/claim' && m === 'POST') {
         const b = await req.json().catch(() => ({}));
-        const j = await claimJob(env, me, parseInt(b.only_id, 10) || null);
+        const j = await claimJob(env, me, parseInt(b.only_id, 10) || null, b.kinds);
         return j ? json(j) : json({ none: true });
       }
       mm = p.match(/^\/api\/jobs\/(\d+)\/result$/);
@@ -880,3 +1179,4 @@ export default {
     } catch (e) { return bad('Server error: ' + e.message, 500); }
   }
 };
+export default app;

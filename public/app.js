@@ -7,7 +7,7 @@ let device = store.get('lp-device');
 async function api(path, opt = {}) {
   const r = await fetch('/api' + path, { headers: { 'content-type': 'application/json', 'x-lp-device': device }, ...opt, body: opt.body ? JSON.stringify(opt.body) : undefined });
   const d = await r.json().catch(() => ({ error: 'Bad response from server' }));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.data = d; throw e; }   // e.data: the whole answer (for example check_failed on a VIN)
   $('#net').hidden = r.headers.get('x-liftpad-cache') !== 'offline';
   return d;
 }
@@ -91,7 +91,9 @@ async function home() {
     : c.nvals ? ['ok', 'All values confirmed'] : ['none', 'No values yet'];
   // Suggestion 11: one grey line with the last visit, not the history.
   const lastSvc = c => c.last_service ? `<span class="lastsvc">Last: ${esc(c.last_service.items.join(', '))}, ${esc(c.last_service.date)}, ${Number(c.last_service.mileage).toLocaleString('en-US')} mi</span>` : '';
-  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${esc(ownerOf(c))}${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span>${lastSvc(c)}</a>`; };
+  // HANDOFF 17 (B10): "No VIN" and "No door card", computed by the Worker.
+  const badges = c => c.no_vin || c.no_doorcard ? `<span class="badges">${c.no_vin ? '<span class="pill Missing">No VIN</span>' : ''}${c.no_doorcard ? '<span class="pill Missing">No door card</span>' : ''}</span>` : '';
+  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${esc(ownerOf(c))}${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span>${badges(c)}${lastSvc(c)}</a>`; };
   const ago = c => { const d = Math.floor((Date.now() - Date.parse(c.last_seen || c.created_iso || 0)) / 864e5); return d <= 0 ? 'today' : d === 1 ? '1 day ago' : `${d} days ago`; };
   const g = k => cars.filter(c => c.grp === k);
   $('#view').innerHTML = `<section aria-label="My cars" class="tabbody"><h2 class="lbl">My cars</h2><div class="cars">${g('mine').map(tile).join('') || '<div class="empty">No cars yet. Tap + Car.</div>'}</div></section>
@@ -112,15 +114,31 @@ async function confirmPage() {
   crumb('Needs confirming');
   // Storyboard T6 / P3: one row per value - what, the value, confidence and source, Confirm / Reject.
   const what = x => x.scope === 'car' ? 'this car only' : `${esc(x.make)} ${esc(x.model)} ${x.year_from}${x.year_to !== x.year_from ? '-' + x.year_to : ''}`;
-  $('#view').innerHTML = `<div class="carhead"><a class="btn" href="#/">Home</a><div><h2>Needs confirming</h2><div class="src">${d.count} proposed value${d.count === 1 ? '' : 's'} · check each against the manual or the door label, then confirm or reject</div></div></div>
-    <div role="list" class="tabbody">${d.values.map(x => `<div role="listitem" class="crow${x.range_flag === 'outside' ? ' flag' : ''}"><div class="tabbody" style="gap:6px">
-      <span class="meta">${what(x)} · ${esc(x.tab)} · ${esc(x.field)}</span>
+  // HANDOFF 17 (B6): a value read from a photo shows the photo beside it, to check against the label.
+  const photoOf = x => { const m = x.scope === 'car' && x.vehicle_id && /^photo (\d[0-9TZ-]*\.(?:jpg|png|webp))$/.exec(x.note || ''); return m ? `<a class="jphoto thumb" href="/api/photos/${x.vehicle_id}/${m[1]}" target="_blank" rel="noopener"><img src="/api/photos/${x.vehicle_id}/${m[1]}" alt="The door-jamb photo this value was read from"></a>` : ''; };
+  const SAVED = { none: 'No VIN is saved for this car yet.', matches: 'Matches the saved VIN.', differs: 'Differs from the saved VIN. A saved VIN is not replaced by a photo.' };
+  const vins = d.vin_proposals || [];
+  $('#view').innerHTML = `<div class="carhead"><a class="btn" href="#/">Home</a><div><h2>Needs confirming</h2><div class="src">${d.count + vins.length} proposed item${d.count + vins.length === 1 ? '' : 's'} · check each against the manual or the door label, then confirm or reject</div></div></div>
+    ${(d.badges || []).length ? `<div class="tabbody" id="missing"><span class="lbl">Missing</span>${d.badges.map(b => `<a class="btn" href="#/car/${b.vehicle_id}">${esc(b.car)} ${b.no_vin ? '<span class="pill Missing">No VIN</span>' : ''}${b.no_doorcard ? '<span class="pill Missing">No door card</span>' : ''}</a>`).join('')}</div>` : ''}
+    <div role="list" class="tabbody">${vins.map(p => `<div role="listitem" class="crow vinrow${p.vin_ok ? '' : ' flag'}"><div class="tabbody" style="gap:6px">
+      <span class="meta">${esc(p.car)} · VIN read from a photo</span><span class="val key" style="font-family:var(--mono)">${esc(p.vin)}</span>
+      <span class="note">${SAVED[p.saved_state]}</span>${p.vin_ok ? '' : '<span class="err">The VIN check digit fails. Read the label again, or save it as a VIN that is not US-market.</span>'}
+      <a class="jphoto thumb" href="/api/photos/${p.vehicle_id}/${esc(p.photo)}" target="_blank" rel="noopener"><img src="/api/photos/${p.vehicle_id}/${esc(p.photo)}" alt="The photo this VIN was read from"></a>
+      ${!p.vin_ok && p.saved_state === 'none' ? `<label class="toggle"><input type="checkbox" data-notus="${p.id}"><span class="st"></span>Not a US-market VIN</label>` : ''}<span class="err" data-vinerr="${p.id}"></span></div>
+      <div class="acts"><button class="ok" data-vok="${p.id}" ${p.saved_state === 'differs' ? 'disabled' : ''}>Confirm</button><button data-vno="${p.id}">Reject</button></div></div>`).join('')}
+    ${d.values.map(x => `<div role="listitem" class="crow${x.range_flag === 'outside' ? ' flag' : ''}"><div class="tabbody" style="gap:6px">
+      <span class="meta">${what(x)}${x.engine ? ' · engine: ' + esc(x.engine) : ''} · ${esc(x.tab)} · ${esc(x.field)}${/read from photo/.test(x.source || '') ? ' · read from photo' : ''}</span>${photoOf(x)}
       <span class="val${keyCls(x)}">${esc(showVal(x))}</span>${x.replaces ? `<span class="note">replaces: ${esc(noNm(x.replaces))}</span>` : ''}
       <span class="meta"><span class="pill ${esc(x.confidence)}" style="margin-left:0">${esc(x.confidence)}</span> ${x.warn ? `<span class="pill lv-${x.warn === 2 ? 'block' : 'caution'}" style="margin-left:0">${x.warn === 2 ? 'Block - do not lift yet' : 'Caution'}</span> ` : ''}${esc(x.source)}</span>${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
       ${x.range_flag === 'outside' && x.range ? `<span class="err">Outside the usual range for ${esc(x.range.thread)} (${x.range.torque_min}-${x.range.torque_max} ft-lb). Check it before you confirm.</span>` : ''}</div>
-      <div class="acts"><button class="ok" data-ok="${x.id}">Confirm</button><button data-no="${x.id}">Reject</button></div></div>`).join('') || '<p class="note">Nothing to confirm.</p>'}</div>
+      <div class="acts"><button class="ok" data-ok="${x.id}">Confirm</button><button data-no="${x.id}">Reject</button></div></div>`).join('') || (vins.length ? '' : '<p class="note">Nothing to confirm.</p>')}</div>
     <p class="note">A confirmed model-year value applies to every car of that model and year. Each confirm or reject is kept in the value's history.</p>`;
   wireStatus(confirmPage);
+  document.querySelectorAll('[data-vok]').forEach(b => b.onclick = () => {
+    const id = b.dataset.vok, nu = document.querySelector(`[data-notus="${id}"]`);
+    api(`/vin-proposals/${id}/confirm`, { method: 'POST', body: { not_us: !!(nu && nu.checked) } }).then(confirmPage).catch(e => { document.querySelector(`[data-vinerr="${id}"]`).textContent = e.message; });
+  });
+  document.querySelectorAll('[data-vno]').forEach(b => b.onclick = () => api(`/vin-proposals/${b.dataset.vno}/reject`, { method: 'POST', body: {} }).then(confirmPage).catch(fail));
 }
 function wireStatus(after) {
   document.querySelectorAll('[data-ok]').forEach(b => b.onclick = () => api(`/values/${b.dataset.ok}/confirm`, { method: 'POST', body: {} }).then(after).catch(fail));
@@ -152,48 +170,112 @@ function combo(input, list, fetchItems, onPick) {
 // ---------- Add car ----------
 function add() {
   crumb('Add car');
-  const st = { make: '', year: 0, model: '', trim: '', vin: '' };
+  const st = { make: '', year: 0, model: '', trim: '', vin: '', variant: '', engine: '', fe_id: null, fuel: '' };
+  // HANDOFF 17 (B2, B3): Year, Make, Model, Variant, Engine, then an optional Trim. fe = the fueleconomy.gov lists for the picked model.
+  const fe = { variants: [], options: [], error: '', checked: false }, vinInfo = { check: null };
   // Storyboard T5: whose car first (Mine / Frequent / Visitor), one tap each.
   $('#view').innerHTML = `<div class="carhead"><a class="btn" href="#/">Cancel</a><h2>Add a car</h2></div><div class="grid"><section class="form">
     <fieldset class="field" style="border:0;margin:0;padding:0"><legend class="lbl" style="margin-bottom:8px">Whose car</legend>
       <div class="seg" id="grp">${[['mine', 'Mine'], ['frequent', 'Frequent'], ['visitor', 'Visitor']].map(([k, l]) => `<button type="button" data-grp="${k}" aria-pressed="${k === 'visitor'}">${l}</button>`).join('')}</div></fieldset>
+    <div class="field"><label for="year">Year</label><input id="year" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="4 digits"></div>
     <div class="field"><label for="make">Make</label><input id="make" autocomplete="off" role="combobox" aria-expanded="false" placeholder="Type 2-3 letters"><ul class="list" id="make-list" role="listbox" hidden></ul></div>
-    <div class="field"><label for="year">Year</label><input id="year" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="4 digits" disabled></div>
-    <div class="field"><label for="model">Model</label><input id="model" autocomplete="off" role="combobox" aria-expanded="false" placeholder="Pick make and year first" disabled><ul class="list" id="model-list" role="listbox" hidden></ul></div>
-    <div class="field"><label for="trim">Trim / engine (optional)</label><input id="trim" autocomplete="off" placeholder="e.g. EX 2.0L"></div>
+    <div class="field"><label for="model">Model</label><input id="model" autocomplete="off" role="combobox" aria-expanded="false" placeholder="Pick year and make first" disabled><ul class="list" id="model-list" role="listbox" hidden></ul></div>
+    <div class="field" id="varbox" hidden><label for="variant">Variant</label><select id="variant"></select></div>
+    <div class="field" id="engbox" hidden><label for="engine">Engine (required when the list has more than one)</label><select id="engine"></select></div>
+    <div class="field"><label for="trimpick">Trim (optional)</label><select id="trimpick" hidden></select><input id="trim" autocomplete="off" placeholder="e.g. EX or Limited"></div>
     <div class="or">or</div>
     <div class="field"><label for="vin">VIN</label><div class="row"><input id="vin" maxlength="17" autocomplete="off" placeholder="17 characters" style="font-family:var(--mono)"><button type="button" id="vin-go">Decode</button>${scanButton('vin-scan')}</div></div>
   </section><section class="card" id="res"><h2>Pick a car</h2><p class="note">Type a make. "stu" finds Studebaker, "ram" finds Ram.</p></section></div>`;
   const show = async () => {
     const R = $('#res');
     if (!st.make || !st.year || !st.model) { R.innerHTML = `<h2>${esc([st.year || '', st.make].join(' ').trim() || 'Pick a car')}</h2><p class="note">${st.make ? (st.year ? 'Pick a model.' : 'Type the 4-digit year.') : 'Type a make.'}</p>`; return; }
-    R.innerHTML = `<h2>${st.year} ${esc(st.make)} ${esc(st.model)}</h2><p class="note">${esc(st.chartNote || '')}</p><button class="primary" id="save">Save car</button><p class="err" id="saveerr"></p>`;
+    // B2: the engine is required when the fueleconomy.gov list has more than one. A classic or a car with no list saves as before.
+    // Opus review finding 5: with several variants and none picked there are no engine options yet, so the variant is required first too.
+    const needVariant = fe.variants.length > 1 && !st.variant;
+    const needEngine = needVariant || (fe.engineChoices && fe.options.length > 1 && !st.fe_id);
+    const nus = vinInfo.check === false ? `<label class="toggle"><input type="checkbox" id="notus"><span class="st"></span>Not a US-market VIN</label>` : '';
+    R.innerHTML = `<h2>${st.year} ${esc(st.make)} ${esc(st.model)}</h2><p class="note">${esc(st.chartNote || '')}</p>${st.variant ? `<p class="note">${esc(st.variant)}${st.engine ? ' · ' + esc(st.engine) : ''}</p>` : ''}
+      ${vinInfo.check === false ? '<p class="err">The VIN check digit fails. Check the VIN, or tick "Not a US-market VIN" to save it anyway.</p>' : ''}${nus}
+      ${fe.error ? `<p class="note">${esc(fe.error)}. Type the trim and engine yourself.</p>` : ''}
+      ${fe.variants.length ? '' : `<div class="field" id="engtextbox"><label for="engtext">Engine (type it, optional)</label><input id="engtext" maxlength="80" autocomplete="off" placeholder="e.g. 2.0 L" value="${esc(st.engine)}"></div>`}
+      <button class="primary" id="save" ${needEngine ? 'disabled' : ''}>Save car</button>${needEngine ? `<p class="note" id="needeng">${needVariant ? 'Pick the variant, then the engine.' : 'Pick the engine first.'}</p>` : ''}<p class="err" id="saveerr"></p>`;
+    if ($('#engtext')) $('#engtext').oninput = e => { st.engine = e.target.value.trim(); };
     $('#save').onclick = async () => {
-      try { const v = await api('/vehicles', { method: 'POST', body: { ...st, trim: $('#trim').value.trim(), grp: $('#grp [aria-pressed="true"]').dataset.grp } }); location.hash = '#/car/' + v.id; }
+      const { chartNote, ...car } = st;
+      try { const v = await api('/vehicles', { method: 'POST', body: { ...car, trim: $('#trim').value.trim(), grp: $('#grp [aria-pressed="true"]').dataset.grp, not_us: !!($('#notus') && $('#notus').checked) } }); location.hash = '#/car/' + v.id; }
       catch (e) { $('#saveerr').textContent = e.message; }
     };
   };
+  const opt = (v, t, sel) => `<option value="${esc(v)}"${sel ? ' selected' : ''}>${esc(t)}</option>`;
+  // Engine text of an option, "Auto 8-spd, 8 cyl, 5.7 L": an electric option has none, so it gives no engine to pick.
+  const hasEng = o => /\d\.\d\s*L\b/i.test(o.text);
+  const drawEngine = () => {
+    fe.engineChoices = fe.options.some(hasEng);
+    $('#engbox').hidden = !fe.engineChoices;
+    $('#engine').innerHTML = (fe.options.length > 1 ? opt('', 'Pick the engine', !st.fe_id) : '') + fe.options.map(o => opt(o.value, o.text, String(st.fe_id) === o.value)).join('');
+    if (fe.options.length === 1) { st.fe_id = +fe.options[0].value; st.engine = fe.engineChoices ? fe.options[0].text : ''; }
+    else if (!st.fe_id) st.engine = '';
+    if (!fe.engineChoices && fe.options.length !== 1) { st.fe_id = null; st.engine = ''; }
+  };
+  const loadOptions = async variant => {
+    st.variant = variant; st.fe_id = null; st.engine = '';
+    if (!variant) { fe.options = []; drawEngine(); show(); return; }
+    try { fe.options = (await api(`/fe?year=${st.year}&make=${encodeURIComponent(st.make)}&model=${encodeURIComponent(st.model)}&variant=${encodeURIComponent(variant)}`)).options || []; } catch (e) { fe.options = []; fe.error = e.message; }
+    drawEngine(); show();
+  };
+  const loadLists = async () => {
+    Object.assign(fe, { variants: [], options: [], error: '', engineChoices: false }); Object.assign(st, { variant: '', engine: '', fe_id: null });
+    $('#varbox').hidden = true; $('#engbox').hidden = true; $('#trimpick').hidden = true;
+    if (!(st.make && st.year && st.model)) return;
+    const q = `year=${st.year}&make=${encodeURIComponent(st.make)}&model=${encodeURIComponent(st.model)}`;
+    api('/trims?' + q).then(r => {
+      if (!r.trims.length) return;
+      $('#trimpick').innerHTML = opt('', 'Pick a trim') + r.trims.map(t => opt(t.name, t.source === 'LiftPad' ? t.name : `${t.name} (${t.source})`)).join('') + opt('__type', 'Type it');
+      $('#trimpick').hidden = false;
+    }).catch(() => { /* no list: the trim is typed */ });
+    try {
+      const r = await api('/fe?' + q);
+      fe.variants = r.variants || []; fe.error = r.error || '';
+    } catch (e) { fe.error = e.message; }
+    if (fe.variants.length) {
+      $('#varbox').hidden = false;
+      $('#variant').innerHTML = (fe.variants.length > 1 ? opt('', 'Pick a variant', true) : '') + fe.variants.map(v => opt(v.text, v.text)).join('');
+      if (fe.variants.length === 1) await loadOptions(fe.variants[0].text);
+    }
+    show();
+  };
+  $('#variant').onchange = e => loadOptions(e.target.value);
+  $('#engine').onchange = e => { const o = fe.options.find(x => x.value === e.target.value); st.fe_id = o ? +o.value : null; st.engine = o && fe.engineChoices ? o.text : ''; show(); };
+  $('#trimpick').onchange = e => { if (e.target.value === '__type') { $('#trim').value = ''; $('#trim').focus(); } else if (e.target.value) $('#trim').value = e.target.value; };
+  const unlock = () => { $('#model').disabled = !(st.make && st.year); $('#model').placeholder = st.make && st.year ? 'Tap to see models' : 'Pick year and make first'; };
   combo($('#make'), $('#make-list'), q => api('/makes?q=' + encodeURIComponent(q)).then(r => r.map(m => ({ label: m.name, tag: m.mine ? 'my car' : '' }))),
-    it => { st.make = it.label; st.model = ''; $('#year').disabled = false; $('#model').value = ''; $('#model').disabled = !st.year; $('#year').focus(); show(); });
+    it => { st.make = it.label; st.model = ''; $('#model').value = ''; unlock(); loadLists(); show(); if (st.year) $('#model').focus(); });
   $('#year').addEventListener('input', e => {
     const v = e.target.value.replace(/\D/g, '').slice(0, 4); e.target.value = v; st.model = '';
-    st.year = v.length === 4 ? +v : 0; $('#model').disabled = !st.year; $('#model').value = '';
-    $('#model').placeholder = st.year ? 'Tap to see models' : 'Type the year first'; if (st.year) $('#model').focus(); show();
+    st.year = v.length === 4 ? +v : 0; $('#model').value = ''; unlock(); loadLists(); show();
+    if (st.year && !st.make) $('#make').focus(); else if (st.year) $('#model').focus();
   });
   combo($('#model'), $('#model-list'), q => api(`/models?make=${encodeURIComponent(st.make)}&year=${st.year}&q=${encodeURIComponent(q)}`)
     .then(r => r.map(m => ({ label: m.label, charts: m.charts, tag: m.charts.length ? m.charts.map(c => c.chart).join(', ') : m.unknown ? 'years unknown' : m.source }))),
-    it => { st.model = it.label; st.chartNote = it.charts.length ? `ALI chart ${it.charts.map(c => c.chart + (c.status === 'ok' ? ` (guide p.${c.guide_page})` : ' (page missing from scan)')).join(', ')}` : 'No ALI chart for this year.'; show(); });
+    it => { st.model = it.label; st.chartNote = it.charts.length ? `ALI chart ${it.charts.map(c => c.chart + (c.status === 'ok' ? ` (guide p.${c.guide_page})` : ' (page missing from scan)')).join(', ')}` : 'No ALI chart for this year.'; loadLists(); show(); });
   $('#vin-go').onclick = async () => {
     const R = $('#res');
-    try { const d = await api('/vin?vin=' + encodeURIComponent($('#vin').value)); Object.assign(st, { vin: d.vin, year: d.year, make: d.make, model: d.model });
-      $('#make').value = d.make; $('#year').value = d.year || ''; $('#year').disabled = false; $('#model').value = d.model; $('#model').disabled = false;
-      $('#trim').value = [d.trim, d.engine].filter(Boolean).join(' ');
-      st.chartNote = (d.error ? 'NHTSA note: ' + d.error : 'Decoded by NHTSA. Check make and model match the lists.') + (d.ev ? ' Battery-electric: no engine oil.' : ''); show(); }
+    try { const d = await api('/vin?fe=1&vin=' + encodeURIComponent($('#vin').value)); Object.assign(st, { vin: d.vin, year: d.year, make: d.make, model: d.model, fuel: d.fuel_class || '' });
+      vinInfo.check = d.check;
+      $('#make').value = d.make; $('#year').value = d.year || ''; $('#model').value = d.model; unlock();
+      $('#trim').value = d.trim || '';
+      st.chartNote = (d.error ? 'NHTSA note: ' + d.error : 'Decoded by NHTSA. Check make and model match the lists.') + (d.ev ? ' Battery-electric: no engine oil.' : '');
+      // B3: the decode first. When it names exactly one fueleconomy.gov option, variant and engine are preselected; otherwise the dropdowns show.
+      await loadLists();
+      // Ultrareview B #5: with no fueleconomy.gov list (down, or the model name does not match) the engine NHTSA decoded is kept, and the typed engine box shows it.
+      if (!fe.variants.length && d.engine) st.engine = d.engine;
+      if (d.fe) { $('#variant').value = d.fe.variant; await loadOptions(d.fe.variant); const o = fe.options.find(x => +x.value === d.fe.id); if (o) { $('#engine').value = o.value; st.fe_id = +o.value; st.engine = fe.engineChoices ? o.text : ''; } }
+      show(); }
     catch (e) { R.innerHTML = `<h2>VIN</h2><p class="err">${esc(e.message)}</p>`; }
   };
   wireScan('vin-scan', vin => { $('#vin').value = vin; $('#vin-go').click(); }, m => { $('#res').innerHTML = `<h2>VIN</h2><p class="err">${esc(m)}</p>`; });
   document.querySelectorAll('[data-grp]').forEach(b => b.onclick = () => document.querySelectorAll('[data-grp]').forEach(x => x.setAttribute('aria-pressed', String(x === b))));
-  $('#make').focus();
+  $('#year').focus();
 }
 
 // ---------- Car ----------
@@ -248,7 +330,8 @@ async function car(id) {
   }
   const ad = tab === 'lift' && v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { stop: false, html: '' };
   // Suggestion 5: the three numbers for a wheels-off job on one line, first on the Lift tab.
-  const bestOf = f => v.values.find(x => x.field === f && x.status === 'confirmed' && !x.hidden_by_placard) || v.values.find(x => x.field === f && x.status !== 'rejected' && !x.hidden_by_placard);
+  // Ultrareview B #4: a value tagged for an engine is never a headline pick for a car with no engine set (no_headline, from the Worker).
+  const bestOf = f => v.values.find(x => x.field === f && x.status === 'confirmed' && !x.hidden_by_placard && !x.no_headline) || v.values.find(x => x.field === f && x.status !== 'rejected' && !x.hidden_by_placard && !x.no_headline);
   const three = tab === 'lift' ? [['Torque', bestOf('Torque')], ['Pressure', bestOf('Pressure')], ['Socket', bestOf('Socket')]].filter(x => x[1]).map(([l, s]) => `<span><b>${l}</b> ${esc(showVal(s))}</span>`).join('') : '';
   const threeLine = three ? `<div class="threeline">${three}</div>` : '';
   const job = v.jobs[0];
@@ -288,13 +371,13 @@ async function car(id) {
   // Decision 1: a proposed value looks different (dashed amber box, the word Proposed) from a confirmed one.
   // Suggestions 1 and 7: History and Edit show after a tap on the value card (class "open"); on the phone the source line does too.
   const valueDd = s => `<dd data-v="${s.id}" class="v-${esc(s.status)} vcard" tabindex="0"><div><span class="val${keyCls(s)}">${esc(showVal(s))}</span>${s.ftlb_src === 'converted' ? '<span class="tag">converted</span>' : ''}</div>
-    <div><span class="pill ${esc(s.confidence)}" style="margin-left:0">${esc(s.confidence)}</span>${pill(s.status)}${s.scope === 'car' ? '<span class="tag">this car only</span>' : `<span class="tag">${s.year_from}${s.year_to !== s.year_from ? '-' + s.year_to : ''}</span>`}</div>
+    <div><span class="pill ${esc(s.confidence)}" style="margin-left:0">${esc(s.confidence)}</span>${pill(s.status)}${s.scope === 'car' ? '<span class="tag">this car only</span>' : `<span class="tag">${s.year_from}${s.year_to !== s.year_from ? '-' + s.year_to : ''}</span>`}${s.engine ? `<span class="tag engtag">engine: ${esc(s.engine)}</span>` : ''}</div>
     <div class="src">${esc(s.source)}</div>${s.note ? `<div class="note">${esc(s.note)}</div>` : ''}${rangeWarn(s)}
     ${s.status === 'proposed' ? `<div class="row"><button class="ok" data-ok="${s.id}">Confirm</button><button class="ghost" data-no="${s.id}">Reject</button></div>` : ''}
     <div class="row vacts"><button class="ghost" data-h="${s.id}">History</button><button class="ghost" data-e="${s.id}">Edit</button></div><div class="hist"></div></dd>`;
   // Storyboard T4: a visiting car opens with a first look at Lift, Torque and Tires side by side.
   // A value hidden by the door card (hidden_by_placard) is never the first look: the car's own label wins here too.
-  const best = f => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard); return c.find(x => x.status === 'confirmed') || c[0]; };
+  const best = f => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard && !x.no_headline); return c.find(x => x.status === 'confirmed') || c[0]; };
   const firstLook = v.grp !== 'visitor' ? '' : `<div class="first">
     <section aria-label="Lift"><h3>Lift</h3>${v.ali ? `<span class="val">Use chart ${esc(v.ali.chart)}</span><span class="src">ALI ${esc(v.ali.edition)} · ${v.ali.year_from}-${v.ali.year_to} · p.${v.ali.guide_page}</span>` : '<span class="note">No ALI chart</span>'}</section>
     <section aria-label="Torque"><h3>Torque</h3>${best('Torque') ? `<span class="val key">${esc(showVal(best('Torque')))}</span>${pill(best('Torque').status)}` : MK && MK.torque_ftlb != null ? `<span class="val key">~${MK.torque_ftlb} ft-lb</span><span><span class="pill Low" style="margin-left:0">Low</span> <span class="note">Typical for ${esc(v.make)} - not confirmed</span></span>` : '<span class="note">No value yet</span>'}</section>
@@ -323,6 +406,9 @@ async function car(id) {
   <div class="card" id="trimbox"><div><span class="lbl">Trim</span> <span class="val" id="trimnow">${esc(v.trim || 'none')}</span></div>
     <div class="row"><input id="trimin" maxlength="60" autocomplete="off" placeholder="for example SE or Limited" aria-label="Trim" value="${esc(v.trim || '')}"><button id="trimsave">Save trim</button></div>
     <p class="note">The trim goes into the research request. A change is logged with its date.</p><p class="err" id="trimerr"></p></div>
+  <div class="card" id="enginebox"><div><span class="lbl">Engine</span> <span class="val" id="engnow">${esc(v.engine || 'not set')}</span>${v.variant ? ` <span class="src">${esc(v.variant)}</span>` : ''}</div>
+    <div class="row"><button class="ghost" id="engpick">Pick engine from the list</button></div><div class="tabbody" id="engform"></div>
+    <p class="note">The engine goes into the research request, so each engine gets its own oil and tire values. Nothing changes until you tap Save engine.</p><p class="err" id="engerr"></p></div>
   <div class="card" id="vinbox"><div><span class="lbl">VIN</span> <span class="val" id="vinnow">${esc(v.vin || 'none')}</span></div>
     <div class="row"><input id="vinin" maxlength="17" autocomplete="off" placeholder="17 characters" aria-label="VIN" style="font-family:var(--mono)" value="${esc(v.vin || '')}"><button id="vinsave">Save VIN</button>${scanButton('vinscan')}</div>
     <p class="note">The VIN stays on this car and goes only to NHTSA, to decode the engine and the EV flag.</p><p class="err" id="vinerr"></p></div>
@@ -361,7 +447,32 @@ async function car(id) {
   document.querySelectorAll('.chartcheck').forEach(b => b.onclick = () => api('/chart-checks', { method: 'POST', body: { edition: b.dataset.ed, chart: b.dataset.chart, action: b.dataset.act } })
     .then(() => car(id)).catch(e => { b.parentElement.querySelector('.chartcheckerr').textContent = e.message; }));
   $('#trimsave').onclick =() => api('/vehicles/' + id, { method: 'PATCH', body: { trim: $('#trimin').value } }).then(() => car(id)).catch(e => { $('#trimerr').textContent = e.message; });
-  $('#vinsave').onclick =() => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value } }).then(() => car(id)).catch(e => { $('#vinerr').textContent = e.message; });
+  // B7: the server checks the VIN check digit. A failed check is shown; the car is saved only after "Save as a VIN that is not US-market".
+  const saveVin = notUs => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value, ...(notUs ? { not_us: true } : {}) } }).then(() => car(id)).catch(e => {
+    $('#vinerr').textContent = e.message;
+    if (e.data && e.data.check_failed) { $('#vinerr').insertAdjacentHTML('afterend', '<button class="ghost" id="vinnotus">Save as a VIN that is not US-market</button>'); $('#vinnotus').onclick = () => saveVin(true); }
+  });
+  $('#vinsave').onclick = () => saveVin(false);
+  // B4: the one-time "Pick engine from the list" for a car that already exists. It shows the lists; Save engine is the only change.
+  $('#engpick').onclick = async () => {
+    const f = $('#engform'); f.innerHTML = '<p class="note">Reading the list...</p>';
+    const q = `year=${v.year}&make=${encodeURIComponent(v.make)}&model=${encodeURIComponent(v.model)}`;
+    try {
+      const r = await api('/fe?' + q);
+      if (!r.variants.length) { f.innerHTML = `<p class="note">${esc(r.error || 'The list has no entry for this car.')} Nothing to pick.</p>`; return; }
+      const o = (val, t, sel) => `<option value="${esc(val)}"${sel ? ' selected' : ''}>${esc(t)}</option>`;
+      f.innerHTML = `<div class="field"><label for="pkvar">Variant</label><select id="pkvar">${r.variants.length > 1 ? o('', 'Pick a variant', !v.variant) : ''}${r.variants.map(x => o(x.text, x.text, x.text === v.variant)).join('')}</select></div>
+        <div class="field"><label for="pkeng">Engine</label><select id="pkeng"></select></div><button id="pksave" disabled>Save engine</button>`;
+      let opts = [];
+      const fill = async () => {
+        const vr = $('#pkvar').value; opts = vr ? (await api(`/fe?${q}&variant=${encodeURIComponent(vr)}`)).options : [];
+        $('#pkeng').innerHTML = o('', 'Pick the engine', !v.fe_id) + opts.map(x => o(x.value, x.text, +x.value === v.fe_id)).join(''); $('#pksave').disabled = !$('#pkeng').value;
+      };
+      $('#pkvar').onchange = fill; $('#pkeng').onchange = () => { $('#pksave').disabled = !$('#pkeng').value; };
+      if ($('#pkvar').value) await fill();
+      $('#pksave').onclick = () => { const x = opts.find(y => y.value === $('#pkeng').value); api('/vehicles/' + id, { method: 'PATCH', body: { variant: $('#pkvar').value, fe_id: +x.value, engine: /\d\.\d\s*L\b/i.test(x.text) ? x.text : '' } }).then(() => car(id)).catch(e => { $('#engerr').textContent = e.message; }); };
+    } catch (e) { $('#engerr').textContent = e.message; }
+  };
   wireScan('vinscan', vin => { $('#vinin').value = vin; $('#vinerr').textContent = 'VIN read from the photo - check it, then Save VIN.'; }, m => { $('#vinerr').textContent = m; });
   document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => car(id)).catch(fail));
   $('#research').onclick = () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => car(id)).catch(e => { $('#delmsg').textContent = e.message; });
@@ -440,22 +551,45 @@ async function jamb(id) {
   crumb(`${v.year} ${v.make} ${v.model} · door-jamb label`);
   $('#view').innerHTML = `<section class="card phoneflow"><h2>Door-jamb label</h2><div class="src">${v.year} ${esc(v.make)} ${esc(v.model)} ${esc(v.trim)}</div>
     <ul class="note"><li>Driver door open, label on the door pillar.</li><li>Get the whole label, no glare.</li><li>The photo stays in your private storage. No one else reads it.</li></ul>
-    <label class="btn primary big" for="jcam">Take photo</label><input type="file" id="jcam" accept="image/*" capture="environment" hidden>
+    <label class="btn primary big" for="jscan">Scan door jamb</label><input type="file" id="jscan" accept="image/*" capture="environment" hidden>
+    <p class="note">Scan reads the photo for you (the VIN label for the VIN, the tire label for the tires). Claude sees only the photo and the car's year, make, model and engine. It never sees the saved VIN. You confirm every value. It takes about 2 minutes.</p>
+    <label class="btn big" for="jcam">Take photo and type the values</label><input type="file" id="jcam" accept="image/*" capture="environment" hidden>
     <label class="btn big" for="jpick">Choose from photos</label><input type="file" id="jpick" accept="image/*" hidden>
     <p class="err" id="jerr"></p>
     ${photos.length ? `<h3 class="lbl">Earlier photos</h3><div class="row">${photos.slice(0, 6).map(ph => `<a class="btn" href="#/car/${v.id}/jamb/${esc(ph.name)}">${esc(ph.name.slice(0, 10))} ${esc(ph.name.slice(11, 16).replace('-', ':'))}</a>`).join('')}</div>` : ''}
     <a class="btn" href="#/car/${v.id}">Back to the car</a></section>`;
-  const up = async e => {
+  const up = scan => async e => {
     const f = e.target.files && e.target.files[0]; if (!f) return;
     $('#jerr').textContent = 'Saving the photo...';
     try {
       const b = await shrink(f);
       const r = await fetch(`/api/vehicles/${id}/photos`, { method: 'POST', headers: { 'content-type': b.type || 'image/jpeg', 'x-lp-device': device }, body: b });
       const d = await r.json(); if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
-      location.hash = `#/car/${id}/jamb/${d.name}`;
+      if (!scan) { location.hash = `#/car/${id}/jamb/${d.name}`; return; }
+      const j = await api(`/vehicles/${id}/doorcard`, { method: 'POST', body: { photo: d.name } });
+      watchRead(id, j.id);
     } catch (x) { $('#jerr').textContent = x.message; }
   };
-  $('#jcam').onchange = up; $('#jpick').onchange = up;
+  $('#jscan').onchange = up(true); $('#jcam').onchange = up(false); $('#jpick').onchange = up(false);
+}
+// B6, B12: after "Scan door jamb" the phone waits for the read job (the N100 checks the queue every minute) and shows its end.
+const READ_WAIT_MS = 5000, READ_WAIT_TRIES = 60;
+async function watchRead(id, jobId) {
+  const live = fresh();
+  $('#view').innerHTML = `<section class="card phoneflow"><h2>Reading the photo</h2><p class="note" id="rd">Reading the photo - about 2 minutes.</p>
+    <p class="note">You can leave this page. The values wait in Needs confirming, beside the photo.</p><a class="btn" href="#/car/${id}">Back to the car</a></section>`;
+  for (let i = 0; i < READ_WAIT_TRIES; i++) {
+    await new Promise(r => setTimeout(r, READ_WAIT_MS)); if (!live()) return;
+    const v = await api(`/vehicles/${id}?peek=1`).catch(() => null); if (!live()) return;
+    const j = v && v.jobs.find(x => x.id === jobId);
+    if (j && j.status === 'done') { $('#view').innerHTML = `<section class="card phoneflow"><h2>Photo read</h2><p class="note">${esc(j.result_summary || 'Done.')}</p><a class="btn primary big" href="#/confirm">Check and confirm</a><a class="btn" href="#/car/${id}">Back to the car</a></section>`; return; }
+    if (j && j.status === 'failed') {
+      const limit = /^daily_limit/.test(j.error || '');
+      $('#view').innerHTML = `<section class="card phoneflow"><h2>${limit ? 'Daily limit reached' : 'The photo was not read'}</h2><p class="${limit ? 'note' : 'err'}" id="rderr">${limit ? 'Daily limit reached - type the values or try tomorrow' : esc(j.error || 'The read failed.')}</p><a class="btn primary big" href="#/car/${id}/jamb">Type the values</a><a class="btn" href="#/car/${id}">Back to the car</a></section>`;
+      return;
+    }
+  }
+  if (live()) $('#rd').textContent = 'Still reading. You can leave this page; the values will appear in Needs confirming.';
 }
 // P2: the photo beside the fields. "Correct - confirm" saves confirmed High (the placard is the
 // maker's own label); "Save as proposed" keeps them for later. They are this car's own values.
@@ -799,7 +933,7 @@ armIdle();
 // ---------- Router ----------
 async function route() {
   const h = location.hash || '#/';
-  routeSeq++;
+  const seq = ++routeSeq;
   $('#hnav').innerHTML = '';   // the home screen fills it
   try {
     if (!device) pickDevice();
@@ -814,7 +948,7 @@ async function route() {
     else if (/^#\/car\/\d+\/jamb\/[0-9TZ-]+\.(jpg|png|webp)$/.test(h)) await jambRead(h.split('/')[2], h.split('/')[4]);
     else if (h.startsWith('#/car/')) await car(h.slice(6));
     else await home();
-  } catch (e) { fail(e); }
+  } catch (e) { if (seq === routeSeq) fail(e); }   // a screen Rick already left must not draw its error over the new one ("Car not found" over Home, 2026-10-28)
 }
 let nextTab = null;   // a screen that sends Rick back to a car can name the tab to open
 let holdHash = false;

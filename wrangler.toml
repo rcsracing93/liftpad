@@ -29,6 +29,8 @@ bucket_name = "liftpad-private"
 
 [vars]
 NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
+# fueleconomy.gov web service (HANDOFF 17): the year, make, model, engine lists. The Worker fetches it and caches the answers in D1 (fe_menu).
+FE = "https://www.fueleconomy.gov/ws/rest/vehicle"
 # Research job by itself when Rick adds a car or changes a trim: "1" = on. Default off; tools/deploy.sh sets it from deploy.env.
 LP_AUTO_RESEARCH = "0"
 
@@ -58,5 +60,6 @@ bucket_name = "liftpad-review-private"
 
 [env.review.vars]
 NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
+FE = "https://www.fueleconomy.gov/ws/rest/vehicle"
 # Always "0" in review: no Anthropic key exists there.
 LP_AUTO_RESEARCH = "0"

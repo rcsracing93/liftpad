@@ -35,6 +35,39 @@ if (LOCAL) {
     const s = createSign('RSA-SHA256').update(h + '.' + p).sign(key).toString('base64url'); return `${h}.${p}.${s}`; };
   sign.other = other;
 }
+// HANDOFF 17: a fake fueleconomy.gov for the local run (run_selftest_local.sh starts the Worker with FE=http://127.0.0.1:8789/fe). It serves
+// SAVED answers from the 2026-10-26 probe, the three shapes (list, one object, null), and counts the requests so the D1 cache can be graded.
+const FE_HITS = { n: 0 };
+let feSrv = null;
+if (LOCAL) {
+  const MENUS = {
+    'model|2021|Jeep': { menuItem: [{ text: 'Grand Cherokee 2WD', value: 'Grand Cherokee 2WD' }, { text: 'Grand Cherokee 4WD', value: 'Grand Cherokee 4WD' }, { text: 'Wrangler', value: 'Wrangler' }] },
+    'options|2021|Jeep|Grand Cherokee 4WD': { menuItem: [{ text: 'Auto 8-spd, 6 cyl, 3.6 L', value: '43167' }, { text: 'Auto 8-spd, 8 cyl, 5.7 L', value: '43168' }] },
+    'options|2021|Jeep|Grand Cherokee 2WD': { menuItem: { text: 'Auto 8-spd, 6 cyl, 3.6 L', value: '43160' } },
+    // Ultrareview B #8: Ford 2013 is not asked by any other check, so the first request for it is graded (the NHTSA example VIN is a 2013 Ford F-150).
+    'model|2013|Ford': { menuItem: [{ text: 'F-150 2WD', value: 'F-150 2WD' }] },
+    'options|2013|Ford|F-150 2WD': { menuItem: { text: 'Auto 6-spd, 6 cyl, 3.5 L', value: '33000' } },
+    'model|2025|BMW': { menuItem: [{ text: 'i4 eDrive40 Gran Coupe', value: 'a' }] },
+    'options|2025|BMW|i4 eDrive40 Gran Coupe': { menuItem: { text: 'Auto (A1)', value: '48308' } },
+  };
+  feSrv = createServer((q, r) => {
+    const u = new URL(q.url, 'http://x'), g = k => u.searchParams.get(k);
+    // Ultrareview B #8 (2026-10-28): a fake NHTSA decode, so the VIN checks run without the network (the container may be offline). It answers the
+    // VIN decode with the public example vehicle (a 2013 Ford F-150, 3.5 L, 6 cyl); every other NHTSA path answers 503 ("NHTSA down", as the tests expect).
+    if (u.pathname.startsWith('/nhtsa/')) {
+      r.setHeader('content-type', 'application/json');
+      if (!u.pathname.startsWith('/nhtsa/DecodeVinValues/')) { r.statusCode = 503; r.end('{}'); return; }
+      r.end(JSON.stringify({ Results: [{ Make: 'FORD', Model: 'F-150', ModelYear: '2013', Trim: 'XLT', Series: '', DisplacementL: '3.5', EngineCylinders: '6', EngineModel: '', FuelTypePrimary: 'Gasoline', FuelTypeSecondary: '', ElectrificationLevel: '', DriveType: '4x4', ErrorCode: '0', ErrorText: '' }] }));
+      return;
+    }
+    FE_HITS.n++;
+    const key = u.pathname.endsWith('/menu/model') ? `model|${g('year')}|${g('make')}` : `options|${g('year')}|${g('make')}|${g('model')}`;
+    r.setHeader('content-type', 'application/json');
+    if (g('make') === 'Failmake') { r.statusCode = 503; r.end('{}'); return; }
+    r.end(JSON.stringify(MENUS[key] ?? null));   // no result = null
+  });
+  await new Promise(ok2 => feSrv.listen(8789, '127.0.0.1', ok2));
+}
 const hdr = as => {
   const h = { 'content-type': 'application/json', 'x-lp-device': 'selftest' };
   if (LOCAL) {
@@ -51,12 +84,15 @@ const hdr = as => {
 // burst of page-image requests the review host reset connections (2026-10-27). A write is never retried (it could run twice), and an
 // HTTP error answer is never retried (it is graded).
 const getRetry = async (url, init) => { for (let i = 0; ; i++) { try { return await fetch(url, init); } catch (e) { if (i >= 2) throw e; await new Promise(z => setTimeout(z, 1500)); } } };
+// HANDOFF 17 (B0): D1's rows_written (meta, indexes included) for every request of the tool token; the Worker sends it in x-lp-rows-written.
+const ROWS = { n: 0, seen: 0 };
 const call = async (p, o = {}) => {
   const h = hdr(o.as || 'tool'); if (o.now) h['x-lp-now'] = o.now;
   const init = { method: o.method || 'GET', headers: h, body: o.body ? JSON.stringify(o.body) : undefined };
   // A DELETE is retried too (2026-10-27, live run 3): it can run twice safely, and a lost delete left a temp car on live.
   // A PUT is retried too (live run 4): the only PUT is the chart box, which writes the same row again.
   const r = ['GET', 'DELETE', 'PUT'].includes(init.method) ? await getRetry(BASE + p, init) : await fetch(BASE + p, init);
+  const rw = r.headers.get('x-lp-rows-written'); if (rw !== null && Number.isFinite(+rw)) { ROWS.n += +rw; ROWS.seen++; }
   let d; try { d = await r.json(); } catch { d = null; } return { s: r.status, d };
 };
 const plus = (ms) => new Date(Date.now() + ms).toISOString();
@@ -266,8 +302,10 @@ await t('the Oil tab has Oil type, Quantity (qt) and Filter', async () => {
 });
 // A public sample VIN (NHTSA's own API example, a 2013 Ford F-150): it goes to NHTSA only.
 await t('VIN decode gives fuel type and the EV flag (gas car: no EV)', async () => {
+  const fe0 = FE_HITS.n;   // Ultrareview B #8: this is the FIRST decode of the Ford (2013) in the run (the local run has a fake NHTSA), so an old Worker that always asks fueleconomy.gov shows here
   const { s, d } = await call('/api/vin?vin=1FTFW1CT5DFC10312');
   if (s >= 500) return 'NHTSA not reachable: ' + JSON.stringify(d).slice(0, 80);
+  ok(FE_HITS.n === fe0, `Ultrareview B #8: the decode without fe=1 made ${FE_HITS.n - fe0} fueleconomy.gov request(s)`);
   ok(s === 200 && d.ev === false && /gasoline/i.test(d.fuel) && typeof d.engine === 'string', JSON.stringify(d)); return `${d.year} ${d.make} ${d.model}, ${d.fuel}, ${d.engine}`;
 });
 // ---------- Lookup links (Handoff 3 step 5, decision 8): the built address only - never fetched ----------
@@ -626,7 +664,7 @@ if (health.schema >= '0009') {
   const bad2 = [], chk = (c, m) => { if (!c) bad2.push(m); }, mv = [], svcIds = [];   // svcIds: every visit this block makes (its history rows must be gone at the end)
   // Ultrareview 2026-10-27: one result line per finding. n counts the checks, so a finding that measured nothing is not a PASS.
   const UR = {}, urChk = (k, c, m) => { const u = UR[k] = UR[k] || { n: 0, bad: [] }; u.n++; if (!c) u.bad.push(m); };
-  const PRIV_KEYS = ['vin', 'notes', 'owner', 'chart_notes', 'chart_notes_footer'], TEST_VIN = '1FTFW1CT5DFC10312';
+  const PRIV_KEYS = ['vin', 'notes', 'owner', 'chart_notes', 'chart_notes_footer', 'no_vin', 'no_doorcard'], TEST_VIN = '1FTFW1CT5DFC10312';
   let tc = null, procVal = null, tcPhoto = null;
   const mkVal = (body, as) => call(`/api/vehicles/${tc}/values`, { method: 'POST', body, as });
   try {
@@ -861,6 +899,269 @@ if (health.schema >= '0009') {
   }
 } else skip('HANDOFF 15: ft-lb numbers, door card wins, owner, fuel, service log', 'schema before 0009');
 
+// ---------- HANDOFF 17: engine lists, VIN check digit, door-jamb photo read, badges ----------
+// Temp cars (1973 AMC Hornet B, trim SELFTEST B) with their photos go with the car. Every job this block makes is claimed and closed here, so
+// the N100 photo script never gets one (a read_doorcard job is claimed within the same second it is queued). Model-scope test values are removed by id.
+// The only VINs are the public NHTSA example VIN and that VIN with its last character changed (check digit fails).
+if (health.schema >= '0012') {
+  const GOOD = '1FTFW1CT5DFC10312', BADV = GOOD.slice(0, 16) + '8', made = [], vals17 = [];
+  const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const addVal = async (id, body) => { const r = await call(`/api/vehicles/${id}/values`, { method: 'POST', body: { confidence: 'Low', source: 'selftest', ...body } }); return r; };
+  const track = r => { (r.d && r.d.values || []).filter(x => x.source === 'selftest' && x.scope === 'model').forEach(x => { if (!vals17.includes(x.id)) vals17.push(x.id); }); return r; };
+  // A value added for ANOTHER engine than the car's own is not in the answer of the add call, so track() cannot see it and it used to stay in the
+  // database for ever (the review database keeps state between runs: the second rehearsal then saw extra values and failed, 2026-10-28). The sweep
+  // deletes every proposed model-scope value with the source "selftest", at the start and at the end of this section.
+  const sweepVals = async () => { const nc = (await call('/api/needs-confirming')).d; for (const x of (nc && nc.values) || []) if (x.source === 'selftest' && x.scope === 'model') await call('/api/values/' + x.id, { method: 'DELETE' }).catch(() => null); };
+  // one photo read: upload a photo, queue the job, claim it as the processor, post the result. Returns the pieces for the checks.
+  const readJob = async (id, read) => {
+    const up = await raw(`/api/vehicles/${id}/photos`, { method: 'POST', body: GREY }), photo = (await up.json()).name;
+    const q = await call(`/api/vehicles/${id}/doorcard`, { method: 'POST', body: { photo } });
+    const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d && q.d.id, kinds: ['read_doorcard'] } });
+    const res = cl.d && cl.d.id ? await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { read } }) : null;
+    return { photo, q, cl, res };
+  };
+  try {
+    await sweepVals();
+    await t('HANDOFF 17 B7: VIN check digit on add, edit and a VIN decode; "not a US-market VIN" saves a failing one', async () => {
+      const b = [];
+      let r = await mkCar({ vin: BADV }); if (r.s !== 400 || !(r.d && r.d.check_failed)) b.push(`add with a failing check digit: ${r.s}`);
+      r = await mkCar({ vin: 'ABCDEFGHIJKLMNOPQ' }); if (r.s !== 400 || (r.d && r.d.check_failed)) b.push(`add with a bad shape: ${r.s}`);
+      r = await mkCar({ vin: BADV, not_us: true }); if (r.s !== 201 || (await carOf(r.d.id)).vin !== BADV) b.push(`add with not_us: ${r.s}`);
+      r = await mkCar({ vin: GOOD.toLowerCase() }); if (r.s !== 201 || (await carOf(r.d.id)).vin !== GOOD) b.push(`add with a good VIN in lower case: ${r.s}`);
+      const c = await mkCar(); const id = c.d.id;
+      let p = await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { vin: BADV } }); if (p.s !== 400 || !p.d.check_failed) b.push(`edit with a failing check digit: ${p.s}`);
+      if ((await carOf(id)).vin) b.push('the failing VIN was saved');
+      p = await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { vin: BADV, not_us: true } }); if (p.s !== 200 || (await carOf(id)).vin !== BADV) b.push(`edit with not_us: ${p.s}`);
+      p = await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { vin: '' } }); if (p.s !== 200 || (await carOf(id)).vin) b.push('clear');
+      const d1 = await call('/api/vin?vin=' + GOOD);   // NHTSA answers; a 500 here is NHTSA down
+      if (d1.s === 200 && d1.d.check !== true) b.push('decode of the good VIN: check ' + d1.d.check);
+      const d2 = await call('/api/vin?vin=' + BADV); if (d2.s === 200 && d2.d.check !== false) b.push('decode of the failing VIN: check ' + d2.d.check);
+      ok(!b.length, b.join('; ')); return 'add, edit, decode';
+    });
+    if (LOCAL) await t('HANDOFF 17 B1: fueleconomy lists through the Worker: variants, options, one object, no result, D1 cache, error, classic', async () => {
+      const b = [], n0 = FE_HITS.n, q = '/api/fe?year=2021&make=Jeep&model=Grand%20Cherokee', v4 = '&variant=Grand%20Cherokee%204WD';
+      const a = await call(q); if (a.s !== 200 || a.d.variants.map(x => x.text).join() !== 'Grand Cherokee 2WD,Grand Cherokee 4WD') b.push('variants: ' + JSON.stringify(a.d));
+      const o = await call(q + v4); if (o.s !== 200 || o.d.options.map(x => x.value).join() !== '43167,43168') b.push('options: ' + JSON.stringify(o.d));
+      const o2 = await call(q + '&variant=Grand%20Cherokee%202WD'); if (o2.d.options.length !== 1 || o2.d.options[0].value !== '43160') b.push('one object: ' + JSON.stringify(o2.d));
+      const h1 = FE_HITS.n - n0; if (h1 !== 3) b.push(`requests to fueleconomy.gov ${h1}, want 3`);
+      await call(q); await call(q + v4); await call(q + '&variant=Grand%20Cherokee%202WD');
+      if (FE_HITS.n - n0 !== h1) b.push(`the cache did not answer: ${FE_HITS.n - n0} requests`);
+      const nr = await call('/api/fe?year=2021&make=Jeep&model=Nothing'); if (nr.s !== 200 || nr.d.variants.length) b.push('no result: ' + JSON.stringify(nr.d));
+      const ev = await call('/api/fe?year=2025&make=BMW&model=i4&variant=i4%20eDrive40%20Gran%20Coupe'); if (ev.d.options.length !== 1 || /\d\.\d\s*L/.test(ev.d.options[0].text)) b.push('electric option: ' + JSON.stringify(ev.d));
+      const er = await call('/api/fe?year=2021&make=Failmake&model=X'); if (er.s !== 200 || er.d.variants.length || !er.d.error) b.push('fetch error with no saved row: ' + JSON.stringify(er.d));
+      const n1 = FE_HITS.n; const cl = await call('/api/fe?year=1973&make=AMC&model=Hornet'); if (cl.s !== 200 || !cl.d.classic || FE_HITS.n !== n1) b.push('classic: ' + JSON.stringify(cl.d));
+      if ((await call('/api/fe?year=2021&model=X')).s !== 400) b.push('missing make is not 400');
+      const tr = await call('/api/trims?year=1973&make=AMC&model=Hornet%20B'); if (tr.s !== 200 || !Array.isArray(tr.d.trims) || tr.d.trims.some(x => /^SELFTEST/.test(x.name))) b.push('trims: ' + JSON.stringify(tr.d));
+      ok(!b.length, b.join('; ')); return `${h1} requests, then 0 more from the cache`;
+    }); else skip('HANDOFF 17 B1: fueleconomy lists through the Worker', 'local mode only (the fake fueleconomy.gov)');
+    await t('HANDOFF 17 B2/B4/B5: variant, engine, fe_id and fuel on a car; a value with an engine shows only on that engine; research carries the engine', async () => {
+      const b = [], E1 = 'Auto 8-spd, 8 cyl, 5.7 L', E2 = 'Auto 8-spd, 6 cyl, 3.6 L';
+      const c = await mkCar({ engine: E1, variant: 'Grand Cherokee 4WD', fe_id: 43168, fuel: 'gas' }); const id = c.d && c.d.id;
+      const cv = await carOf(id); if (c.s !== 201 || cv.engine !== E1 || cv.variant !== 'Grand Cherokee 4WD' || cv.fe_id !== 43168 || cv.fuel !== 'gas') b.push('fields not stored: ' + JSON.stringify([cv.engine, cv.variant, cv.fe_id, cv.fuel]));
+      if ((await mkCar({ engine: 'x'.repeat(81) })).s !== 400) b.push('an engine of 81 characters was accepted');
+      if ((await mkCar({ fe_id: 'abc' })).s !== 400) b.push('a bad fe_id was accepted');
+      const c2 = await mkCar(); const id2 = c2.d.id;   // no engine
+      for (const [value, engine] of [['generic oil', undefined], ['oil for the V8', E1], ['oil for the V6', E2]]) {
+        const r = track(await addVal(id, { tab: 'oil', field: 'Oil type', value, scope: 'model', engine })); if (r.s !== 201) b.push('add value ' + r.s);
+      }
+      const oil = async i => ((await carOf(i)).values || []).filter(x => x.field === 'Oil type').map(x => x.value);
+      let s = await oil(id); if (s.join() !== 'oil for the V8,generic oil') b.push('car with the V8: ' + s);
+      s = await oil(id2); if (s.length !== 3) b.push('car with no engine sees ' + s);
+      await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { engine: E2, fe_id: 43167 } }); s = await oil(id); if (s.join() !== 'oil for the V6,generic oil') b.push('car with the V6: ' + s);
+      const hl = ((await call('/api/vehicles')).d || []).find(x => x.id === id); if (!hl || hl.nvals < 2) b.push('Home counts: ' + JSON.stringify(hl && hl.nvals));
+      if (hasProc) {
+        const jb = await call('/api/jobs', { method: 'POST', body: { vehicle_id: id, kind: 'research', fields: [{ tab: 'oil', field: 'Quantity' }] } });
+        const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jb.d && jb.d.id, kinds: ['research', 'workup'] } });
+        if (!cl.d || cl.d.request.engine !== E2) b.push('the research request has no engine: ' + JSON.stringify(cl.d && cl.d.request));
+        const rs = cl.d && cl.d.id ? await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [
+          { tab: 'oil', field: 'Quantity', value: '5.5 qt', confidence: 'Low', source: 'https://example.com/selftest', engine: E2 },   // marked for the engine (as the worker does for oil)
+          { tab: 'torque', field: 'Thread', value: 'M12x1.5', confidence: 'Low', source: 'https://example.com/selftest' }] } }) : { s: 'no job' };   // not engine-dependent: no tag
+        if (rs.s !== 200) b.push('result ' + rs.s);
+        const pv = ((await call(`/api/vehicles/${id}?peek=1`)).d.values || []).filter(x => x.source === 'https://example.com/selftest');
+        const q = pv.find(x => x.field === 'Quantity'), th = pv.find(x => x.field === 'Thread');
+        if (!q || q.engine !== E2 || q.scope !== 'model') b.push('the value marked for the engine has no engine tag: ' + JSON.stringify(q && [q.engine, q.scope]));
+        if (!th || th.engine !== null) b.push('a value not marked for the engine got a tag (Opus finding 1): ' + JSON.stringify(th && th.engine));
+        pv.forEach(x => vals17.push(x.id));
+        const jb2 = await call('/api/jobs', { method: 'POST', body: { vehicle_id: id2, kind: 'research', fields: [{ tab: 'oil', field: 'Filter' }] } });
+        const cl2 = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jb2.d && jb2.d.id, kinds: ['research'] } });
+        if (!cl2.d || 'engine' in cl2.d.request) b.push('a car with no engine has an engine key in its request');
+        if (cl2.d && cl2.d.id) await call(`/api/jobs/${cl2.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } });
+      }
+      ok(!b.length, b.join('; ')); return 'engine filter, order, request and result';
+    });
+    await t('HANDOFF 17 (Rick 2026-10-27): engines match by a normalized key (displacement, cylinders, turbo, electric), not by text', async () => {
+      const b = [], LIST20 = 'Auto (variable gear ratios), 4 cyl, 2.0 L';
+      const id = (await mkCar({ engine: LIST20 })).d.id;
+      for (const [value, engine] of [['tag 2.0 L', '2.0 L'], ['tag 2.0L spelling', '2.0L'], ['tag list text', LIST20], ['tag 1.5 L turbo', '1.5 L turbo'], ['tag 2.0 L turbo', '2.0 L Turbo'], ['tag 4 cyl 2.0 L', '4 cyl 2.0 L'], ['tag 6 cyl 2.0 L', '6 cyl 2.0 L'], ['no tag', undefined]])
+        track(await addVal(id, { tab: 'oil', field: 'Filter', value, scope: 'model', engine }));
+      const seen = async () => ((await carOf(id)).values || []).filter(x => x.field === 'Filter').map(x => x.value).sort();
+      const want = ['no tag', 'tag 2.0 L', 'tag 2.0L spelling', 'tag 4 cyl 2.0 L', 'tag list text'];
+      let s = await seen(); if (s.join() !== want.join()) b.push('2.0 L car (list text) sees: ' + s);
+      await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { engine: '2.0 L' } }); s = await seen();   // a later pick or another spelling never hides a value
+      if (s.join() !== ['no tag', 'tag 2.0 L', 'tag 2.0L spelling', 'tag 4 cyl 2.0 L', 'tag 6 cyl 2.0 L', 'tag list text'].sort().join()) b.push('2.0 L car (short text) sees: ' + s);
+      await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { engine: '1.5 L Turbo' } }); s = await seen();
+      if (s.join() !== ['no tag', 'tag 1.5 L turbo'].join()) b.push('1.5 L turbo car sees: ' + s);
+      const hl = ((await call('/api/vehicles')).d || []).find(x => x.id === id), nv = (await carOf(id)).values.length;   // Home counts equal what the car shows
+      if (!hl || hl.nvals !== nv) b.push(`Home counts ${hl && hl.nvals}, the car shows ${nv}`);
+      ok(!b.length, b.join('; ')); return 'normalized key';
+    });
+    await t('Ultrareview B #4: a car with no engine sees the untagged value first, the tagged ones are flagged no_headline; a car with an engine is not flagged', async () => {
+      const b = [], E = 'Auto (variable gear ratios), 4 cyl, 2.0 L';
+      const none = (await mkCar({ year: 1975 })).d.id, eng = (await mkCar({ year: 1975, engine: E })).d.id;
+      for (const [value, engine] of [['tagged oil 2.0', E], ['generic oil', undefined]]) track(await addVal(none, { tab: 'oil', field: 'Oil type', value, scope: 'model', engine }));
+      const vs = async i => ((await carOf(i)).values || []).filter(x => x.field === 'Oil type');
+      let s = await vs(none);
+      if (s.map(x => x.value).join() !== 'generic oil,tagged oil 2.0') b.push('car with no engine, order: ' + s.map(x => x.value));
+      const g = s.find(x => x.value === 'generic oil'), tg = s.find(x => x.value === 'tagged oil 2.0');
+      if (!g || !tg || g.no_headline !== false || tg.no_headline !== true || tg.engine !== E) b.push('car with no engine, flags: ' + JSON.stringify(s.map(x => [x.value, x.no_headline, x.engine])));
+      s = await vs(eng);
+      if (s.map(x => x.value).join() !== 'tagged oil 2.0,generic oil' || s.some(x => x.no_headline)) b.push('car with the engine: ' + JSON.stringify(s.map(x => [x.value, x.no_headline])));
+      ok(!b.length, b.join('; ')); return 'order and no_headline';
+    });
+    await t('Ultrareview B #6: Needs confirming "replaces" looks at the same engine or no engine only, and the row carries the engine', async () => {
+      const b = [], EA = 'Auto, 4 cyl, 2.0 L', EB = 'Auto, 4 cyl, 1.5 L turbo';
+      const id = (await mkCar({ year: 1979 })).d.id;
+      const mk = async (value, engine, confirm) => {
+        const r = track(await addVal(id, { tab: 'oil', field: 'Filter', value, scope: 'model', engine })), x = ((r.d && r.d.values) || []).find(y => y.value === value);
+        if (x && confirm) await call(`/api/values/${x.id}/confirm`, { method: 'POST', body: {} });
+        return x;
+      };
+      await mk('filter A confirmed', EA, true); await mk('filter B proposed', EB, false); await mk('filter A proposed', EA, false); await mk('filter untagged proposed', undefined, false);
+      const nc = (await call('/api/needs-confirming')).d.values, get = v => nc.find(x => x.value === v);
+      if (!get('filter B proposed') || !get('filter A proposed') || !get('filter untagged proposed')) b.push('a proposal is missing from Needs confirming');
+      else {
+        if (get('filter B proposed').replaces) b.push('a proposal for engine B shows the value of engine A as replaced: ' + get('filter B proposed').replaces);
+        if (get('filter A proposed').replaces !== 'filter A confirmed') b.push('the same engine does not show the replaced value: ' + get('filter A proposed').replaces);
+        if (get('filter untagged proposed').replaces) b.push('an untagged proposal shows a tagged value as replaced');
+        if (get('filter B proposed').engine !== EB) b.push('the row has no engine: ' + get('filter B proposed').engine);
+      }
+      ok(!b.length, b.join('; ')); return 'replaces by engine';
+    });
+    if (LOCAL) await t('Ultrareview B #8 and #2: /api/vin asks fueleconomy.gov only with fe=1; an empty fueleconomy answer is not cached', async () => {
+      const b = [];
+      const n0 = FE_HITS.n, d0 = await call('/api/vin?vin=' + GOOD);
+      if (d0.s === 200) {
+        if (FE_HITS.n !== n0) b.push(`the car-page decode made ${FE_HITS.n - n0} fueleconomy.gov request(s)`);
+        const n1 = FE_HITS.n, d1 = await call('/api/vin?fe=1&vin=' + GOOD);
+        if (d1.s !== 200 || FE_HITS.n === n1) b.push('the Add car decode (fe=1) made no fueleconomy.gov request');
+        else if (d1.d.fe && d1.d.fe.id !== 33000) b.push('the Add car decode matched another option: ' + JSON.stringify(d1.d.fe));
+      }   // a 500 here is NHTSA down: the two checks above are skipped, the cache check below still runs
+      const q = '/api/fe?year=2021&make=Jeep&model=Wrangler&variant=Nothing%20Here';
+      await call(q);
+      const h = FE_HITS.n; await call(q); const h1 = FE_HITS.n - h; await call(q); const h2 = FE_HITS.n - h - h1;
+      if (h1 !== 1 || h2 !== 1) b.push(`an empty answer was cached: ${h1} then ${h2} request(s), want 1 and 1`);
+      ok(!b.length, b.join('; ')); return 'fe=1 only; empty not cached';
+    }); else skip('Ultrareview B #8 and #2', 'local mode only (the fake fueleconomy.gov)');
+    if (hasProc) await t('Ultrareview B #3 and #7: a waiting photo read does not stop the Frequent workup; a job for another engine does not block; the same engine does', async () => {
+      const b = [], EA = 'Auto, 4 cyl, 2.0 L', EB = 'Auto, 4 cyl, 1.5 L turbo', open = [];
+      const drop = async (jid, kinds) => { const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jid, kinds } }); if (cl.d && cl.d.id) await call(`/api/jobs/${cl.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } }); };
+      const freq = async id => (await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { grp: 'frequent' } })).d;
+      try {
+        const a = (await mkCar({ year: 1978, engine: EA })).d.id;
+        const up = await raw(`/api/vehicles/${a}/photos`, { method: 'POST', body: GREY }), photo = (await up.json()).name;
+        const pj = await call(`/api/vehicles/${a}/doorcard`, { method: 'POST', body: { photo } }); if (pj.s !== 201) b.push('photo job ' + pj.s); else open.push([pj.d.id, ['read_doorcard']]);
+        const w1 = await freq(a); if (!w1 || !w1.workup_job) b.push('a waiting photo read stopped the workup'); else open.push([w1.workup_job, ['workup']]);
+        const c = (await mkCar({ year: 1978, engine: EB })).d.id, w2 = await freq(c);
+        if (!w2 || !w2.workup_job) b.push('a job for engine A blocked the workup of a car with engine B'); else open.push([w2.workup_job, ['workup']]);
+        const d = (await mkCar({ year: 1978, engine: EA })).d.id, w3 = await freq(d);
+        if (w3 && w3.workup_job) { b.push('a second workup for the same engine was queued'); open.push([w3.workup_job, ['workup']]); }
+      } finally { for (const [jid, kinds] of open) await drop(jid, kinds); }
+      ok(!b.length, b.join('; ')); return 'photo job and engines';
+    });
+    if (hasProc) {
+      await t('HANDOFF 17 B6/B9/B12: a photo read job: key list, claim by kind, photo only while claimed, result to proposals, no VIN on any car or list route of the processor', async () => {
+        const b = [], c = await mkCar({ engine: 'E-DOOR', vin: GOOD }), id = c.d.id;
+        const up = await raw(`/api/vehicles/${id}/photos`, { method: 'POST', body: GREY }), photo = (await up.json()).name;
+        if ((await call(`/api/vehicles/${id}/doorcard`, { method: 'POST', body: { photo: '2000-01-01T00-00-00-000Z.jpg' } })).s !== 404) b.push('a photo that does not exist was queued');
+        if ((await call(`/api/vehicles/${id}/doorcard`, { method: 'POST', body: { photo: '../x.jpg' } })).s !== 400) b.push('a bad photo name was queued');
+        if ((await call(`/api/vehicles/${id}/doorcard`, { as: 'proc', method: 'POST', body: { photo } })).s !== 403) b.push('the processor started a read');
+        const q = await call(`/api/vehicles/${id}/doorcard`, { method: 'POST', body: { photo } }); if (q.s !== 201 || !q.d.id) b.push('queue ' + q.s);
+        const q2 = await call(`/api/vehicles/${id}/doorcard`, { method: 'POST', body: { photo } }); if (!q2.d || q2.d.id !== q.d.id || !q2.d.already) b.push('a second queue for the same photo made a second job');
+        const pu = `/api/photos/${id}/${photo}`;
+        if ((await raw(pu, { as: 'proc' })).status !== 403) b.push('the photo was served before the job was claimed');
+        if (!(await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id } })).d.none) b.push('a claim with no kinds got the photo job');
+        if (!(await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['research', 'workup'] } })).d.none) b.push('a research claim got the photo job');
+        const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['read_doorcard'] } });
+        if (!cl.d || cl.d.kind !== 'read_doorcard') b.push('no claim: ' + JSON.stringify(cl.d));
+        const keys = Object.keys(cl.d && cl.d.request || {}).sort().join(); if (keys !== 'car,engine,make,model,photo,year') b.push('request keys (no saved VIN): ' + keys);
+        if (cl.d && (JSON.stringify(cl.d.request).includes(GOOD) || cl.d.request.engine !== 'E-DOOR' || cl.d.request.photo !== photo)) b.push('request values');
+        const pg = await raw(pu, { as: 'proc' }); if (pg.status !== 200 || (await pg.arrayBuffer()).byteLength !== GREY.length) b.push('the claimed photo: ' + pg.status);
+        if ((await raw(`/api/photos/${id}/2000-01-01T00-00-00-000Z.jpg`, { as: 'proc' })).status !== 403) b.push('another photo name was served');
+        if ((await raw(pu, { as: 'proc', method: 'DELETE' })).status !== 403) b.push('the processor deleted a photo');
+        if ((await raw('/api/ali/2019/p001.jpg', { as: 'proc' })).status !== 403) b.push('an ALI page was served to the processor');
+        for (const [bad, why] of [[{}, 'no read'], [{ read: { psi_front: 5, psi_rear: 32 } }, 'psi 5'], [{ read: { psi_front: 32.5, psi_rear: 32 } }, 'psi 32.5'], [{ read: { spare: { state: 'maybe' } } }, 'spare state'],
+          [{ read: { spare: { state: 'psi' } } }, 'spare psi missing'], [{ read: { size_front: 'garbage' } }, 'size'], [{ read: { vin: 'ABC' } }, 'vin shape']]) {
+          const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: bad }); if (r.s !== 400) b.push(`${why}: ${r.s}`);
+        }
+        const rs = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { read: { size_front: '235/50R18', size_rear: '255/45R18', psi_front: 32, psi_rear: 35, spare: { state: 'none' }, vin: GOOD } } });
+        // Ultrareview B #10: the processor's answer has no "vin" word (it would confirm the saved VIN to the processor). The tool's job summary below says "matches".
+        if (rs.s !== 200 || rs.d.proposed !== 3 || 'vin' in rs.d || rs.d.matches.length) b.push('result (the VIN equals the saved VIN: no proposal, no vin word for the processor): ' + rs.s + JSON.stringify(rs.d));
+        const tv = ((await carOf(id)).values || []).filter(x => x.tab === 'tires' && x.scope === 'car');
+        const want = { Pressure: '32 / 35 psi', Size: '235/50R18 / 255/45R18', 'Spare pressure': 'none' };
+        for (const [f, v] of Object.entries(want)) { const x = tv.find(y => y.field === f); if (!x || x.value !== v || x.status !== 'proposed' || x.confidence !== 'High' || !/\(read from photo\)/.test(x.source) || x.note !== 'photo ' + photo) b.push(`${f}: ` + JSON.stringify(x && [x.value, x.status, x.source, x.note])); }
+        const jd = ((await carOf(id)).jobs || []).find(j => j.id === q.d.id); if (!jd || jd.status !== 'done' || /[A-Z0-9]{17}/.test(jd.result_summary || '')) b.push('job summary: ' + JSON.stringify(jd));
+        const pj = ((await call(`/api/vehicles/${id}?peek=1`, { as: 'proc' })).d.jobs || []).find(j => j.id === q.d.id); if (!pj || pj.result_summary !== null) b.push('the processor sees the photo job summary (it says whether a VIN is saved): ' + JSON.stringify(pj && pj.result_summary));
+        if ((await raw(pu, { as: 'proc' })).status !== 403) b.push('the photo was served after the job was done');
+        const nc = (await call('/api/needs-confirming')).d, vp = (nc.vin_proposals || []).find(p => p.vehicle_id === id);
+        if (vp) b.push('a VIN equal to the saved VIN made a proposal: ' + JSON.stringify(vp));
+        const jsum = ((await carOf(id)).jobs || []).find(j => j.id === q.d.id); if (!jsum || !/VIN matches the saved VIN/.test(jsum.result_summary || '')) b.push('the job summary does not say the VIN matches: ' + (jsum && jsum.result_summary));
+        const pn = await call('/api/needs-confirming', { as: 'proc' }); if ('vin_proposals' in pn.d || JSON.stringify(pn.d).includes(GOOD)) b.push('the processor sees a VIN proposal');
+        // Rick 2026-10-27: a read equal to a CONFIRMED car-scope value says "matches" and makes no proposal. Confirm the pressure, read the same again.
+        const pv = ((await carOf(id)).values || []).find(x => x.field === 'Pressure' && x.scope === 'car' && x.status === 'proposed');
+        if (pv) await call(`/api/values/${pv.id}/confirm`, { method: 'POST', body: {} });
+        const r3 = await readJob(id, { size_front: '235/50R18', size_rear: '255/45R18', psi_front: 32, psi_rear: 35, spare: { state: 'none' }, vin: GOOD });
+        if (!r3.res || r3.res.s !== 200 || r3.res.d.proposed !== 0 || r3.res.d.matches.join() !== 'Pressure' || 'vin' in r3.res.d) b.push('a read equal to a confirmed value: ' + JSON.stringify(r3.res && r3.res.d));
+        const cnt = ((await carOf(id)).values || []).filter(x => x.field === 'Pressure' && x.scope === 'car').length; if (cnt !== 1) b.push('a matching read made a second Pressure value: ' + cnt);
+        const j3 = ((await carOf(id)).jobs || []).find(j => j.id === (r3.q.d && r3.q.d.id)); if (!j3 || !/matches the confirmed value: Pressure/.test(j3.result_summary || '')) b.push('the job summary does not say matches: ' + (j3 && j3.result_summary));
+        // a pending VIN proposal can be confirmed (a car with no VIN, below); a decided one cannot be decided again
+        // a second photo: another VIN, spare not on the label. A saved VIN is never replaced.
+        const r2 = await readJob(id, { psi_front: 30, psi_rear: 30, spare: { state: 'not_on_label' }, vin: BADV });
+        if (!r2.res || r2.res.s !== 200 || r2.res.d.proposed !== 1) b.push('second read: ' + JSON.stringify(r2.res && r2.res.d));
+        if (((await carOf(id)).values || []).filter(x => x.field === 'Spare pressure').length !== 1) b.push('not_on_label proposed a spare value');
+        const vp2 = ((await call('/api/needs-confirming')).d.vin_proposals || []).find(p => p.vehicle_id === id);
+        if (!vp2 || vp2.saved_state !== 'differs' || vp2.vin_ok) b.push('second proposal: ' + JSON.stringify(vp2));
+        if (vp2) { const cf = await call(`/api/vin-proposals/${vp2.id}/confirm`, { method: 'POST', body: { not_us: true } }); if (cf.s !== 409) b.push('a differing VIN was confirmed: ' + cf.s);
+          if ((await carOf(id)).vin !== GOOD) b.push('THE SAVED VIN CHANGED');
+          if ((await call(`/api/vin-proposals/${vp2.id}/reject`, { method: 'POST', body: {} })).s !== 200) b.push('reject'); }
+        // a car with no VIN: the proposal fills it; a failing check digit needs not_us
+        const e = await mkCar(); const re = await readJob(e.d.id, { vin: GOOD });
+        if (!re.res || re.res.s !== 200 || re.res.d.proposed !== 0 || 'vin' in re.res.d) b.push('read for a car with no VIN: ' + JSON.stringify(re.res && re.res.d));
+        const pe = ((await call('/api/needs-confirming')).d.vin_proposals || []).find(p => p.vehicle_id === e.d.id);
+        if (!pe || pe.saved_state !== 'none') b.push('proposal for a car with no VIN: ' + JSON.stringify(pe));
+        if (pe) {
+          if ((await call(`/api/vin-proposals/${pe.id}/confirm`, { as: 'proc', method: 'POST', body: {} })).s !== 403) b.push('the processor confirmed a VIN');
+          if ((await call(`/api/vin-proposals/${pe.id}/confirm`, { method: 'POST', body: {} })).s !== 200 || (await carOf(e.d.id)).vin !== GOOD) b.push('confirm fills the empty VIN');
+          if ((await call(`/api/vin-proposals/${pe.id}/confirm`, { method: 'POST', body: {} })).s !== 409) b.push('a decided proposal was decided again');
+        }
+        const f = await mkCar(); const rf = await readJob(f.d.id, { vin: BADV });
+        const pf = ((await call('/api/needs-confirming')).d.vin_proposals || []).find(p => p.vehicle_id === f.d.id);
+        if (!pf || pf.vin_ok) b.push('failing proposal: ' + JSON.stringify(pf));
+        if (pf) { const c1 = await call(`/api/vin-proposals/${pf.id}/confirm`, { method: 'POST', body: {} }); if (c1.s !== 409 || !c1.d.check_failed || (await carOf(f.d.id)).vin) b.push('a failing check digit was saved without not_us: ' + c1.s);
+          const c2 = await call(`/api/vin-proposals/${pf.id}/confirm`, { method: 'POST', body: { not_us: true } }); if (c2.s !== 200 || (await carOf(f.d.id)).vin !== BADV) b.push('not_us confirm: ' + c2.s); }
+        void rf;
+        ok(!b.length, b.join('; ')); return 'key list, claim by kind, photo access, result, VIN proposals';
+      });
+      await t('HANDOFF 17 B10: "No VIN" and "No door card" are computed; the processor does not get them', async () => {
+        const b = [], c = await mkCar(), id = c.d.id, row = async () => ((await call('/api/vehicles')).d || []).find(x => x.id === id);
+        let r = await row(); if (!r || r.no_vin !== true || r.no_doorcard !== true) b.push('new car: ' + JSON.stringify(r && [r.no_vin, r.no_doorcard]));
+        let nc = (await call('/api/needs-confirming')).d; if (!(nc.badges || []).some(x => x.vehicle_id === id && x.no_vin && x.no_doorcard)) b.push('Needs confirming has no badge for the car');
+        await addVal(id, { tab: 'tires', field: 'Pressure', value: '30 psi', scope: 'car', status: 'confirmed', confidence: 'High', source: 'Door-jamb label photo, 2026-10-27' });
+        await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { vin: GOOD } });
+        r = await row(); if (!r || r.no_vin !== false || r.no_doorcard !== false) b.push('after VIN and a confirmed door card: ' + JSON.stringify(r && [r.no_vin, r.no_doorcard]));
+        nc = (await call('/api/needs-confirming')).d; if ((nc.badges || []).some(x => x.vehicle_id === id)) b.push('the badge stays in Needs confirming');
+        const pl = (await call('/api/vehicles', { as: 'proc' })).d.find(x => x.id === id); if (!pl || 'no_vin' in pl || 'no_doorcard' in pl || 'vin' in pl) b.push('the processor list has a badge or VIN key: ' + Object.keys(pl || {}));
+        const pv = (await call(`/api/vehicles/${id}?peek=1`, { as: 'proc' })).d; if ('no_vin' in pv || 'no_doorcard' in pv || 'vin' in pv) b.push('the processor car has a badge or VIN key');
+        ok(!b.length, b.join('; ')); return 'badges';
+      });
+    } else skip('HANDOFF 17 B6/B9/B10: photo read job, badges', 'no processor token');
+  } finally {
+    for (const id of vals17) await call('/api/values/' + id, { method: 'DELETE' }).catch(() => null);
+    await sweepVals().catch(() => null);
+    for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
+  }
+} else skip('HANDOFF 17: engine lists, VIN check digit, photo read, badges', 'schema before 0012');
+
 // ---------- cleanup ----------
 // Every step runs and every problem is listed, so one failed step (a network error, or no value id
 // because the value check failed) never leaves the temp car on live (it did on 2026-10-22, car 5).
@@ -876,7 +1177,16 @@ await t('cleanup: temp values (history kept) and temp car removed', async () => 
   ok(!bad2.length, bad2.join('; '));
 });
 await t('sweep after the run: no SELFTEST car is left', async () => { const r = await sweep(); ok(!r.bad.length && r.still === 0, `${r.bad.join('; ')} still ${r.still}`); return `${r.n} removed by the sweep`; });
+// HANDOFF 17 (B0, Rick 2026-10-27): a self-test or rehearsal run must stay small. Measured, not estimated: the sum of D1 meta.rows_written over
+// every tool-token request of this run (temp cars, values, history rows, visits and their deletes; the full seed is NOT part of it).
+await t('B0: this run wrote under 2,000 rows to D1 (measured from D1 meta)', async () => {
+  ok(ROWS.seen > 0, 'NOT MEASURED: no response carried x-lp-rows-written');
+  const max = +(process.env.LP_ROWS_MAX || 2000);
+  ok(ROWS.n < max, `rows_written ${ROWS.n} over ${ROWS.seen} requests, limit ${max}`);
+  return `rows_written ${ROWS.n} over ${ROWS.seen} requests (limit ${max})`;
+});
 if (srv) srv.close();
+if (feSrv) feSrv.close();
 
 const pass = res.filter(r => r.ok).length, skipped = res.filter(r => r.skip).length, fail = res.length - pass - skipped;
 const rep = `# LiftPad self-test\n\nTarget: ${BASE}\nTime: ${new Date().toISOString()}\nMode: ${LOCAL ? 'local (self-signed JWTs)' : 'live (service tokens)'}\nPrivate checks: ${priv ? 'yes' : 'no'}\nResult: ${pass}/${res.length - skipped} passed, ${skipped} skipped, ${fail} failed\n\n` +

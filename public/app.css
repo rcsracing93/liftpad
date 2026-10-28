@@ -244,3 +244,8 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
   .src,.tag,.note{color:#000}
   .visit{break-inside:avoid}
 }
+/* HANDOFF 17: missing-data badges on the Home card, and the photo beside a value read from it */
+.badges{display:flex;flex-wrap:wrap;gap:8px}
+.badges .pill,#missing .pill{margin-left:0}
+.jphoto.thumb img{display:block;max-width:100%;max-height:220px;border-radius:8px;border:2px solid var(--line2)}
+.crow .toggle{margin-top:6px}
