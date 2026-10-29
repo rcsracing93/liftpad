@@ -126,7 +126,7 @@ step "D deploy"
 WDRY=''; [ "$DRY" = 1 ] && WDRY='--dry-run --outdir /tmp/dry-out'
 # shellcheck disable=SC2086 # WDRY is empty or two flags, split on purpose
 npx wrangler deploy $WDRY --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
-  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" --var "LP_ADMIN_EMAILS:$LP_ACCESS_EMAIL" ${LP_BUILD:+--var "LP_BUILD:$LP_BUILD"} 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
+  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" --var "LP_D1_PLAN:${LP_D1_PLAN:-free}" --var "LP_ADMIN_EMAILS:$LP_ACCESS_EMAIL" ${LP_BUILD:+--var "LP_BUILD:$LP_BUILD"} 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
 if [ "$DRY" = 1 ]; then
   [ -s /tmp/dry-out/worker.js ] || { echo "STOP (dry run): wrangler built no worker.js"; exit 1; }
   echo "dry run: Worker built ($(wc -c < /tmp/dry-out/worker.js) bytes), nothing uploaded"

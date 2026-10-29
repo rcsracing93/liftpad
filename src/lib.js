@@ -192,3 +192,37 @@ export function pickWeight(rows, trim) {
   const base = have.reduce((a, b) => (b.curb_lb < a.curb_lb ? b : a));
   return { lb: base.curb_lb, front_pct: base.front_pct ?? null, source: 'Canadian specs, base model' };
 }
+// HANDOFF 19 (Rick 2026-10-29): the D1 lines of the Admin page. Free plan (default): today's rows against the old FREE daily limits, 50% amber, 80% red.
+// Workers Paid (the Worker variable LP_D1_PLAN = "paid", set by tools/deploy.sh from deploy.env): the free-limit % is grey info only (level "info": no
+// colour, never the red dot), and the colour is judged against the monthly INCLUDED amounts, summed from the daily reports of this month.
+// The Kuma alert (ops_push.py) stays on the free limits: it is for the decision to cancel the paid plan.
+export const D1_FREE = { rows_written: 100000, rows_read: 5000000 };   // free plan, per day
+export const D1_PAID = { rows_written: 50e6, rows_read: 25e9 };        // Workers Paid, included per month
+export const d1IsPaid = plan => String(plan ?? '').trim().toLowerCase() === 'paid';
+const pctText = p => !Number.isFinite(p) ? '?' : p >= 1 ? String(Math.round(p)) : p === 0 ? '0' : '<1';
+const lvOf = p => p >= 80 ? 'red' : p >= 50 ? 'amber' : 'green';
+// The month so far: each daily report row is the cumulative count of its UTC day, so the caller gives the LAST report of each day; the days are added up.
+export function d1Month(dayRows) {
+  const m = {};
+  for (const r of dayRows || []) for (const x of (r && Array.isArray(r.databases) ? r.databases : [])) {
+    const o = m[x.name] || (m[x.name] = { rows_written: 0, rows_read: 0 });
+    o.rows_written += Number(x.rows_written) || 0; o.rows_read += Number(x.rows_read) || 0;
+  }
+  return m;
+}
+export function d1Lines(row, nowMs, plan = 'free', month = {}) {
+  if (!row || !row.data || !Array.isArray(row.data.databases)) return [{ name: 'd1_usage', level: 'amber', reason: 'No D1 usage report has arrived yet.' }];
+  const age = (nowMs - Date.parse(row.ts)) / 3600e3, out = [], paid = d1IsPaid(plan), num = n => Number.isFinite(n) ? n.toLocaleString('en-US') : '?';
+  for (const d of row.data.databases.slice(0, 6)) for (const k of ['rows_written', 'rows_read']) {
+    const nm = String(d.name).replace(/[^\w-]/g, '').slice(0, 30), n = Number(d[k]), pct = 100 * n / D1_FREE[k], word = k.replace('_', ' ');
+    if (!paid) {
+      out.push({ name: `d1_${nm}_${k}`, level: lvOf(Math.round(pct)), reason: `${d.name}: ${num(n)} ${word} today of ${D1_FREE[k].toLocaleString('en-US')} free (${Number.isFinite(pct) ? Math.round(pct) : '?'}%).` });
+    } else {
+      const mo = (month[d.name] || {})[k] || 0, mpct = 100 * mo / D1_PAID[k];
+      out.push({ name: `d1_${nm}_${k}`, level: 'info', reason: `${d.name}: ${num(n)} ${word} today = ${pctText(pct)}% of the old free daily limit (info only on Workers Paid).` });
+      out.push({ name: `d1_${nm}_${k}_month`, level: lvOf(mpct), reason: `${d.name}: ${num(mo)} ${word} this month of ${D1_PAID[k].toLocaleString('en-US')} included (${pctText(mpct)}%).` });
+    }
+  }
+  if (age > 26) out.push({ name: 'd1_usage_age', level: 'amber', reason: `The D1 usage report is ${Math.round(age)} hours old.` });
+  return out;
+}

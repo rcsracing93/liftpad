@@ -7,11 +7,22 @@ let device = store.get('lp-device');
 async function api(path, opt = {}) {
   const r = await fetch('/api' + path, { headers: { 'content-type': 'application/json', 'x-lp-device': device }, ...opt, body: opt.body ? JSON.stringify(opt.body) : undefined });
   const d = await r.json().catch(() => ({ error: 'Bad response from server' }));
+  setOffline(r.headers.get('x-liftpad-cache') === 'offline', Number(r.headers.get('x-liftpad-saved')) || 0);
   if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.data = d; throw e; }   // e.data: the whole answer (for example check_failed on a VIN)
-  $('#net').hidden = r.headers.get('x-liftpad-cache') !== 'offline';
   return d;
 }
-function crumb(t) { $('#crumb').textContent = t || ''; }
+// HANDOFF 19 (D6): the banner under the header says how old the saved copy is. The service worker stamps each saved answer (x-liftpad-saved).
+function savedAgo(ms) {
+  if (!ms) return 'earlier';
+  const h = Math.floor((Date.now() - ms) / 36e5), d = Math.floor(h / 24);
+  return d >= 1 ? (d === 1 ? '1 day ago' : `${d} days ago`) : h >= 1 ? (h === 1 ? '1 hour ago' : `${h} hours ago`) : 'less than an hour ago';
+}
+function setOffline(off, savedMs) {
+  document.body.classList.toggle('offline', off);
+  const n = $('#net'); n.hidden = !off;
+  if (off) n.textContent = `Offline - data saved ${savedAgo(savedMs || Number(store.get('lp-saved')) || 0)}`;
+}
+function crumb(t, html) { $('#crumb').textContent = t || ''; $('#carline').textContent = t || ''; if (html) { $('#crumb').innerHTML = html; $('#carline').innerHTML = html; } }
 // A screen that loads slowly must not draw over a newer one (a fast tap to another screen): route()
 // counts, and a screen draws only while its count is still the newest.
 let routeSeq = 0;
@@ -56,11 +67,14 @@ const noNm = t => {
   if (ft) return ft[1].replace(/\s+/g, '') + ' ft-lb';
   return x.replace(/(\d+)\s*N[·.\s-]?m(?![A-Za-z])/gi, (_, n) => Math.round(+n * 0.737562) + ' ft-lb');
 };
+// HANDOFF 19 (D7): "21mm" is shown "21 mm"; a tire pressure always says "cold" (the door-jamb label is a cold pressure).
+const tidy = t => String(t ?? '').replace(/(\d)(mm)\b/g, '$1 $2');
 const showVal = s => {
   // HANDOFF 15: torque is shown from the stored ft-lb numbers. No N-m on screen.
   if (s.tab === 'torque' && s.field === 'Torque' && s.ftlb_lo != null) return `${s.ftlb_lo}${s.ftlb_hi != null ? '-' + s.ftlb_hi : ''} ft-lb`;
+  if (s.tab === 'tires' && /^(Spare )?[Pp]ressure$/.test(s.field) && /\bpsi\b/i.test(s.value) && !/cold/i.test(s.value)) return `${s.value} cold`;
   const m =s.tab === 'oil' && s.field === 'Quantity' && String(s.value).match(/^(\d+(?:\.\d+)?)\s*(qt|L)$/i);
-  if (!m) return s.value;
+  if (!m) return tidy(s.value);
   const n = +m[1], qt = m[2].toLowerCase() === 'qt';
   return `${n} ${qt ? 'qt' : 'L'} (${(qt ? n * QT_L : n / QT_L).toFixed(1)} ${qt ? 'L' : 'qt'}) with filter`;
 };
@@ -85,31 +99,52 @@ async function home() {
   // HANDOFF 18 (C3): the gear button shows only when the Admin page answers (Rick's own login); a red dot when anything is red.
   const [cars, need, dot] = await Promise.all([api('/vehicles' + (showHidden ? '?hidden=1' : '')), api('/needs-confirming'), api('/admin/dot').catch(() => null)]);
   if (!live()) return;
-  crumb(device);
+  crumb('');
+  // HANDOFF 19 (D5): cars first; History, Needs confirming, Admin and + Car are one row under the cars (the bottom of the list on the phone). Apps stays in the header (tablet) or ends the row (phone).
   const gear = dot ? `<a class="btn gear" id="gearbtn" href="#/admin" aria-label="Admin${dot.level === 'red' ? ' - something is red' : ''}"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.4 7.4 0 0 0-1.7-1L14.9 3h-4l-.4 2.9a7.4 7.4 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.4 7.4 0 0 0 1.7 1l.4 2.9h4l.4-2.9a7.4 7.4 0 0 0 1.7-1l2.4 1 2-3.4zM12.9 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>Admin${dot.level === 'red' ? '<span class="reddot" role="img" aria-label="red"></span>' : ''}</a>` : '';
-  $('#hnav').innerHTML = `<a class="btn" href="#/history">History</a><a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a>${gear}<a class="btn primary" href="#/add">+ Car</a>`;
-  // HANDOFF 10: Home shows only a block (warn = 2, an open problem). A caution (warn = 1) is on the Lift tab only.
-  const status = c => c.nblock ? ['warn', 'Warning - see the Lift tab'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
+  const btnRow = `<nav class="homerow" aria-label="Home buttons"><a class="btn" href="#/history">History</a><a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a>${gear}<a class="btn primary" href="#/add">+ Car</a><a class="btn phoneonly" href="#/apps">Apps</a></nav>`;
+  // HANDOFF 10: Home shows only a block (warn = 2, an open problem). A caution (warn = 1) is on the car screen only.
+  // HANDOFF 19 (D5): the real proposals first, then "No VIN" and "No door card", as one line.
+  const status = c => c.nblock ? ['warn', 'Warning - do not lift yet'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
     : c.nvals ? ['ok', 'All values confirmed'] : ['none', 'No values yet'];
   // Suggestion 11: one grey line with the last visit, not the history.
   const lastSvc = c => c.last_service ? `<span class="lastsvc">Last: ${esc(c.last_service.items.join(', '))}, ${esc(c.last_service.date)}, ${Number(c.last_service.mileage).toLocaleString('en-US')} mi</span>` : '';
   // HANDOFF 17 (B10): "No VIN" and "No door card", computed by the Worker.
-  const badges = c => c.no_vin || c.no_doorcard ? `<span class="badges">${c.no_vin ? '<span class="pill Missing">No VIN</span>' : ''}${c.no_doorcard ? '<span class="pill Missing">No door card</span>' : ''}</span>` : '';
-  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${esc(ownerOf(c))}${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}">${t}</span>${badges(c)}${lastSvc(c)}</a>`; };
+  const badges = c => c.no_vin || c.no_doorcard ? `${c.no_vin ? '<span class="pill Missing">No VIN</span>' : ''}${c.no_doorcard ? '<span class="pill Missing">No door card</span>' : ''}` : '';
+  const tile = c => { const [k, t] = status(c); return `<a class="carbtn" href="#/car/${c.id}"><b>${esc(ownerOf(c))}${c.year} ${esc(c.make)} ${esc(c.model)}</b><span>${esc(c.trim)}${c.hidden ? ' · hidden' : ''}</span><span class="status ${k}"><span class="stxt">${t}</span>${badges(c)}</span>${lastSvc(c)}</a>`; };
   const ago = c => { const d = Math.floor((Date.now() - Date.parse(c.last_seen || c.created_iso || 0)) / 864e5); return d <= 0 ? 'today' : d === 1 ? '1 day ago' : `${d} days ago`; };
   const g = k => cars.filter(c => c.grp === k);
   $('#view').innerHTML = `<section aria-label="My cars" class="tabbody"><h2 class="lbl">My cars</h2><div class="cars">${g('mine').map(tile).join('') || '<div class="empty">No cars yet. Tap + Car.</div>'}</div></section>
-    <section aria-label="Frequent" class="tabbody"><h2 class="lbl">Frequent</h2><div class="cars small">${g('frequent').map(tile).join('')}${g('frequent').length < 3 ? '<div class="empty">Mark a visitor Frequent to keep it here</div>' : ''}</div></section>
+    <section aria-label="Frequent" class="tabbody"><h2 class="lbl">Frequent</h2><div class="cars">${g('frequent').map(tile).join('')}${g('frequent').length < 3 ? '<div class="empty">Mark a visitor Frequent to keep it here</div>' : ''}</div></section>
+    ${btnRow}
     <section aria-label="Visitors" class="tabbody"><h2 class="lbl">Visitors - hidden 30 days after the last visit</h2>
       <div class="chips">${g('visitor').map(c => `<a class="chip" href="#/car/${c.id}">${c.year} ${esc(c.make)} ${esc(c.model)}<span>${c.hidden ? 'hidden · ' : ''}${ago(c)}</span></a>`).join('') || '<div class="empty">No visitors</div>'}</div>
-      ${showHidden ? '<p class="note">Hidden visitors are shown. Turn this off on the Admin page.</p>' : ''}</section>
-    <div class="row"><span class="src">This screen: ${esc(device)}</span></div>`;
+      ${showHidden ? '<p class="note">Hidden visitors are shown. Turn this off on the Admin page.</p>' : ''}</section>`;
+  prefetchAll(cars);
+}
+// HANDOFF 19 (D6): when Home loads online, the pages of all cars and the chart images of Rick's cars are fetched in the background, so the
+// service worker holds a copy. peek=1: a prefetch must not set the "last seen" time of a visitor. At most once in 10 minutes.
+let prefetching = false;
+async function prefetchAll(cars) {
+  // The service worker must be in control, or the answers are not saved (its first load: controllerchange below starts Home again).
+  if (prefetching || !navigator.onLine || !(navigator.serviceWorker && navigator.serviceWorker.controller) || Date.now() - (Number(store.get('lp-saved')) || 0) < 600000) return;
+  prefetching = true;
+  try {
+    await api('/tabs');
+    for (const c of cars) {
+      const v = await api(`/vehicles/${c.id}?peek=1`);
+      await api(`/vehicles/${c.id}/service`);
+      if (c.grp !== 'visitor' && v.ali && v.ali.img) await fetch(v.ali.img);
+    }
+    store.set('lp-saved', String(Date.now()));
+  } catch (e) { /* went offline in between: the next Home load tries again */ }
+  prefetching = false;
 }
 
 // ---------- Admin (HANDOFF 18, C3, C6) ----------
 // Rick's own login only (the Worker answers 403 to every other caller). Kuma stays the alerting; this page is where he looks for the why.
 let adminDay = '', adminKind = '';
-const LV = { green: 'OK', amber: 'Check', red: 'Problem' };
+const LV = { green: 'OK', amber: 'Check', red: 'Problem', info: 'Info' };   // info: grey, no colour judgement (D1 free-limit % on Workers Paid)
 const lvPill = l => `<span class="pill lv-${esc(l)}" style="margin-left:0">${LV[l] || esc(l)}</span>`;
 const ITEM_LABEL = { disk_root: 'Disk (N100)', disk_nas: 'Disk (NAS)', backup_file: 'Last backup', backup_nas_copy: 'NAS copy of the backup', backup_nas_mount: 'NAS backups share', backup_run: 'Backup job',
   health_ping_run: 'Health ping job', token_check_run: 'Token check job', token_expiry: 'Token expiry', research_worker_run: 'Research worker', research_cost: 'Research cost',
@@ -138,7 +173,7 @@ async function adminPage() {
     <section class="card" id="adm-results" aria-label="Results"><h3>Results ${lvPill(r.level)}</h3><p>${esc(r.reason)}</p><a class="btn" href="#/confirm">Open Needs confirming</a>
       ${r.recent.length ? `<ul class="alist">${r.recent.map(j => `<li class="aitem lv-green"><b>Job ${j.id} (${esc(j.kind)})</b><span class="areason">${esc(j.summary)}</span></li>`).join('')}</ul>` : ''}</section>
     <section class="card" id="adm-n100" aria-label="N100 health"><h3>N100 health</h3><p class="src">${d.n100.as_of ? 'Report from ' + esc(when(d.n100.as_of)) + ' UTC' : 'No report yet'}</p><ul class="alist">${d.n100.items.map(aitem).join('')}</ul></section>
-    <section class="card" id="adm-d1" aria-label="D1 usage"><h3>D1 usage today</h3><p class="src">${d.d1.as_of ? 'Report from ' + esc(when(d.d1.as_of)) + ' UTC. Free limits: 100,000 rows written and 5,000,000 rows read a day.' : 'No report yet'}</p><ul class="alist">${d.d1.items.map(aitem).join('')}</ul></section>
+    <section class="card" id="adm-d1" aria-label="D1 usage"><h3>D1 usage</h3><p class="src">${d.d1.as_of ? 'Report from ' + esc(when(d.d1.as_of)) + ' UTC. ' + (d.d1.plan === 'paid' ? 'Workers Paid: the colour is the share of the monthly included amounts (50 million rows written, 25 billion rows read). The old free daily limits are shown in grey as information.' : 'Free limits: 100,000 rows written and 5,000,000 rows read a day.') : 'No report yet'}</p><ul class="alist">${d.d1.items.map(aitem).join('')}</ul></section>
     <section class="card" id="adm-log" aria-label="Log"><h3>Log</h3>
       <div class="row"><div class="field"><label for="admday">Day (New York)</label><input id="admday" type="date" value="${esc(d.day)}"></div>
       <div class="field"><label for="admkind">Kind</label><select id="admkind"><option value="">all (no health lines)</option>${KINDS.map(k => `<option value="${k}" ${d.kind === k ? 'selected' : ''}>${k.replace('_', ' ')}</option>`).join('')}</select></div></div>
@@ -177,7 +212,7 @@ async function confirmPage() {
       <span class="val${keyCls(x)}">${esc(showVal(x))}</span>${x.replaces ? `<span class="note">replaces: ${esc(noNm(x.replaces))}</span>` : ''}
       <span class="meta"><span class="pill ${esc(x.confidence)}" style="margin-left:0">${esc(x.confidence)}</span> ${x.warn ? `<span class="pill lv-${x.warn === 2 ? 'block' : 'caution'}" style="margin-left:0">${x.warn === 2 ? 'Block - do not lift yet' : 'Caution'}</span> ` : ''}${esc(x.source)}</span>${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
       ${x.range_flag === 'outside' && x.range ? `<span class="err">Outside the usual range for ${esc(x.range.thread)} (${x.range.torque_min}-${x.range.torque_max} ft-lb). Check it before you confirm.</span>` : ''}</div>
-      <div class="acts"><button class="ok" data-ok="${x.id}">Confirm</button><button data-no="${x.id}">Reject</button></div></div>`).join('') || (vins.length ? '' : '<p class="note">Nothing to confirm.</p>')}</div>
+      <div class="acts"><button class="ok needsnet" data-ok="${x.id}">Confirm</button><button class="needsnet" data-no="${x.id}">Reject</button></div></div>`).join('') || (vins.length ? '' : '<p class="note">Nothing to confirm.</p>')}</div>
     <p class="note">A confirmed model-year value applies to every car of that model and year. Each confirm or reject is kept in the value's history.</p>`;
   wireStatus(confirmPage);
   document.querySelectorAll('[data-vok]').forEach(b => b.onclick = () => {
@@ -336,13 +371,14 @@ const VERIFIED = { no: 'Not checked - read the page.', ai: 'AI-checked - the pag
 const FOOT_FALLBACK = 'The chart gives no pad height. Check that the pads reach the lift points and the arms clear the car.';
 const adaptersBlock = (n, foot, hideCar) => {
   // HANDOFF 15: the per-car switch for the chart's caution text (set for the Jeep). The chart image still shows the caution.
-  const hideBtn = hideCar ? `<button class="ghost" id="cautiontoggle" data-hide="0">Show the chart caution again</button>` : `<button class="ghost" id="cautiontoggle" data-hide="1">Hide the chart caution for this car</button>`;
+  // HANDOFF 19 (D7): one control, Show or Hide, and no sentence about the state.
+  const hideBtn = hideCar ? `<button class="ghost" id="cautiontoggle" data-hide="0">Show chart caution</button>` : `<button class="ghost" id="cautiontoggle" data-hide="1">Hide chart caution</button>`;
   const lv = n && VERIFIED[n.verified] ? n.verified : 'no', stop = !!n && /^Do not use a 2-post/.test(n.kit_mark || '');
   // HANDOFF 13: "I checked this chart" until Rick has checked it; "Undo" while the check holds (it falls back by itself
   // when the chart text changes). Who and when come from chart_checks.
   const byBtn = !!n && lv === 'rick' && !!n.verified_by;
-  const act = !n ? '' : lv !== 'rick' ? `<button class="primary chartcheck" data-act="check" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">I checked this chart</button>`
-    : byBtn ? `<button class="chartcheck" data-act="undo" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">Undo</button>` : '';
+  const act = !n ? '' : lv !== 'rick' ? `<button class="primary chartcheck needsnet" data-act="check" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">I checked this chart</button>`
+    : byBtn ? `<button class="chartcheck needsnet" data-act="undo" data-ed="${esc(n.edition)}" data-chart="${esc(n.chart)}">Undo</button>` : '';
   const lead = `<div class="vlabel"><b>${VERIFIED[lv]}</b>${byBtn ? ` <span class="note">${esc(String(n.verified_at || '').slice(0, 10))}</span>` : ''} ${act}<span class="err chartcheckerr"></span></div>`;
   const end = `<div class="adfoot">${esc(foot || FOOT_FALLBACK)}</div>`;
   if (!n) return { stop: false, html: `<div class="adapters unchecked" data-verified="no">${lead}<div>LiftPad has no adapter notes for this chart.</div>${end}</div>` };
@@ -351,7 +387,7 @@ const adaptersBlock = (n, foot, hideCar) => {
     <div><b>Adapters (from the guide):</b> ${esc(n.adapters || 'no adapter callout on the chart')}</div>
     ${n.height_note ? `<div><b>Height:</b> ${esc(n.height_note)}</div>` : ''}
     <div><b>Your kit:</b> ${esc(n.kit_mark || 'height not given')}</div>
-    ${n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}${n.cautions_hidden ? `<div class="src cautionhidden">Chart caution hidden. The car's own caution above applies.</div>` : ''}
+    ${n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}
     ${hideBtn}${end}</div>` };
 };
 // HANDOFF 18 (C7, C8): the recalls line and the curb weight. Both come from the Worker's daily cache; the page posts /facts once it is drawn.
@@ -363,7 +399,7 @@ const recallInner = v => {
   const vinBtn = v.vin ? `<a class="btn" id="vinrecall" href="${NHTSA_VIN_URL}${encodeURIComponent(v.vin)}" target="_blank" rel="noopener noreferrer">Check my VIN at NHTSA</a>` : '';
   let line;
   if (!r) line = '<span class="note">Recalls: checking...</span>';
-  else if (r.count == null) line = `<span class="note">Recalls are not available right now. ${esc(r.error || '')}</span>`;
+  else if (r.count == null) line = '<span class="note">Recalls not available right now.</span>';
   else if (!r.count) line = `<span class="recalls-n">0 recalls for this model year</span>`;
   else line = `<details class="recalls"><summary>${r.count} recall${s(r.count)} for this model year</summary>
     <ul class="alist">${r.items.map(i => `<li class="aitem"><b>${esc(i.campaign)}</b> <span class="src">${esc(i.date)} · ${esc(i.component)}</span><span class="areason">${esc(i.summary)}</span><span class="areason"><b>Fix:</b> ${esc(i.remedy)}</span></li>`).join('')}</ul></details>`;
@@ -388,45 +424,155 @@ function wireWeight(v) {
   const c = $('#wconfirm'); if (c) c.onclick = () => post({ action: 'confirm' });
   const sv = $('#wsave'); if (sv) sv.onclick = () => { const b = { action: 'confirm', lb: $('#wlb').value.trim() }; if ($('#wfp').value.trim()) b.front_pct = $('#wfp').value.trim(); post(b); };
 }
+// HANDOFF 19 (D1-D3): the car screen (direction A). Four tiles, no tabs. A tap on Wheels off, Tires or Oil opens a drawer; the Lift tile opens the Lift screen.
+// `tab` is the value tab of the open drawer (valueForm and valueInputs read it).
+let drawerKey = null;      // the open drawer: lift torque tires oil caution recalls checks edit
+let redraw = () => {};     // draws the screen under the drawer again (a save inside the drawer)
+const TILE_TAB = { wheels: 'torque', tires: 'tires', oil: 'oil', lift: 'lift' };
+const RANKC = { Low: 0, Medium: 1, High: 2 };
+// The value shown for a field: confirmed first. Ultrareview B #4: a value tagged for an engine is never a headline pick for a car with no engine set.
+const pickVal = (v, f) => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard && !x.no_headline && x.status !== 'rejected'); return c.find(x => x.status === 'confirmed') || c[0]; };
+const confPill = c => `<span class="pill ${esc(c)}">${esc(c)}</span>`;
+// Badges never hide: a tile shows the confidence and status of its least confirmed value.
+const weakest = list => list.filter(Boolean).sort((a, b) => (a.status === 'confirmed') - (b.status === 'confirmed') || RANKC[a.confidence] - RANKC[b.confidence])[0];
+const badgesOf = s => s ? `${confPill(s.confidence)}${pill(s.status)}` : '<span class="pill Missing">Missing</span>';
+const missing = what => `<span class="pill Missing">Missing ${what}</span>`;
+const SIZE_RE = /(?<![0-9])\d{3}\/\d{2}\s?[A-Za-z]{0,2}\s?R?\s?\d{2}\b/g;   // 235/50ZR18, 245/40 R19, T125/70D17
+const psiNumbers = t => (String(t || '').replace(SIZE_RE, ' ').match(/\d+(?:\.\d+)?/g) || []).filter(x => +x >= 10 && +x <= 99);
+// A front / rear pair only when the text says front and rear ("33 F / 33 R", "32 / 32", "Front 38, Rear 44"); else the raw text is shown.
+const hasFR = t => /\b[FR]\b|front|rear|\d\s*\/\s*\d/i.test(String(t || '').replace(SIZE_RE, ' '));
+const firstSentence = t => String(t || '').split(/(?<=[.!?])\s+/)[0];
+// Oil: the grade of this car's engine. A text for several engines ("1.6T and 2.5: SAE 0W-20 ... 2.5T: SAE 0W-30") is cut at each engine label.
+const SAE = /\b\d{1,2}W-?\d{1,2}\b/i;
+function oilGrade(text, v) {
+  const t = String(text || ''), segs = t.split(/\.\s+(?=\d\.\d)/);
+  // a turbo mark ("2.5T", or the word Turbo after the size) wins over the plain size
+  const both = (String(v.engine || '') + ' ' + String(v.trim || '')).replace(/(\d\.\d)\s*L?\b[^,;]*\bturbo/i, '$1T'), tok = both.match(/\d\.\dT\b/i) || both.match(/\d\.\d/);
+  const labels = s => (s.split(':')[0].match(/\d\.\dT?/gi) || []).map(x => x.toUpperCase());
+  const seg = segs.length > 1 && tok ? (segs.find(s => labels(s).includes(tok[0].toUpperCase())) || segs.find(s => labels(s).some(l => l.replace(/T$/, '') === tok[0].toUpperCase().replace(/T$/, '')))) : null;
+  if (segs.length > 1 && !seg) return null;   // the text is for several engines and none is this car's: the tile says so, the drawer has the text
+  const m = (seg || t).match(SAE);
+  return m ? m[0].toUpperCase() : '';
+}
+// The four tiles. Each gives { big, small, badges }; a missing value is a red chip, never an empty place.
+function tileData(v) {
+  const wheels = () => {
+    const t = pickVal(v, 'Torque'), so = pickVal(v, 'Socket'), th = pickVal(v, 'Thread'), MK = v.typical && v.typical.make;
+    const big = t ? esc(noNm(showVal(t))) : MK && MK.torque_ftlb != null ? `~${MK.torque_ftlb} ft-lb` : missing('torque');
+    const small = [so ? esc(tidy(so.value)) : missing('socket'), th ? esc(th.value) : missing('thread')].join(' · ');
+    // No torque of its own: a typical value is Low and "Typical", never the High / Confirmed badge of the socket; nothing at all is Missing.
+    const noTorque = !t ? (MK && MK.torque_ftlb != null ? `${confPill('Low')}<span class="pill st-proposed">Typical</span>` : '<span class="pill Missing">Missing</span>') : '';
+    return { big, small, badges: t ? badgesOf(weakest([t, so, th])) : noTorque };
+  };
+  const tires = () => {
+    const p = pickVal(v, 'Pressure'), sp = pickVal(v, 'Spare pressure'), sz = pickVal(v, 'Size'), n = p ? psiNumbers(p.value) : [];
+    const big = p ? esc(n.length === 2 && hasFR(p.value) ? `${n[0]} F / ${n[1]} R psi` : n.length === 1 ? `${n[0]} psi` : String(p.value).replace(/\s*cold\s*$/i, '')) : missing('pressure');
+    const spare = sp ? (psiNumbers(sp.value)[0] ? `spare ${psiNumbers(sp.value)[0]} psi` : /none|no spare/i.test(sp.value) ? 'no spare' : tidy(sp.value)) : '';
+    const sizes = sz ? [...new Set(String(sz.value).match(SIZE_RE) || [])] : [];
+    const size = sz ? (sizes.length ? sizes.join(' / ') : String(sz.value).slice(0, 24)) : '';
+    const small = [spare && esc(spare), 'cold', sz ? esc(size) : missing('size')].filter(Boolean).join(' · ');
+    return { big, small, badges: badgesOf(weakest([p, sp, sz])) };
+  };
+  const oil = () => {
+    if (v.fuel === 'ev') return { big: 'No engine oil (EV)', small: '', badges: '<span class="pill st-confirmed">EV</span>' };
+    const g = pickVal(v, 'Oil type'), q = pickVal(v, 'Quantity'), f = pickVal(v, 'Filter');
+    const grade = g ? oilGrade(g.value, v) : '', qm = q && String(q.value).match(/(\d+(?:\.\d+)?)\s*(qt|quarts?|L|liters?|litres?)\b/i);
+    const qty = qm ? `${qm[1]} ${/^l/i.test(qm[2]) ? 'L' : 'qt'}` : '';
+    const spec = g && /·/.test(g.value) ? g.value.split('·').slice(1).join('·').trim() : '';
+    const big = g ? (grade === null ? 'Several engines' : esc(grade ? grade + (qty ? ' · ' + qty : '') : String(g.value).slice(0, 30))) : missing('oil type');
+    const small = [grade === null ? 'see the drawer for each engine' : '', qty ? 'with filter' : missing('quantity'), spec && esc(spec), f && esc(f.value)].filter(Boolean).join(' · ');
+    return { big, small, badges: badgesOf(weakest([g, q, f])) };
+  };
+  const lift = () => {
+    const a = v.ali, pts = pickVal(v, 'Points');
+    const big = a ? esc(a.chart) : missing('chart');
+    const small = pts ? `<span class="clamp2">${esc(pts.value)}</span>` : missing('points');
+    return { big, small, badges: pts || a ? (a && a.status !== 'ok' ? missing('page') : '') + (pts ? badgesOf(pts) : '') : badgesOf(null) };
+  };
+  return { lift: lift(), wheels: wheels(), tires: tires(), oil: oil() };
+}
+const recallText = v => {
+  const r = v.recalls;
+  return !r ? 'Recalls: checking...' : r.count == null ? 'Recalls not available right now.' : !r.count ? '0 recalls for this model year' : `${r.count} recall${r.count === 1 ? '' : 's'} for this model year · model year, not your VIN`;
+};
+const needsHtml = v => {
+  // Safety values and warnings come first. A safety value, or a text that is cut short, gets "Check" (it opens the drawer with the source) and never a one-tap Confirm.
+  const prop = v.values.filter(s => s.status === 'proposed' && !s.hidden_by_placard).sort((a, b) => (b.warn || 0) - (a.warn || 0) || (b.is_safety || 0) - (a.is_safety || 0)), c = v.curb && v.curb.status !== 'confirmed' ? v.curb : null;
+  const rows = [...prop.map(s => { const txt = noNm(showVal(s)), long = txt.length > 40;
+      return { t: `${esc(s.field)} <span class="mono">${esc(txt.slice(0, 40))}${long ? '...' : ''}</span> ${pill('proposed')}`, a: s.is_safety || s.warn || long ? `data-drawer="${esc(s.tab)}"` : `data-ok="${s.id}"`, check: !!(s.is_safety || s.warn || long) }; }),
+    ...(c ? [{ t: `Curb weight <span class="mono">${lbPlain(c.lb)} lb</span> ${pill('proposed')}`, a: 'id="wconfirm2"', check: false }] : [])];
+  if (!rows.length) return '';
+  return `<div class="panel needs"><span class="lbl">Needs you</span>${rows.slice(0, 2).map(r => `<div class="needrow"><span>${r.t}</span>${r.check ? `<button class="t48" ${r.a}>Check</button>` : `<button class="ok t48 needsnet" ${r.a}>Confirm</button>`}</div>`).join('')}
+    ${rows.length > 2 ? `<a class="src" href="#/confirm">${rows.length - 2} more in Needs confirming</a>` : ''}<span class="src offlinewhy">Confirming needs a connection.</span></div>`;
+};
+// The caution line: amber for a standing step (warn 1), red and "Do not lift yet" for a block (warn 2).
+const cautionsOf = v => v.values.filter(s => s.warn && !s.hidden_by_placard).sort((a, b) => b.warn - a.warn);
 async function car(id) {
   const live = fresh();
   if (!meta) meta = await api('/tabs');
-  const v = await api('/vehicles/' + id);
-  if (!meta.tabs.some(t => t.name === tab) && tab !== 'service') tab = meta.tabs[0]?.name || 'lift';
-  if (tab === 'service') return servicePage(v, id, live);
-  const hiddenTires = tab === 'tires' ? v.values.filter(s => s.hidden_by_placard).length : 0;
-  const rows = v.values.filter(s => s.tab === tab && !s.hidden_by_placard);
-  let ali = '', pageCard = '';
-  if (tab === 'lift') {
-    const a = v.ali;
-    if (!a) ali = `<div class="warn bad">No ALI chart for this car in the lift guide.</div>`;
-    else if (a.d === 0) ali = `<dl><dt>ALI chart</dt><dd><span class="val">${esc(a.chart)}</span><span class="pill ${a.status === 'ok' ? 'High' : 'Missing'}">${a.status === 'ok' ? 'High' : 'Missing'}</span><div class="src">ALI ${esc(a.edition)} · guide p.${a.guide_page}${a.pdf_page ? ' · PDF p.' + a.pdf_page : ''} · ${a.year_from}-${a.year_to}</div></dd></dl>`;
-    else ali = `<div class="warn">ALI chart ${esc(a.chart)} covers ${a.year_from}-${a.year_to}, not ${v.year}. Check it is the same body before you use it. (guide p.${a.guide_page})</div>`;
-    // Storyboard T2: the whole page, the chart's box on it when one is drawn, "Use chart XX" in large text.
-    if (a && a.img) pageCard = `<a class="pagecard" href="#/car/${v.id}/page" aria-label="Open the ALI page full screen">
-      <span class="pageimg" style="aspect-ratio:${a.w}/${a.h}"><img src="${esc(a.img)}" alt="ALI ${esc(a.edition)} guide page ${a.guide_page}${a.box ? ', chart ' + esc(a.chart) + ' outlined' : ''}">${a.box ? `<span class="pbox" style="${boxStyle(a.box)}"></span>` : ''}</span>
-      <span class="usechart">Use chart ${esc(a.chart)} - tap to open</span></a>`;
-    else if (a && a.status === 'missing_from_scan') pageCard = `<div class="warn bad">The page for chart ${esc(a.chart)} (guide p.${a.guide_page}) is missing from the ${esc(a.edition)} scan. Use a paper guide.</div>`;
-  }
-  const ad = tab === 'lift' && v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { stop: false, html: '' };
-  // Suggestion 5: the three numbers for a wheels-off job on one line, first on the Lift tab.
-  // Ultrareview B #4: a value tagged for an engine is never a headline pick for a car with no engine set (no_headline, from the Worker).
-  const bestOf = f => v.values.find(x => x.field === f && x.status === 'confirmed' && !x.hidden_by_placard && !x.no_headline) || v.values.find(x => x.field === f && x.status !== 'rejected' && !x.hidden_by_placard && !x.no_headline);
-  const three = tab === 'lift' ? [['Torque', bestOf('Torque')], ['Pressure', bestOf('Pressure')], ['Socket', bestOf('Socket')]].filter(x => x[1]).map(([l, s]) => `<span><b>${l}</b> ${esc(showVal(s))}</span>`).join('') : '';
-  const threeLine = three ? `<div class="threeline">${three}</div>` : '';
+  const [v, svc] = await Promise.all([api('/vehicles/' + id), api(`/vehicles/${id}/service`).catch(() => ({ entries: [] }))]);
+  if (!live()) return;
+  const T = tileData(v), cs = cautionsOf(v), c0 = cs[0], last = svc.entries[0], drafts = readDrafts().filter(d => d.car === +id);
+  const stop = v.chart_notes && /^Do not use a 2-post/.test(v.chart_notes.kit_mark || '');
+  crumb('', `<b>${esc(carName(v))}</b> <span class="trim">${esc(v.trim || '')}</span>`);
+  $('#hnav').innerHTML = '<a class="btn t48" href="#/">My cars</a>';
+  const cautionLine = c0 ? `<div class="caut row ${c0.warn === 2 ? 'block' : ''}" data-level="${c0.warn === 2 ? 'block' : 'caution'}"><a class="cautmain" href="#/car/${id}/lift"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>
+      <b class="cauttitle">${esc(c0.field)}${cs.length > 1 ? ` (+${cs.length - 1})` : ''}</b><span class="cautsum">${c0.warn === 2 ? 'Do not lift yet' : esc(firstSentence(c0.value))}</span></a>${pill(c0.status)}<button class="ibtn t48" data-drawer="caution" aria-label="Caution detail">i</button></div>` : '';
+  const stopLine = stop ? `<a class="caut row block" data-level="block" href="#/car/${id}/lift"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v5M12 18h.01"/></svg><b class="cauttitle">Do not use a 2-post</b><span class="cautsum">The chart says so</span></a>` : '';
+  const tile = (key, label, t) => `<${key === 'lift' ? `a href="#/car/${id}/lift"` : `button type="button" data-tile="${key}"`} class="tile" data-key="${key}"><span class="top"><span class="lbl">${label}</span><span class="badges">${t.badges}</span></span>
+    <span class="val tbig">${t.big}</span>${t.small ? `<span class="val tsmall">${t.small}</span>` : ''}</${key === 'lift' ? 'a' : 'button'}>`;
+  $('#view').innerHTML = `<div class="carscreen" data-car="${id}">
+    <div class="leftcol">${stopLine}${cautionLine}<div class="tiles">${tile('lift', 'Lift', T.lift)}${tile('wheels', 'Wheels off', T.wheels)}${tile('tires', 'Tires', T.tires)}${tile('oil', 'Oil', T.oil)}</div></div>
+    <div class="rightcol"><a class="btn big amber logwork" href="#/car/${id}/log">Log work</a>
+      <a class="panel lastvisit" href="#/car/${id}/history"><span class="lbl">Last visit</span>${last ? `<span class="mono">${esc(last.date)} · ${miles(last.mileage)} mi</span><span>${last.items.map(itemLine).join(' · ')}</span>` : '<span>No visits yet.</span>'}
+        ${drafts.map(d => `<span class="notsent">Not sent: ${esc(d.body.date)} · ${miles(d.body.mileage)} mi. It goes out when you are back online.</span>`).join('')}</a>
+      <div id="needs">${needsHtml(v)}</div>
+      <button type="button" class="recallline" id="recallbox" data-drawer="recalls">${esc(recallText(v))}</button>
+      <button type="button" class="ghost editcarbtn" data-drawer="edit">Edit car</button></div></div>`;
+  redraw = () => car(id);
+  wireCar(v, id, live);
+  if (drawerKey) openDrawer(v, id, drawerKey);
+}
+// Buttons of the car screen; the drawer has its own wiring (wireDrawer). Once a day per car the Worker asks NHTSA (recalls, Canadian-specs weight);
+// the page is already drawn, only the recall line and the Needs you panel are redrawn.
+function wireCar(v, id, live) {
+  document.querySelectorAll('[data-tile]').forEach(b => b.onclick = () => { drawerKey = TILE_TAB[b.dataset.tile]; openDrawer(v, id, drawerKey); });
+  document.querySelectorAll('[data-drawer]').forEach(b => b.onclick = () => { drawerKey = b.dataset.drawer; openDrawer(v, id, drawerKey); });
+  const needs = () => { const n = $('#needs'); if (n) { n.innerHTML = needsHtml(v); wireNeeds(v, id); } };
+  wireNeeds(v, id);
+  if (v.facts_due && navigator.onLine) api(`/vehicles/${id}/facts`, { method: 'POST', body: {} }).then(f => {
+    if (!live()) return;
+    v.recalls = f.recalls; v.curb = f.curb; v.weight_error = f.weight_error;
+    const rb = $('#recallbox'); if (rb) rb.textContent = recallText(v);
+    needs();
+  }).catch(() => { const rb = $('#recallbox'); if (live() && rb && !v.recalls) { v.recalls = { count: null, error: 'The check did not finish.', items: [] }; rb.textContent = recallText(v); } });
+}
+function wireNeeds(v, id) {
+  wireStatus(() => redraw());
+  document.querySelectorAll('#needs [data-drawer]').forEach(b => b.onclick = () => { drawerKey = b.dataset.drawer; openDrawer(v, id, drawerKey); });
+  const c = $('#wconfirm2'); if (c) c.onclick = () => api(`/vehicles/${id}/weight`, { method: 'POST', body: { action: 'confirm' } }).then(() => redraw()).catch(fail);
+}
+// ---------- The drawer (HANDOFF 19, D2): one component for the three value tiles, the Lift points, the caution, the recalls, the checks and Edit car ----------
+// 440 px from the right on the tablet, a bottom sheet on the phone, a dimmer behind, a 48 px Close. Wiring runs after each draw.
+const DRAWER_TITLE = { torque: 'Wheels off', tires: 'Tires', oil: 'Oil', lift: 'Lift points', caution: 'Caution', recalls: 'Recalls', checks: 'Checks', edit: 'Edit car' };
+async function drawerBody(v, id, key) {
+  const valueKey = ['torque', 'tires', 'oil', 'lift'].includes(key);
+  if (valueKey) tab = key;
+  const rows = valueKey ? v.values.filter(s => s.tab === key && !s.hidden_by_placard) : [];
+  const hiddenTires = key === 'tires' ? v.values.filter(s => s.hidden_by_placard).length : 0;
   const job = v.jobs[0];
   const jobLine = !job ? '' : job.status === 'done' ? `<span class="warn">Results ready - confirm${job.result_summary ? ' (' + esc(job.result_summary) + ')' : ''}</span>`
     : job.status === 'failed' ? `<span class="warn bad">Research failed: ${esc(job.error)}</span>` : `<span class="note">${job.status === 'claimed' ? 'Researching' : 'Queued'}</span>`;
   // The VIN decode (NHTSA only, cached) gives the engine for the lookup links and the EV flag.
-  const lookTab = ['oil', 'torque', 'tires'].includes(tab);
+  const lookTab = ['oil', 'torque', 'tires'].includes(key);
   const dec = lookTab && v.vin ? await api('/vin?vin=' + encodeURIComponent(v.vin)).catch(() => null) : null;
   // Decision 7: NHTSA says battery-electric -> no engine oil.
   let evNote = '';
-  if (tab === 'oil' && v.fuel === 'ev') evNote = `<div class="warn"><b>No engine oil (EV).</b> This car is battery-electric. It has no engine oil to change.</div>`;
-  else if (tab === 'oil' && dec && dec.ev) evNote = `<div class="warn"><b>No engine oil (EV).</b> NHTSA says this car is battery-electric (${esc(dec.electrification || dec.fuel)}). It has no engine oil to change.</div>`;
+  if (key === 'oil' && v.fuel === 'ev') evNote = `<div class="warn"><b>No engine oil (EV).</b> This car is battery-electric. It has no engine oil to change.</div>`;
+  else if (key === 'oil' && dec && dec.ev) evNote = `<div class="warn"><b>No engine oil (EV).</b> NHTSA says this car is battery-electric (${esc(dec.electrification || dec.fuel)}). It has no engine oil to change.</div>`;
   // Decision 8: links Rick opens and reads himself; LiftPad never fetches them. A tap fills the Source box.
   let links = '';
-  if (lookTab) {
+  if (lookTab && !evNote) {   // HANDOFF 19 (D1, i4): an EV has no engine oil, so no look-it-up links and no research
     const L = (await api(`/links?year=${v.year}&make=${encodeURIComponent(v.make)}&model=${encodeURIComponent(v.model)}&engine=${encodeURIComponent((dec && dec.engine) || '')}&ev=${dec && dec.ev ? 1 : 0}`).catch(() => [])).filter(l => l.tabs.includes(tab));
     if (L.length) links = `<details class="links"><summary class="lbl">Look it up yourself (${L.length} links)</summary>
       <p class="note">Each opens the site in a new tab. LiftPad never reads these sites for you. Enter what you find below: the source is filled in.</p>
@@ -435,51 +581,53 @@ async function car(id) {
   // Decision 9: after the car's own values, the make's typical value (Low), then the thread range
   // as a sanity check only. A torque outside the range is flagged on the value.
   const R = v.typical && v.typical.range, MK = v.typical && v.typical.make;
-  const rangeWarn = s => s.range_flag === 'outside' && R ? `<div class="warn bad">Outside the usual range for ${esc(R.thread)} (${R.torque_min}-${R.torque_max} ft-lb). Check it before you use it.</div>` : '';
+  // HANDOFF 19 (D7): one range warning per value, and not red on a value that is confirmed High (the source is the manual; the range is a sanity check).
+  const rangeWarn = s => s.range_flag === 'outside' && R
+    ? (s.status === 'confirmed' && s.confidence === 'High'
+      ? `<div class="src rangenote">Outside the usual range for ${esc(R.thread)} (${R.torque_min}-${R.torque_max} ft-lb). Confirmed High from the source.</div>`
+      : `<div class="warn bad">Outside the usual range for ${esc(R.thread)} (${R.torque_min}-${R.torque_max} ft-lb). Check it before you use it.</div>`) : '';
   let typ = '';
   const ownTq = rows.find(s => s.field === 'Torque' && s.status === 'confirmed' && s.confidence === 'High');
-  // Suggestion 2: when the car's own torque is confirmed High, one grey line replaces the "Typical for" box (no red LOW badge).
-  if (tab === 'torque' && ownTq && R) typ += `<p class="src rangeline">Range check: ${ownTq.range_flag === 'outside' ? 'OUTSIDE' : 'inside'} ${R.torque_min}-${R.torque_max} ft-lb</p>`;
-  else if (tab === 'torque' && MK) {
+  // Suggestion 2: when the car's own torque is confirmed High, one grey line replaces the "Typical for" box (no red LOW badge). An outside value has its own warning above.
+  if (key === 'torque' && ownTq && R) typ += ownTq.range_flag === 'outside' ? '' : `<p class="src rangeline">Range check: inside ${R.torque_min}-${R.torque_max} ft-lb</p>`;
+  else if (key === 'torque' && MK) {
     const own = rows.some(s => s.field === 'Torque');
     typ += `<div class="typical${own ? ' after' : ''}"><div class="lbl">${own ? 'Typical for ' + esc(v.make) + ' (for comparison)' : 'No value for this car yet - typical for ' + esc(v.make)}</div>
       ${MK.torque_ftlb != null ? `<span class="val${own ? '' : ' key'}">~${MK.torque_ftlb} ft-lb</span>` : ''}<span class="pill Low">Low</span>
       <div>${[MK.thread, MK.socket && MK.socket + ' socket'].filter(Boolean).map(esc).join(' · ')}</div>
       <div class="note">Typical for ${esc(v.make)} ${esc(MK.era)} - not confirmed for this car.${MK.note ? ' ' + esc(MK.note) + '.' : ''} (table ${esc(MK.edition)})</div></div>`;
   }
-  if (tab === 'torque' && R && !ownTq) typ += `<p class="src">Range for ${esc(R.thread)}${v.typical.thread_from === 'make' ? ` (the typical ${esc(v.make)} thread)` : ''}: ${R.torque_min}-${R.torque_max} ft-lb. A sanity check only, never the car's value. (table ${esc(R.edition)})</p>`;
+  if (key === 'torque' && R && !ownTq) typ +=`<p class="src">Range for ${esc(R.thread)}${v.typical.thread_from === 'make' ? ` (the typical ${esc(v.make)} thread)` : ''}: ${R.torque_min}-${R.torque_max} ft-lb. A sanity check only, never the car's value. (table ${esc(R.edition)})</p>`;
   // Decision 1: a proposed value looks different (dashed amber box, the word Proposed) from a confirmed one.
   // Suggestions 1 and 7: History and Edit show after a tap on the value card (class "open"); on the phone the source line does too.
   const valueDd = s => `<dd data-v="${s.id}" class="v-${esc(s.status)} vcard" tabindex="0"><div><span class="val${keyCls(s)}">${esc(showVal(s))}</span>${s.ftlb_src === 'converted' ? '<span class="tag">converted</span>' : ''}</div>
     <div><span class="pill ${esc(s.confidence)}" style="margin-left:0">${esc(s.confidence)}</span>${pill(s.status)}${s.scope === 'car' ? '<span class="tag">this car only</span>' : `<span class="tag">${s.year_from}${s.year_to !== s.year_from ? '-' + s.year_to : ''}</span>`}${s.engine ? `<span class="tag engtag">engine: ${esc(s.engine)}</span>` : ''}</div>
     <div class="src">${esc(s.source)}</div>${s.note ? `<div class="note">${esc(s.note)}</div>` : ''}${rangeWarn(s)}
-    ${s.status === 'proposed' ? `<div class="row"><button class="ok" data-ok="${s.id}">Confirm</button><button class="ghost" data-no="${s.id}">Reject</button></div>` : ''}
+    ${s.status === 'proposed' ? `<div class="row"><button class="ok needsnet" data-ok="${s.id}">Confirm</button><button class="ghost needsnet" data-no="${s.id}">Reject</button></div>` : ''}
     <div class="row vacts"><button class="ghost" data-h="${s.id}">History</button><button class="ghost" data-e="${s.id}">Edit</button></div><div class="hist"></div></dd>`;
-  // Storyboard T4: a visiting car opens with a first look at Lift, Torque and Tires side by side.
-  // A value hidden by the door card (hidden_by_placard) is never the first look: the car's own label wins here too.
-  const best = f => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard && !x.no_headline); return c.find(x => x.status === 'confirmed') || c[0]; };
-  const firstLook = v.grp !== 'visitor' ? '' : `<div class="first">
-    <section aria-label="Lift"><h3>Lift</h3>${v.ali ? `<span class="val">Use chart ${esc(v.ali.chart)}</span><span class="src">ALI ${esc(v.ali.edition)} · ${v.ali.year_from}-${v.ali.year_to} · p.${v.ali.guide_page}</span>` : '<span class="note">No ALI chart</span>'}</section>
-    <section aria-label="Torque"><h3>Torque</h3>${best('Torque') ? `<span class="val key">${esc(showVal(best('Torque')))}</span>${pill(best('Torque').status)}` : MK && MK.torque_ftlb != null ? `<span class="val key">~${MK.torque_ftlb} ft-lb</span><span><span class="pill Low" style="margin-left:0">Low</span> <span class="note">Typical for ${esc(v.make)} - not confirmed</span></span>` : '<span class="note">No value yet</span>'}</section>
-    <section aria-label="Tires"><h3>Tires</h3>${best('Pressure') ? `<span class="val key">${esc(best('Pressure').value)}</span>${pill(best('Pressure').status)}` : `<span class="note">No values yet. The door-jamb label is the maker's own source.</span><a class="btn primary" href="#/car/${v.id}/jamb">Door-jamb photo</a>`}</section></div>`;
-  if (!live()) return;
-  crumb(`${v.year} ${v.make} ${v.model}`);
-  $('#view').innerHTML = `${firstLook}<section class="card">
-    <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${esc(carName(v))}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
-    <div class="recallbox" id="recallbox">${recallInner(v)}</div>
-    ${tabRow(v)}
-    <div class="${pageCard ? 'liftgrid' : 'tabbody'}"><div class="tabbody">
-    ${threeLine}${ad.stop ? ad.html : ''}${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
-    ${ali}${ad.stop ? '' : ad.html}${tab === 'lift' ? `<div class="weightbox" id="weightbox">${weightInner(v)}</div>` : ''}${evNote}
-    ${evNote && !rows.length ? '' : `<dl>${rows.filter(s => !s.warn).map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below, or tap Research.</dd>'}</dl>`}
-    ${hiddenTires ? `<p class="src hiddennote">The door card wins: ${hiddenTires} value${hiddenTires === 1 ? '' : 's'} for other wheel sizes ${hiddenTires === 1 ? 'is' : 'are'} hidden (kept in the history).</p>` : ''}
-    ${tab === 'tires' ? `<a class="btn primary big" href="#/car/${v.id}/jamb">Door-jamb photo</a><p class="note">The label on the driver door pillar is the maker's own source. Take a photo, then type what it says.</p>` : ''}
+  const T = tileData(v)[key === 'torque' ? 'wheels' : key];
+  const hasMissing = valueKey && /class="pill Missing"/.test(`${T.big}${T.small}${T.badges}`);
+  const label = (meta.tabs.find(t => t.name === key) || {}).label || key;
+  const addLabel = `+ Add ${/^[aeiou]/i.test(label) ? 'an' : 'a'} ${esc(label.toLowerCase())} value`;
+  const valueList = `<dl>${rows.map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below.</dd>'}</dl>`;
+  const valueTail = `${hiddenTires ? `<p class="src hiddennote">The door card wins: ${hiddenTires} value${hiddenTires === 1 ? '' : 's'} for other wheel sizes ${hiddenTires === 1 ? 'is' : 'are'} hidden (kept in the history).</p>` : ''}
     ${typ}${links}
-    <details id="addspec" ${evNote ? 'hidden' : ''}><summary class="lbl">+ Add a ${esc(meta.tabs.find(t => t.name === tab)?.label || tab)} value</summary>${valueForm(v)}</details>
-    </div>${pageCard}</div>
-  </section>
-  <div class="row"><button id="research">Research missing values</button>${jobLine}</div>
-  <details class="card editcar" id="editcar"><summary class="lbl">Edit car</summary>
+    <details id="addspec" ${evNote ? 'hidden' : ''}><summary class="lbl">${addLabel}</summary>${valueForm(v)}</details>
+    <div class="row dacts">${key === 'tires' ? `<a class="btn primary needsnet" href="#/car/${v.id}/jamb">Door-jamb photo</a>` : ''}${key === 'oil' && v.fuel !== 'ev' ? `<a class="btn" href="#/car/${v.id}/log">Log oil change</a>` : ''}
+      ${hasMissing ? `<button id="research" class="needsnet">Research missing values</button>${jobLine}` : ''}</div><span class="src offlinewhy">Scans and confirming need a connection.</span><p class="err" id="delmsg"></p>`;
+  const head = (title, extra = '') => `<div class="row dhead"><span class="lbl dtitle">${esc(title)} · sources and history</span><button type="button" class="t48" id="dclose">Close</button></div>${extra}`;
+  if (valueKey) {
+    const big = key === 'oil' && v.fuel === 'ev' ? 'No engine oil (EV)' : T.big;
+    return head(DRAWER_TITLE[key], `<div class="val dbig">${big}</div>${T.small ? `<div class="val dsmall">${T.small}</div>` : ''}<div class="badges">${T.badges}</div>`) + (evNote || '') + (evNote && !rows.length ? '' : valueList) + valueTail;
+  }
+  if (key === 'recalls') return head('Recalls', `<div class="recalldrawer">${recallInner(v)}</div>`);
+  if (key === 'caution' || key === 'checks') {
+    const ad = v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { html: '<p class="note">No ALI chart for this car in the lift guide.</p>' };
+    const cl = key === 'caution' ? cautionsOf(v) : [];
+    return head(DRAWER_TITLE[key], `${cl.length ? `<dl>${cl.map(s => `<dt>${s.warn === 2 ? 'Do not lift yet' : 'Caution'} - ${esc(s.field)}</dt>${valueDd(s)}`).join('')}</dl>` : ''}${ad.html}<div class="weightbox" id="weightbox">${weightInner(v)}</div>`);
+  }
+  // key 'edit'
+  return head('Edit car', `<span class="src">${esc(carName(v))} · ${GROUP[v.grp]}</span>
   <div class="row">${Object.keys(GROUP).filter(g => g !== v.grp).map(g => `<button class="ghost" data-g="${g}">Move to ${GROUP[g]}</button>`).join('')}</div>
   <div class="card" id="ownbox"><div class="row"><div class="field"><label for="ownin">Owner (shown on the card when it is not Rick)</label><input id="ownin" maxlength="60" autocomplete="off" value="${esc(v.owner || '')}"></div>
     <div class="field"><label for="fuelin">Fuel</label><select id="fuelin"><option value="">not set</option>${['gas', 'diesel', 'hybrid', 'phev', 'ev'].map(f => `<option value="${f}" ${v.fuel === f ? 'selected' : ''}>${f}</option>`).join('')}</select></div>
@@ -493,20 +641,28 @@ async function car(id) {
   <div class="card" id="vinbox"><div><span class="lbl">VIN</span> <span class="val" id="vinnow">${esc(v.vin || 'none')}</span></div>
     <div class="row"><input id="vinin" maxlength="17" autocomplete="off" placeholder="17 characters" aria-label="VIN" style="font-family:var(--mono)" value="${esc(v.vin || '')}"><button id="vinsave">Save VIN</button>${scanButton('vinscan')}</div>
     <p class="note">The VIN stays on this car and goes only to NHTSA, to decode the engine and the EV flag.</p><p class="err" id="vinerr"></p></div>
-  <div class="row"><button class="ghost" id="del">Delete car</button></div></details><p id="delmsg"></p>`;
-  document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; car(id); });
-  if (tab === 'lift') wireWeight(v);
-  // Once a day per car the Worker asks NHTSA (recalls, Canadian-specs weight). The page is already drawn; only the two boxes are redrawn.
-  if (v.facts_due) api(`/vehicles/${id}/facts`, { method: 'POST', body: {} }).then(f => {
-    if (!live()) return;
-    v.recalls = f.recalls; v.curb = f.curb; v.weight_error = f.weight_error;
-    const rb = $('#recallbox'); if (rb) rb.innerHTML = recallInner(v);
-    const wb = $('#weightbox'); if (wb && !wb.querySelector('details[open]')) { wb.innerHTML = weightInner(v); wireWeight(v); }
-  }).catch(() => { const rb = $('#recallbox'); if (live() && rb && !v.recalls) { v.recalls = { count: null, error: 'The check did not finish.', items: [] }; rb.innerHTML = recallInner(v); } });
+  <div class="row"><button class="ghost" id="del">Delete car</button></div><p id="delmsg"></p>`);
+}
+// The drawer on the screen. Every save inside it draws the screen under it again (redraw); drawerKey keeps it open.
+async function openDrawer(v, id, key) {
+  drawerKey = key;
+  let w = $('#drawerwrap');
+  if (!w) { w = document.createElement('div'); w.id = 'drawerwrap'; w.className = 'drawerwrap'; w.innerHTML = '<div class="dimmer" id="dimmer"></div><aside class="drawer" id="drawer" role="dialog" aria-modal="true"></aside>'; document.body.appendChild(w); }
+  const html = await drawerBody(v, id, key);
+  if (drawerKey !== key) return;   // closed, or another one opened, while the lists loaded
+  $('#drawer').setAttribute('aria-label', DRAWER_TITLE[key]);
+  $('#drawer').innerHTML = html;
+  $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer;
+  wireDrawer(v, id);
+}
+function closeDrawer() { drawerKey = null; const x = $('#drawerwrap'); if (x) x.remove(); }
+function wireDrawer(v, id) {
+  const on = (sel, fn) => { const e = $(sel); if (e) e.onclick = fn; };
+  if ($('#weightbox')) wireWeight(v);
   document.querySelectorAll('.vcard').forEach(d => d.addEventListener('click', e => { if (!e.target.closest('button,a,input,select,textarea,form')) d.classList.toggle('open'); }));
-  const ct = $('#cautiontoggle'); if (ct) ct.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { hide_chart_cautions: +ct.dataset.hide } }).then(() => car(id)).catch(fail);
-  $('#ownsave').onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { owner: $('#ownin').value, fuel: $('#fuelin').value } }).then(() => car(id)).catch(e => { $('#ownerr').textContent = e.message; });
-  wireStatus(() => car(id));
+  const ct = $('#cautiontoggle'); if (ct) ct.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { hide_chart_cautions: +ct.dataset.hide } }).then(() => redraw()).catch(fail);
+  on('#ownsave', () => api('/vehicles/' + id, { method: 'PATCH', body: { owner: $('#ownin').value, fuel: $('#fuelin').value } }).then(() => redraw()).catch(e => { $('#ownerr').textContent = e.message; }));
+  wireStatus(() => redraw());
   document.querySelectorAll('[data-h]').forEach(b => b.onclick = async () => {
     const box = b.closest('dd').querySelector('.hist');
     const h = await api(`/values/${b.dataset.h}/history`);
@@ -527,23 +683,23 @@ async function car(id) {
     store.set('lp-lastsrc', JSON.stringify({ car: v.id, src }));
     const box = $('#addspec input[name=source]'); if (box) box.value = src;
   }));
-  wireForm($('#addspec form'), body => api(`/vehicles/${id}/values`, { method: 'POST', body: { ...body, tab, status: body.confirm ? 'confirmed' : 'proposed' } }).then(() => car(id)));
+  wireForm($('#addspec form'), body => api(`/vehicles/${id}/values`, { method: 'POST', body: { ...body, tab, status: body.confirm ? 'confirmed' : 'proposed' } }).then(() => redraw()));
   document.querySelectorAll('[data-e]').forEach(b => b.onclick = () => {
     const s = v.values.find(x => x.id == b.dataset.e); const dd = b.closest('dd'); dd.innerHTML = editForm(s);
     // The Value box shows the text without N-m; an unchanged box sends the stored text back, so the stored N-m part stays.
-    wireForm(dd.querySelector('form'), body => { if (body.value === noNm(s.value)) body.value = s.value; return api('/values/' + s.id, { method: 'PATCH', body }).then(() => car(id)); }, () => api('/values/' + s.id, { method: 'DELETE' }).then(() => car(id)));
+    wireForm(dd.querySelector('form'), body => { if (body.value === noNm(s.value)) body.value = s.value; return api('/values/' + s.id, { method: 'PATCH', body }).then(() => redraw()); }, () => api('/values/' + s.id, { method: 'DELETE' }).then(() => redraw()));
   });
   document.querySelectorAll('.chartcheck').forEach(b => b.onclick = () => api('/chart-checks', { method: 'POST', body: { edition: b.dataset.ed, chart: b.dataset.chart, action: b.dataset.act } })
-    .then(() => car(id)).catch(e => { b.parentElement.querySelector('.chartcheckerr').textContent = e.message; }));
-  $('#trimsave').onclick =() => api('/vehicles/' + id, { method: 'PATCH', body: { trim: $('#trimin').value } }).then(() => car(id)).catch(e => { $('#trimerr').textContent = e.message; });
+    .then(() => redraw()).catch(e => { b.parentElement.querySelector('.chartcheckerr').textContent = e.message; }));
+  on('#trimsave', () => api('/vehicles/' + id, { method: 'PATCH', body: { trim: $('#trimin').value } }).then(() => redraw()).catch(e => { $('#trimerr').textContent = e.message; }));
   // B7: the server checks the VIN check digit. A failed check is shown; the car is saved only after "Save as a VIN that is not US-market".
-  const saveVin = notUs => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value, ...(notUs ? { not_us: true } : {}) } }).then(() => car(id)).catch(e => {
+  const saveVin = notUs => api('/vehicles/' + id, { method: 'PATCH', body: { vin: $('#vinin').value, ...(notUs ? { not_us: true } : {}) } }).then(() => redraw()).catch(e => {
     $('#vinerr').textContent = e.message;
     if (e.data && e.data.check_failed) { $('#vinerr').insertAdjacentHTML('afterend', '<button class="ghost" id="vinnotus">Save as a VIN that is not US-market</button>'); $('#vinnotus').onclick = () => saveVin(true); }
   });
-  $('#vinsave').onclick = () => saveVin(false);
+  on('#vinsave', () => saveVin(false));
   // B4: the one-time "Pick engine from the list" for a car that already exists. It shows the lists; Save engine is the only change.
-  $('#engpick').onclick = async () => {
+  on('#engpick', async () => {
     const f = $('#engform'); f.innerHTML = '<p class="note">Reading the list...</p>';
     const q = `year=${v.year}&make=${encodeURIComponent(v.make)}&model=${encodeURIComponent(v.model)}`;
     try {
@@ -559,13 +715,93 @@ async function car(id) {
       };
       $('#pkvar').onchange = fill; $('#pkeng').onchange = () => { $('#pksave').disabled = !$('#pkeng').value; };
       if ($('#pkvar').value) await fill();
-      $('#pksave').onclick = () => { const x = opts.find(y => y.value === $('#pkeng').value); api('/vehicles/' + id, { method: 'PATCH', body: { variant: $('#pkvar').value, fe_id: +x.value, engine: /\d\.\d\s*L\b/i.test(x.text) ? x.text : '' } }).then(() => car(id)).catch(e => { $('#engerr').textContent = e.message; }); };
+      $('#pksave').onclick = () => { const x = opts.find(y => y.value === $('#pkeng').value); api('/vehicles/' + id, { method: 'PATCH', body: { variant: $('#pkvar').value, fe_id: +x.value, engine: /\d\.\d\s*L\b/i.test(x.text) ? x.text : '' } }).then(() => redraw()).catch(e => { $('#engerr').textContent = e.message; }); };
     } catch (e) { $('#engerr').textContent = e.message; }
-  };
+  });
   wireScan('vinscan', vin => { $('#vinin').value = vin; $('#vinerr').textContent = 'VIN read from the photo - check it, then Save VIN.'; }, m => { $('#vinerr').textContent = m; });
-  document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => car(id)).catch(fail));
-  $('#research').onclick = () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => car(id)).catch(e => { $('#delmsg').textContent = e.message; });
-  $('#del').onclick = () => { $('#delmsg').innerHTML = `This deletes the car, its own values and its service log. Values for the model and year stay. <button class="primary" id="del2">Yes, delete</button>`; $('#del2').onclick = () => api('/vehicles/' + id, { method: 'DELETE' }).then(() => location.hash = '#/'); };
+  document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => redraw()).catch(fail));
+  on('#research', () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => redraw()).catch(e => { $('#delmsg').textContent = e.message; }));
+  on('#del', () => { $('#delmsg').innerHTML = `This deletes the car, its own values and its service log. Values for the model and year stay. <button class="primary" id="del2">Yes, delete</button>`; $('#del2').onclick = () => api('/vehicles/' + id, { method: 'DELETE' }).then(() => { closeDrawer(); location.hash = '#/'; }); });
+}
+// ---------- The Lift screen (HANDOFF 19, D3): the cautions, the points and the chart on one screen; everything else is behind Checks ----------
+const CHECKED_SHORT = { rick: 'chart checked by Rick', ai: 'chart AI-checked', no: 'chart not checked' };
+const CAUT_ICON = '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>';
+async function liftPage(id) {
+  const live = fresh();
+  if (!meta) meta = await api('/tabs');
+  const v = await api(`/vehicles/${id}?peek=1`);
+  if (!live()) return;
+  const a = v.ali, n = v.chart_notes, cs = cautionsOf(v), pts = pickVal(v, 'Points');
+  const stop = !!n && /^Do not use a 2-post/.test(n.kit_mark || '');
+  crumb('', `<b>${esc(carName(v))}</b> <span class="trim">Lift</span>`);
+  $('#hnav').innerHTML = `<a class="btn t48" href="#/car/${id}">Back to car</a>`;
+  const cautBox = s => `<div class="caut ${s.warn === 2 ? 'block' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><div class="row">${CAUT_ICON}<b class="cauttitle">${s.warn === 2 ? 'Do not lift yet' : 'Caution'} - ${esc(s.field)}</b>
+    <span class="badges">${badgesOf(s)}</span><button class="ibtn t48" data-drawer="caution" aria-label="Source and chart checks">i</button></div><div class="cautfull">${esc(s.value)}</div></div>`;
+  const pads = ((v.chart_notes_footer || '').match(/(\d+(?:\.\d+)?-\d+(?:\.\d+)?)\s*in\b/i) || [])[1];
+  const adapters = n ? (!n.adapters || /^no adapter/i.test(n.adapters) ? 'none' : n.adapters) : 'no notes';
+  const chartLine = a ? `<span class="lbl">Chart</span><span class="val v28">${esc(a.chart)}</span>${a.status !== 'ok' ? missing('page') : a.d !== 0 ? confPill('Medium') : confPill('High')}<span class="src">adapters: ${esc(adapters)}${pads ? ` · pads ${esc(pads)} in` : ''}</span>` : `<span class="lbl">Chart</span>${missing('chart')}`;
+  const level = n && CHECKED_SHORT[n.verified] ? n.verified : 'no';
+  const curb = v.curb ? `Curb weight ${lbPlain(v.curb.lb)} lb ${pill(v.curb.status === 'confirmed' ? 'confirmed' : 'proposed')}` : 'Curb weight not known yet';
+  const mismatch = a && a.d !== 0 ? `<div class="warn">ALI chart ${esc(a.chart)} covers ${a.year_from}-${a.year_to}, not ${v.year}. Check it is the same body before you use it. (guide p.${a.guide_page})</div>` : '';
+  const chartView = a && a.img ? `<div class="chartbox"><div class="row charthead"><b>${esc(a.chart)}${a.box ? ' · zoomed' : ''} · guide p.${a.guide_page}</b><span class="src">ALI ${esc(a.edition)} · ${a.year_from}-${a.year_to}</span></div>
+      <div class="vstage lzstage" id="lzstage"><div class="vpage" id="lzpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="ALI ${esc(a.edition)} guide page ${a.guide_page}${a.box ? ', chart ' + esc(a.chart) + ' zoomed' : ''}" draggable="false"></div></div>
+      <span class="src">Pinch to zoom here.</span></div><a class="btn big amber" href="#/car/${id}/page">Whole page p.${a.guide_page} full screen</a>`
+    : a && a.status === 'missing_from_scan' ? `<div class="warn bad">The page for chart ${esc(a.chart)} (guide p.${a.guide_page}) is missing from the ${esc(a.edition)} scan. Use a paper guide.</div>`
+    : `<div class="warn bad">No ALI chart for this car in the lift guide.</div>`;
+  $('#view').innerHTML = `<div class="carscreen liftscreen" data-car="${id}"><div class="liftleft">
+    ${stop ? `<div class="caut block" data-level="block"><div class="row">${CAUT_ICON}<b class="cauttitle">Do not use a 2-post</b></div><div class="cautfull">The chart says so. Read its words in Checks.</div></div>` : ''}
+    ${cs.map(cautBox).join('')}${mismatch}
+    <div class="panel pointspanel"><div class="row"><span class="lbl">Points</span>${pts && pts.is_safety ? '<span class="pill">Safety value</span>' : ''}<span class="badges">${pts ? badgesOf(pts) : missing('points')}</span><button class="ibtn t48" data-drawer="lift" aria-label="Source of the points">i</button></div>
+      <div class="val v28">${pts ? esc(pts.value) : 'No value yet.'}</div></div>
+    <div class="row chartline">${chartLine}</div>
+    ${n && n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}
+    <div class="row"><span class="src grow">${curb} · ${CHECKED_SHORT[level]}</span><button type="button" class="t64" data-drawer="checks">Checks (i)</button></div></div>
+    <div class="liftright">${chartView}</div></div>`;
+  redraw = () => liftPage(id);
+  document.querySelectorAll('[data-drawer]').forEach(b => b.onclick = () => openDrawer(v, id, b.dataset.drawer));
+  if (a && a.img) zoomStage($('#lzstage'), $('#lzpage'), a.w, a.h, a.box);
+  if (drawerKey) openDrawer(v, id, drawerKey);
+}
+// Pinch zoom, drag and double tap for the small chart view. It is the page viewer's logic in a box; the viewer itself (Whole page) is unchanged.
+function zoomStage(stage, pg, W, H, box) {
+  let s = 1, x = 0, y = 0, start = null, moved = false, lastTap = 0;
+  const pts = new Map();
+  const fit = () => Math.min(stage.clientWidth / W, stage.clientHeight / H);
+  const draw = () => {
+    const f = fit(); s = Math.min(Math.max(s, f), f * 8);
+    const pw = W * s, ph = H * s, sw = stage.clientWidth, sh = stage.clientHeight;
+    x = pw <= sw ? (sw - pw) / 2 : Math.min(0, Math.max(sw - pw, x));
+    y = ph <= sh ? (sh - ph) / 2 : Math.min(0, Math.max(sh - ph, y));
+    pg.style.transform = `translate(${x}px,${y}px) scale(${s})`; pg.dataset.zoom = (s / f).toFixed(3);
+  };
+  const zoomAt = (ns, cx, cy) => { x = cx - (cx - x) * ns / s; y = cy - (cy - y) * ns / s; s = ns; draw(); };
+  const home = () => {
+    if (box) { s = Math.min(stage.clientWidth / (box.w * W), stage.clientHeight / (box.h * H)) * 0.96; draw(); x = stage.clientWidth / 2 - (box.x + box.w / 2) * W * s; y = stage.clientHeight / 2 - (box.y + box.h / 2) * H * s; }
+    else s = fit();
+    draw();
+  };
+  const local = e => { const r = stage.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  const snap = () => { const p = [...pts.values()], two = p.length > 1; return { n: p.length, s, x, y, mid: two ? [(p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2] : p[0], dist: two ? Math.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]) : 0 }; };
+  stage.addEventListener('pointerdown', e => { try { stage.setPointerCapture(e.pointerId); } catch (err) { /* a pointer the browser no longer tracks */ } pts.set(e.pointerId, local(e)); moved = false; start = snap(); });
+  stage.addEventListener('pointermove', e => {
+    if (!pts.has(e.pointerId)) return; pts.set(e.pointerId, local(e));
+    const now = snap(); if (!start || now.n !== start.n) { start = now; return; }
+    if (Math.hypot(now.mid[0] - start.mid[0], now.mid[1] - start.mid[1]) > 6 || now.n > 1) moved = true;
+    s = start.s; x = start.x + now.mid[0] - start.mid[0]; y = start.y + now.mid[1] - start.mid[1];
+    if (now.n > 1 && start.dist) zoomAt(start.s * now.dist / start.dist, now.mid[0], now.mid[1]); else draw();
+  });
+  const up = e => {
+    if (!pts.has(e.pointerId)) return; const p = local(e); pts.delete(e.pointerId);
+    start = pts.size ? snap() : null;
+    if (pts.size || moved) return;
+    const t = Date.now();
+    if (t - lastTap < 350) { zoomAt(s > fit() * 1.5 ? fit() : s * 2.5, p[0], p[1]); lastTap = 0; } else lastTap = t;
+  };
+  stage.addEventListener('pointerup', up); stage.addEventListener('pointercancel', up);
+  stage.addEventListener('wheel', e => { e.preventDefault(); const p = local(e); zoomAt(s * Math.exp(-e.deltaY * 0.002), p[0], p[1]); }, { passive: false });
+  const onResize = () => { if (stage.isConnected) home(); else removeEventListener('resize', onResize); };
+  addEventListener('resize', onResize);
+  home();
 }
 function valueForm(v) {
   const fs = meta.fields.filter(f => f.tab === tab);
@@ -648,7 +884,8 @@ async function jamb(id) {
   crumb(`${v.year} ${v.make} ${v.model} · door-jamb label`);
   $('#view').innerHTML = `<section class="card phoneflow"><h2>Door-jamb label</h2><div class="src">${v.year} ${esc(v.make)} ${esc(v.model)} ${esc(v.trim)}</div>
     <ul class="note"><li>Driver door open, label on the door pillar.</li><li>Get the whole label, no glare.</li><li>The photo stays in your private storage. No one else reads it.</li></ul>
-    <label class="btn primary big" for="jscan">Scan door jamb</label><input type="file" id="jscan" accept="image/*" capture="environment" hidden>
+    <span class="src offlinewhy">Scanning needs a connection.</span>
+    <label class="btn primary big needsnet" for="jscan">Scan door jamb</label><input type="file" id="jscan" accept="image/*" capture="environment" hidden>
     <p class="note">Scan reads the photo for you (the VIN label for the VIN, the tire label for the tires). Claude sees only the photo and the car's year, make, model and engine. It never sees the saved VIN. You confirm every value. It takes about 2 minutes.</p>
     <label class="btn big" for="jcam">Take photo and type the values</label><input type="file" id="jcam" accept="image/*" capture="environment" hidden>
     <label class="btn big" for="jpick">Choose from photos</label><input type="file" id="jpick" accept="image/*" hidden>
@@ -734,7 +971,7 @@ async function jambRead(id, name) {
         if (o) { if (o.value !== value || o.confidence !== 'High') await api('/values/' + o.id, { method: 'PATCH', body }); if (confirm && o.status !== 'confirmed') await api(`/values/${o.id}/confirm`, { method: 'POST', body: {} }); }
         else await api(`/vehicles/${v.id}/values`, { method: 'POST', body: { ...body, tab: 'tires', field, scope: 'car', status: confirm ? 'confirmed' : 'proposed' } });
       }
-      nextTab = 'tires'; location.hash = '#/car/' + v.id;
+      location.hash = '#/car/' + v.id;
     } catch (x) { $('#jerr').textContent = x.message; }
   };
   $('#jok').onclick = () => save(true); $('#jlater').onclick = () => save(false);
@@ -770,7 +1007,7 @@ async function viewer(id) {
   crumb(`${v.year} ${v.make} ${v.model} · page`);
   const fine = matchMedia('(pointer: fine)').matches;
   $('#view').innerHTML = `<div class="viewer" id="vw" role="dialog" aria-label="ALI page viewer">
-    <div class="vbar"><a class="btn primary" href="#/car/${v.id}">Close</a>
+    <div class="vbar"><a class="btn primary" href="#/car/${v.id}/lift">Close</a>
       <span class="vtitle">Use chart ${esc(a.chart)}</span><span class="vsub">ALI ${esc(a.edition)} · guide p.${a.guide_page} · ${a.year_from}-${a.year_to}</span>
       <span class="vtools" id="vtools"></span></div>
     <div class="vstage" id="stage"><div class="vpage" id="vpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="ALI ${esc(a.edition)} guide page ${a.guide_page}" draggable="false"><span class="pbox" id="vbox" hidden></span><span class="pdraw" id="vdraw" hidden></span></div>
@@ -855,7 +1092,7 @@ const ICONS = {
   apps: '<path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8h-8z"/>',
   cctv: '<path d="M2 6.5l15-3 1.5 6-15 3zM16 12.5l-1.5 2.5H9v4H6v2H3v-7h3v2h1.5l1-2.5z"/><path d="M19 6l3-1v5l-3 1z"/>' };
 const appIcon = n => `<svg aria-hidden="true" viewBox="0 0 24 24">${ICONS[n] || ICONS.apps}</svg>`;
-let appsBack = '#/', appsTab = null;   // Back on the Apps screen: the screen (and car tab) it came from
+let appsBack = '#/';   // Back on the Apps screen: the screen it came from
 async function appsPage() {
   const live = fresh();
   const list = await api('/apps');
@@ -871,13 +1108,25 @@ async function appsPage() {
 // The fifth tab, the cart ("Log work"), the history of one car (#/car/<id>/history) and of all cars (#/history).
 // A visit = one date and one mileage with several items. The server checks the date (400) and the mileage order (409, then
 // "Yes, that is right" sends force=1). Edit and delete are for Rick; a delete is soft and keeps a history row.
-const tabRow = () => `<div class="tabs" role="tablist">${meta.tabs.concat([{ name: 'service', label: 'Service' }]).map(t => `<button role="tab" aria-selected="${tab === t.name}" data-t="${t.name}">${esc(t.label)}</button>`).join('')}</div>`;
 const todayStr = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const miles = n => Number(n).toLocaleString('en-US');
 const itemLine = i => `${esc(i.name)}${i.option ? ' - ' + esc(i.option) : ''}${i.other_text ? ': ' + esc(i.other_text) : ''}`;
 const visitHtml = (e, withCar) => `<div class="visit vcard" data-e="${e.id}" tabindex="0"><div class="vhead"><b>${esc(e.date)}</b><span>${miles(e.mileage)} mi</span>${withCar ? `<span class="tag">${esc(carName(e))}</span>` : ''}</div>
-  <ul>${e.items.map(i => `<li>${itemLine(i)}</li>`).join('')}</ul>
+  <ul>${e.items.map(i => `<li>${itemLine(i)}</li>`).join('')}</ul>${e.low ? '<div class="src lowmi">mileage lower than the last visit</div>' : ''}
   <div class="row vacts"><button class="ghost" data-repeat="${e.id}">Repeat</button><button class="ghost" data-vedit="${e.id}">Edit</button><button class="ghost" data-vdel="${e.id}">Delete</button></div></div>`;
+// HANDOFF 19 (D7): a visit with a lower mileage than an older visit of the same car gets a grey note on the line (no block).
+function flagLow(entries) {
+  entries.forEach(e => { e.low = entries.some(o => o.vehicle_id === e.vehicle_id && (o.date < e.date || (o.date === e.date && o.id < e.id)) && o.mileage > e.mileage); });
+  return entries;
+}
+// HANDOFF 19 (D6): the cart is kept in this browser (lp-cart) so a reload does not lose it. A visit sent while offline is kept as a draft (lp-draft)
+// and sent through the normal server checks (date, mileage order, 409) when the connection is back.
+const cartSave = () => store.set('lp-cart', cart && !cart.editId ? JSON.stringify({ car: cart.car, items: [...cart.items.entries()], date: cart.date, mileage: cart.mileage }) : '');
+const cartDrop = () => { cart = null; store.set('lp-cart', ''); };
+const cartLoad = id => { try { const c = JSON.parse(store.get('lp-cart') || 'null'); return c && c.car === +id ? { car: c.car, items: new Map(c.items), date: c.date, mileage: c.mileage, editId: null, keep: null } : null; } catch (e) { return null; } };
+// Drafts are a list (one per visit), so a second offline visit does not replace the first.
+const readDrafts = () => { try { const d = JSON.parse(store.get('lp-draft') || '[]'); return Array.isArray(d) ? d : [d]; } catch (e) { return []; } };
+const writeDrafts = list => store.set('lp-draft', list.length ? JSON.stringify(list) : '');
 let cart = null;   // { car, items: Map(item_id -> { option, other }), date, mileage, editId }
 function wireVisits(entries, reload) {
   document.querySelectorAll('.visit').forEach(d => d.addEventListener('click', e => { if (!e.target.closest('button,a')) d.classList.toggle('open'); }));
@@ -895,23 +1144,11 @@ function wireVisits(entries, reload) {
     api('/service/' + b.dataset.vdel, { method: 'DELETE' }).then(reload).catch(fail);
   });
 }
-async function servicePage(v, id, live) {
-  const d = await api(`/vehicles/${id}/service`);
-  if (!live()) return;
-  crumb(carName(v));
-  $('#view').innerHTML = `<section class="card"><div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${esc(carName(v))}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
-    ${tabRow()}
-    <div class="tabbody"><a class="btn primary big logbtn" href="#/car/${id}/log">Log work</a>
-    <div class="visits">${d.entries.map(e => visitHtml(e)).join('') || '<p class="note">No visits logged yet. Tap Log work.</p>'}</div>
-    <div class="row"><a class="btn" href="#/car/${id}/history">Full screen</a></div></div></section>`;
-  document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; car(id); });
-  wireVisits(d.entries, () => car(id));
-}
 async function logPage(id) {
   const live = fresh();
   const [d, v] = await Promise.all([api(`/vehicles/${id}/service`), api(`/vehicles/${id}?peek=1`)]);
   if (!live()) return;
-  if (!cart || cart.car !== +id) cart = { car: +id, items: new Map(), date: todayStr(), mileage: '', editId: null, keep: null };
+  if (!cart || cart.car !== +id) cart = cartLoad(id) || { car: +id, items: new Map(), date: todayStr(), mileage: '', editId: null, keep: null };
   crumb('Log work');
   // Ultrareview F5: the items shown are the ones the car offers now, plus (in an edit) the visit's own items that it no longer offers.
   // An item in the cart that is in neither list is named on the screen, never dropped without a word.
@@ -944,26 +1181,40 @@ async function logPage(id) {
         <ul>${sel.map(({ it, c }) => `<li>${itemLine({ name: it.name, option: c.option || '', other_text: c.other || '' })}</li>`).join('') || '<li class="note">No items yet. Tap an item above.</li>'}</ul></div>
       ${lost.length ? `<div class="warn" id="cartlost"><b>Left out:</b> ${esc(lost.join(', '))}. This car does not offer ${lost.length === 1 ? 'it' : 'them'} now, so ${lost.length === 1 ? 'it is' : 'they are'} not in this visit.</div>` : ''}
       <div id="cartwarn"></div>
-      <button class="primary big submit" id="csubmit" ${ready ? '' : 'disabled'}>${cart.editId ? 'Save visit' : 'Submit'}</button><p class="err" id="cerr"></p></section>`;
+      <button class="primary big submit" id="csubmit" ${ready ? '' : 'disabled'}>${cart.editId ? 'Save visit' : navigator.onLine ? 'Submit' : "Not sent - I'll send it when you're back online"}</button><p class="err" id="cerr"></p></section>`;
+    cartSave();
     document.querySelectorAll('[data-item]').forEach(b => b.onclick = () => { const k = +b.dataset.item; if (cart.items.has(k)) cart.items.delete(k); else cart.items.set(k, { option: '', other: '' }); draw(); });
     document.querySelectorAll('[data-opt]').forEach(b => b.onclick = () => { cart.items.get(+b.dataset.opt).option = b.dataset.v; draw(); });
     const readyNow = () => sel.length > 0 && /^\d+$/.test(cart.mileage) && sel.every(({ it, c }) => (!it.choices || c.option) && (!it.text || (c.other || '').trim()));
-    document.querySelectorAll('[data-other]').forEach(i => i.oninput = () => { cart.items.get(+i.dataset.other).other = i.value; $('#csubmit').disabled = !readyNow(); });
-    $('#cdate').onchange = e => { cart.date = e.target.value || todayStr(); $('#sumline').innerHTML = sumLine(); };
-    $('#cmiles').oninput = e => { cart.mileage = e.target.value.replace(/\D/g, ''); e.target.value = cart.mileage; $('#sumline').innerHTML = sumLine(); $('#csubmit').disabled = !readyNow(); };
+    document.querySelectorAll('[data-other]').forEach(i => i.oninput = () => { cart.items.get(+i.dataset.other).other = i.value; $('#csubmit').disabled = !readyNow(); cartSave(); });
+    $('#cdate').onchange = e => { cart.date = e.target.value || todayStr(); $('#sumline').innerHTML = sumLine(); cartSave(); };
+    $('#cmiles').oninput = e => { cart.mileage = e.target.value.replace(/\D/g, ''); e.target.value = cart.mileage; $('#sumline').innerHTML = sumLine(); $('#csubmit').disabled = !readyNow(); cartSave(); };
+    // The 409 answer (the mileage does not fit the visits before and after): one message and a button that sends again with force=1.
+    const showNeed = j => {
+      const nb = x => x ? `${esc(x.date)} at ${miles(x.mileage)} mi` : 'none';
+      $('#cartwarn').innerHTML = `<div class="warn bad"><b>Check the mileage.</b> The visit before is ${nb(j.before)}. The visit after is ${nb(j.after)}. <button class="primary" id="forcego">Yes, that is right</button></div>`;
+      $('#forcego').onclick = () => go(true);
+    };
     const send = async force => {
       const body = { date: cart.date, mileage: +cart.mileage, force: force ? 1 : 0, items: sel.map(({ it, c }) => ({ item_id: it.id, option: c.option || '', other_text: c.other || '' })) };
-      const r = await fetch(cart.editId ? '/api/service/' + cart.editId : `/api/vehicles/${id}/service`, { method: cart.editId ? 'PATCH' : 'POST', headers: { 'content-type': 'application/json', 'x-lp-device': device }, body: JSON.stringify(body) });
-      const j = await r.json().catch(() => ({ error: 'Bad response from server' }));
-      if (r.status === 409 && j.confirm_needed) {
-        const nb = x => x ? `${esc(x.date)} at ${miles(x.mileage)} mi` : 'none';
-        $('#cartwarn').innerHTML = `<div class="warn bad"><b>Check the mileage.</b> The visit before is ${nb(j.before)}. The visit after is ${nb(j.after)}. <button class="primary" id="forcego">Yes, that is right</button></div>`;
-        $('#forcego').onclick = () => go(true);
-        return;
+      // Offline: a new visit is kept as a draft and goes out when the connection is back. An edit needs the connection.
+      const keepDraft = () => { writeDrafts([...readDrafts(), { car: +id, body, at: Date.now() }]); cartDrop(); location.hash = '#/car/' + id; };
+      if (!navigator.onLine) {
+        if (cart.editId) { $('#cerr').textContent = 'Saving a change to a visit needs a connection.'; return; }
+        return keepDraft();
       }
+      let r;
+      try { r = await fetch(cart.editId ? '/api/service/' + cart.editId : `/api/vehicles/${id}/service`, { method: cart.editId ? 'PATCH' : 'POST', headers: { 'content-type': 'application/json', 'x-lp-device': device }, body: JSON.stringify(body) }); }
+      catch (e) {   // Wi-Fi without internet: navigator.onLine is true and the send fails. A new visit is kept as a draft.
+        if (cart.editId) { $('#cerr').textContent = 'Saving a change to a visit needs a connection.'; return; }
+        return keepDraft();
+      }
+      const j = await r.json().catch(() => ({ error: 'Bad response from server' }));
+      if (r.status === 409 && j.confirm_needed) { showNeed(j); return; }
       if (!r.ok) { $('#cerr').textContent = j.error || 'HTTP ' + r.status; return; }
-      cart = null; nextTab = 'service'; location.hash = '#/car/' + id;
+      cartDrop(); location.hash = '#/car/' + id;
     };
+    if (cart.need) { const j = cart.need; cart.need = null; if (j.confirm_needed) showNeed(j); else $('#cerr').textContent = j.error || 'The visit was not sent.'; }
     // One tap sends one visit: Submit and "Yes, that is right" are both off while any request runs, POST or PATCH (a double tap would
     // log the visit twice; ultrareview F4). busy also stops a second tap that comes before the button is drawn as off.
     const go = force => {
@@ -981,6 +1232,7 @@ async function historyPage(id) {
   const [es, cars] = await Promise.all([api('/service' + (id ? '?car=' + id : '')), api('/vehicles?hidden=1')]);
   if (!live()) return;
   crumb('Service history');
+  flagLow(es);
   const owners = [...new Set(es.map(e => e.owner).filter(Boolean))];
   $('#view').innerHTML = `<section class="card historypage"><div class="carhead"><a class="btn" href="${id ? '#/car/' + id : '#/'}">Back</a><div><h2>Service history</h2><div class="src">${id ? '' : 'All cars'}</div></div></div>
     ${id ? '' : `<div class="row nonprint"><div class="field"><label for="fcar">Car</label><select id="fcar"><option value="">All cars</option>${cars.map(c => `<option value="${c.id}">${esc(carName(c))}</option>`).join('')}</select></div>
@@ -1005,7 +1257,7 @@ function leaveAsk(to) {
   d.innerHTML = `<div class="card"><h2>Leave without saving?</h2><p>The visit in the cart is not saved.</p><div class="row"><button class="primary big" id="lstay">Stay</button><button class="big" id="lgo">Leave and lose the cart</button></div></div>`;
   document.body.appendChild(d);
   $('#lstay').onclick = () => d.remove();
-  $('#lgo').onclick = () => { d.remove(); cart = null; location.hash = to; };
+  $('#lgo').onclick = () => { d.remove(); cartDrop(); location.hash = to; };
 }
 document.addEventListener('click', e => {
   const a = e.target.closest('a[href^="#"]');
@@ -1015,17 +1267,18 @@ document.addEventListener('click', e => {
 addEventListener('beforeunload', e => { if (cartDirty(location.hash)) { e.preventDefault(); e.returnValue = ''; } });
 // Suggestion 8: after 10 minutes with no touch the screen goes back to Home. It waits while a cart or an editor is open.
 const IDLE_MS = Number(store.get('lp-idle-ms')) || 600000;
-let idleT;
+let idleT, routing = 0, updatedApp = false;   // routing: screens that are still loading (the idle timer waits for them); updatedApp: a new version took over (see the end of the file)
 // Ultrareview F1: an editor is open = the cart, an open <details> (add a value, Edit car; not the lookup links), or a form that is not inside
 // a closed <details> (a value editor in its card, the door-jamb form). The add-value form is always in a car page inside its closed <details>,
 // so "#view form" alone matched on every car tab and the screen never went back to Home.
-const editorOpen = () => !!document.querySelector('.cartpage, #view details[open]:not(.links)') ||[...document.querySelectorAll('#view form')].some(f => !f.closest('details:not([open])'));
+const editorOpen = () => !!document.querySelector('.cartpage, #view details[open]:not(.links), #drawerwrap details[open]:not(.links)') ||[...document.querySelectorAll('#view form, #drawerwrap form')].some(f => !f.closest('details:not([open])'));
 function armIdle() {
   clearTimeout(idleT);
   idleT = setTimeout(() => {
+    if (updatedApp && !routing && !editorOpen() && !cartDirty(location.hash)) { location.reload(); return; }   // a kiosk page never reloads by itself
     if ((location.hash || '#/') === '#/') return armIdle();
-    if (editorOpen()) return armIdle();
-    cart = null; location.hash = '#/';
+    if (routing || editorOpen()) return armIdle();
+    cart = null; location.hash = '#/';   // lp-cart stays: the cart comes back when Log work is opened again
   }, IDLE_MS);
 }
 ['pointerdown', 'keydown', 'touchstart'].forEach(ev => addEventListener(ev, armIdle, { passive: true }));
@@ -1035,7 +1288,10 @@ armIdle();
 async function route() {
   const h = location.hash || '#/';
   const seq = ++routeSeq;
+  armIdle();     // opening a screen counts as a touch: the idle timer of the screen before must not send Rick Home from a screen that is still loading
+  sendDraft();   // a visit kept offline goes out as soon as there is a connection and no open cart
   $('#hnav').innerHTML = '';   // the home screen fills it
+  routing++;
   try {
     if (!device) pickDevice();
     else if (h === '#/add') add();
@@ -1045,23 +1301,59 @@ async function route() {
     else if (h === '#/history') await historyPage(0);
     else if (/^#\/car\/\d+\/history$/.test(h)) await historyPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/log$/.test(h)) await logPage(h.split('/')[2]);
+    else if (/^#\/car\/\d+\/lift$/.test(h)) await liftPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/page$/.test(h)) await viewer(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb$/.test(h)) await jamb(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb\/[0-9TZ-]+\.(jpg|png|webp)$/.test(h)) await jambRead(h.split('/')[2], h.split('/')[4]);
     else if (h.startsWith('#/car/')) await car(h.slice(6));
     else await home();
   } catch (e) { if (seq === routeSeq) fail(e); }   // a screen Rick already left must not draw its error over the new one ("Car not found" over Home, 2026-10-28)
+  finally { routing--; }
 }
-let nextTab = null;   // a screen that sends Rick back to a car can name the tab to open
 let holdHash = false;
 addEventListener('hashchange', e => {
   const from = new URL(e.oldURL).hash || '#/', to = location.hash || '#/';
   if (holdHash) { holdHash = false; return; }
   // The browser's Back button leaves the cart through the hash too: put the hash back and ask.
   if (cartDirty(from) && !/\/log$/.test(to)) { holdHash = true; location.hash = from; leaveAsk(to); return; }
-  if (to === '#/apps' && from !== '#/apps') { appsBack = from; appsTab = tab; }   // remember where Apps was opened
-  else if (from === '#/apps' && to === appsBack && appsTab) nextTab = appsTab;     // Back opens the same car tab
-  tab = nextTab || 'lift'; nextTab = null; route();
+  if (to === '#/apps' && from !== '#/apps') appsBack = from;   // remember where Apps was opened
+  closeDrawer(); route();
 });
+addEventListener('online', () => { setOffline(false); sendDraft(); });
+addEventListener('offline', () => setOffline(true));
+if (!navigator.onLine) setOffline(true);
+// HANDOFF 19 (D6): a visit kept as a draft while offline goes out through the normal server checks when the connection is back.
+// A refusal (409 mileage order, 400) opens the cart again with the draft and the normal message. Nothing is dropped without a word.
+let sendingDraft = false;
+async function sendDraft() {
+  // One run at a time (the start-up call and an online event can come together). The draft leaves the list BEFORE the send and goes back when the send
+  // does not reach the server, so a visit is never sent twice. Not while a cart is open: that cart would be replaced.
+  if (sendingDraft || !navigator.onLine || cartDirty(location.hash)) return;
+  const list = readDrafts(); if (!list.length) return;
+  sendingDraft = true;
+  try {
+    const d = list[0]; writeDrafts(list.slice(1));
+    const r = await fetch(`/api/vehicles/${d.car}/service`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-lp-device': device }, body: JSON.stringify(d.body) }).catch(() => null);
+    if (!r) { writeDrafts([d, ...readDrafts()]); return; }   // still no connection: the draft stays
+    const j = await r.json().catch(() => ({ error: 'Bad response from server' }));
+    if (r.ok) { if (/^#\/car\/\d+$/.test(location.hash)) route(); }
+    else {
+      cart = { car: d.car, items: new Map(d.body.items.map(i => [i.item_id, { option: i.option, other: i.other_text }])), date: d.body.date, mileage: String(d.body.mileage), editId: null, keep: null, need: j };
+      location.hash = `#/car/${d.car}/log`;
+    }
+  } finally { sendingDraft = false; }
+  if (readDrafts().length && navigator.onLine) sendDraft();
+}
+sendDraft();
 route();
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+  // Rick 2026-10-29 (the tablet kept the page of the old version after the deploy): a page that was opened under a worker is old when a new worker takes
+  // control. It reloads at once when nothing is open (no cart, no editor), else at the next idle check. The worker is also asked for an update every hour,
+  // so a kiosk page that is never reloaded still finds a new version. (The first load has no worker in control: then Home starts the background save.)
+  const had = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('/sw.js').then(reg => setInterval(() => reg.update().catch(() => {}), 3600e3)).catch(() => {});
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (had) { updatedApp = true; if (!routing && !editorOpen() && !cartDirty(location.hash)) location.reload(); return; }
+    if ((location.hash || '#/') === '#/') route();
+  });
+}

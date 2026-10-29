@@ -17,31 +17,44 @@
 *{box-sizing:border-box}
 [hidden]{display:none!important}   /* a display rule (e.g. .field grid) must never show a hidden element */
 html,body{margin:0}
-body{background:var(--bg);color:var(--ink);font:17px/1.45 var(--body);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:max(16px,env(safe-area-inset-top,0px)) 40px}
-@media (min-width:900px){body{font-size:20px;padding-left:max(40px,env(safe-area-inset-left,0px));padding-right:max(40px,env(safe-area-inset-right,0px))}}
-.wrap{max-width:1280px;margin:0 auto;display:grid;gap:20px}
-#view{display:grid;gap:24px;min-width:0}
-header{display:flex;align-items:center;gap:12px 18px;flex-wrap:wrap;border-bottom:4px solid var(--accent);padding-bottom:12px}
-/* HANDOFF 18 (C9): header style H2. Stripe chip flush left, italic Barlow Condensed 700 wordmark; 64 px tall on the lift screen, 56 px on the phone. */
+body{background:var(--bg);color:var(--ink);font:17px/1.45 var(--body);margin:0;padding:0}
+@media (min-width:900px){body{font-size:20px}}
+#view{display:grid;grid-template-columns:minmax(0,1fr);gap:24px;min-width:0;max-width:1280px;margin:0 auto;padding:12px max(14px,env(safe-area-inset-left,0px)) 40px}
+/* HANDOFF 19 (D4): the header is 56 px on the tablet, 52 px on the phone, one row; its buttons are 48 px (the boards), everything else is 64 / 48. */
+header{display:flex;align-items:center;gap:12px;height:56px;padding:0 max(16px,env(safe-area-inset-left,0px));border-bottom:3px solid var(--accent);background:#101110}
+@media (max-width:560px){header{height:52px;padding:0 12px;gap:8px}header h1{font-size:1.5rem}header .btn{padding:0 8px;font-size:.9rem;letter-spacing:0}header .homebtn{padding:0 8px}.brand{gap:6px}}
+header .btn{min-height:48px;height:48px;padding:0 16px}
+header .sub{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+header .sub .trim,.carline .trim{color:var(--muted);font-weight:400}
+.carline{display:none}
+/* HANDOFF 18 (C9): header style H2. Stripe chip flush left, italic Barlow Condensed 700 wordmark. */
 /* the font itself is in fonts.css (self-hosted, a data URI) */
-.brand{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:12px;height:56px;background:#121314}
-@media (min-width:900px){.brand{height:64px}}
+.brand{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:12px;height:100%;background:#121314}
 .logomark{height:100%;width:auto;aspect-ratio:1;flex:none}
 header h1{font:italic 700 2.2rem/1 "Barlow Condensed","Arial Narrow",Arial,sans-serif;letter-spacing:.04em;text-transform:uppercase;margin:0;color:#F2B824;display:inline-flex;gap:.12em;padding-right:6px}
 @media (min-width:900px){header h1{font-size:2.6rem}}
 header .sub{color:var(--muted)}
-.hnav{margin-left:auto;display:flex;gap:12px;flex-wrap:wrap}
+.hnav{display:flex;gap:8px}
+.hnav:empty{display:none}
+header .sub+.hnav,header .hnav{margin-left:auto}
+.homebtn{margin-left:0}
+header .hnav:empty+.homebtn{margin-left:auto}
 /* HANDOFF 6: the Apps button (header, every screen) and the Apps screen tiles */
 .appsbtn{gap:10px;padding:0 16px}
 .appsbtn svg{width:22px;height:22px;fill:currentColor;flex:none}
 .apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;margin-top:20px}
 .apptile{justify-items:center;align-content:center;text-align:center;min-height:180px}
 .apptile svg{width:64px;height:64px;fill:var(--accent)}
-/* Phone: Apps on the first line beside the name, the screen name under it, then the screen's own
-   buttons (the Apps button must not take a row of its own) */
-@media (max-width:560px){.appsbtn{order:1;margin-left:auto}header .sub{order:2;flex-basis:100%}.hnav{order:3}}
+/* Phone (HANDOFF 19, D4): one header row (logo, the screen's button, Home). Apps is a button in the Home row; the car name is one line under the banner. */
+@media (max-width:560px){header .appsbtn,header .sub{display:none}.carline{display:block;padding:8px 14px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:1.05rem}.phoneonly{display:inline-flex!important}}
+.phoneonly{display:none}
 .count{display:inline-block;background:var(--accent);color:var(--accent-ink);border-radius:99px;padding:0 12px;margin-left:10px;font-family:var(--mono)}
-.net{font:600 .85rem var(--display);letter-spacing:.06em;text-transform:uppercase;color:var(--warn)}
+/* HANDOFF 19 (D6): the offline banner, 36 px, under the header on every page */
+.net{height:36px;display:flex;align-items:center;gap:10px;padding:0 16px;background:#2b2416;color:var(--accent);font:600 15px var(--body);border-bottom:1px solid var(--warn)}
+.net:not([hidden])::before{content:"";width:10px;height:10px;border-radius:50%;background:var(--accent);flex:none}
+.offlinewhy{display:none}
+body.offline .offlinewhy{display:block}
+body.offline .needsnet{opacity:.4;pointer-events:none}   /* scans and confirming are online only */
 h2{font:700 1.9rem/1.1 var(--display);margin:0;text-wrap:balance}
 h3{margin:0}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,480px);gap:28px;align-items:start}
@@ -100,9 +113,6 @@ label.btn{cursor:pointer}
 .src{font:500 .85rem var(--mono);color:var(--muted)}
 .carhead{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .carhead h2{font-size:2.1rem;line-height:1}
-.tabs{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px;border-bottom:2px solid var(--line)}
-.tabs button{border:none;border-bottom:6px solid transparent;border-radius:0;min-height:calc(var(--tap) + 4px);padding:0 6px;margin-bottom:-2px;color:var(--muted);font-size:1.15rem;min-width:0}
-@media (min-width:900px){.tabs button{font-size:1.4rem}}.tabs button[aria-selected="true"]{border-bottom-color:var(--accent);color:var(--ink)}
 dl{margin:0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:14px 20px}
 @media (max-width:560px){dl{grid-template-columns:minmax(0,1fr)}}
 dt{font:600 .9rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding-top:12px}
@@ -151,11 +161,6 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .crow .meta{font-size:.9rem;color:var(--muted)}
 .crow .acts{display:flex;gap:10px}
 @media (max-width:700px){.crow{grid-template-columns:minmax(0,1fr)}.crow .acts{display:grid;grid-template-columns:1fr 1fr}}
-/* Visiting car, first look (T4): Lift, Torque and Tires side by side */
-.first{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
-@media (max-width:860px){.first{grid-template-columns:minmax(0,1fr)}}
-.first section{background:var(--panel2);border:2px solid var(--line);border-radius:12px;padding:16px;display:grid;gap:8px;align-content:start}
-.first h3{font:700 1.4rem var(--display);text-transform:uppercase}
 /* Typical value for the make (Handoff 3 step 4): always marked Low and "not confirmed", never
    the car's value; after the car's own values it is a small comparison line. */
 .typical{border:2px dashed var(--line2);border-radius:10px;padding:14px 16px;display:grid;gap:6px}
@@ -173,17 +178,8 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .links summary,details summary{cursor:pointer;min-height:var(--tap);display:flex;align-items:center}
 /* Lift tab page panel and the page viewer (Handoff 3 step 2, storyboard T2 and T3). The page is
    always on its paper colour; the box is the accent, 4 px at any zoom (--s is the viewer scale). */
-.liftgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,460px);gap:28px;align-items:start}
-@media (max-width:860px){.liftgrid{grid-template-columns:minmax(0,1fr)}}
 .tabbody{display:grid;gap:16px;min-width:0}
-.pagecard{display:grid;gap:10px;text-decoration:none;color:inherit}
-.pageimg{position:relative;display:block;width:100%;background:#e9e6dd;border-radius:10px;overflow:hidden}
-.pageimg img{display:block;width:100%;height:100%;object-fit:contain}
-/* On the lift screen the whole page and "Use chart" fit on the screen: the page takes its height
-   from the screen and its width from its own shape, so the chart box stays on the chart. */
-@media (min-width:900px){.pageimg{height:calc(100vh - 430px);min-height:300px;width:auto;max-width:100%;margin:0 auto}}
 .pbox{position:absolute;border:4px solid var(--accent);border-radius:6px;background:rgb(242 181 29 / .12);pointer-events:none}
-.usechart{display:flex;align-items:center;justify-content:center;text-align:center;min-height:var(--tap);padding:8px 16px;border-radius:10px;background:var(--accent);color:var(--accent-ink);font:700 1.4rem/1.15 var(--display);letter-spacing:.04em;text-transform:uppercase}
 .viewer{position:fixed;inset:0;z-index:50;background:#0b0d0c;color:#eef1ee;display:grid;grid-template-rows:auto minmax(0,1fr)}
 .vbar{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;padding:12px max(16px,env(safe-area-inset-left,0px));background:#0b0d0c;border-bottom:2px solid #333a37}
 .vtitle{font:700 1.8rem/1.1 var(--display)}
@@ -203,13 +199,12 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 
 /* HANDOFF 15: Home button in the header (every page), value cards that open on a tap, the three-number line, the Service tab and the cart. */
-.homebtn{padding:0 22px}   /* HANDOFF 18 (C9) asks for at least 52 px (lift) and 48x44 (phone); the standard button size (64 / 48) is larger, so it stays */
+.homebtn{padding:0 22px}
 .vacts{display:none}
-.vcard.open .vacts{display:flex}
+.vcard.open .vacts,.drawer .vacts{display:flex}
 .vcard{cursor:pointer}
 .lastsvc{font:500 .85rem var(--mono)}
-.threeline{display:flex;flex-wrap:wrap;gap:8px 28px;font:600 1.15rem var(--mono);border:2px solid var(--line2);border-radius:10px;padding:10px 16px;background:var(--panel2)}
-.threeline b{font:600 .8rem var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:6px}
+.lowmi{color:var(--muted)}
 .chartq{border-left:4px solid var(--line2);padding-left:12px;color:var(--muted);font-style:italic}
 .rangeline,.cautionhidden,.hiddennote{color:var(--muted)}
 .tag{white-space:nowrap}
@@ -235,10 +230,9 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
   header h1{font-size:2rem}
   header{padding-bottom:8px;gap:8px 12px}
   .carhead h2{font-size:1.5rem}
-  .tabs{display:flex;overflow-x:auto;gap:12px;scrollbar-width:none}
-  .tabs button{flex:none;padding:0 14px;font-size:1.05rem}
   dd .src{display:none}
   dd.open .src{display:block}
+  .drawer dd .src{display:block}
   .homebtn{padding:0 14px}
 }
 /* HANDOFF 18: Admin page (C3), gear button, recalls line (C8), curb weight (C7). Level is always a word as well as a colour. */
@@ -248,6 +242,8 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .pill.lv-green{color:var(--hi);background:var(--hi-bg)}
 .pill.lv-amber{color:var(--warn);background:var(--warn-bg)}
 .pill.lv-red{color:var(--lo);background:var(--lo-bg)}
+.pill.lv-info{color:var(--muted);background:var(--pill-bg)}
+.aitem.lv-info{border-left-color:var(--line2)}
 .alist{list-style:none;margin:0;padding:0;display:grid;gap:10px}
 .aitem{display:grid;gap:2px;border-left:6px solid var(--line2);padding:6px 0 6px 12px;overflow-wrap:anywhere}
 .aitem.lv-green{border-left-color:var(--hi)} .aitem.lv-amber{border-left-color:var(--warn)} .aitem.lv-red{border-left-color:var(--lo)}
@@ -270,3 +266,102 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .badges .pill,#missing .pill{margin-left:0}
 .jphoto.thumb img{display:block;max-width:100%;max-height:220px;border-radius:8px;border:2px solid var(--line2)}
 .crow .toggle{margin-top:6px}
+
+/* HANDOFF 19, direction A: the car screen (boards Main, A2-A6). 1024x640: header 56, banner 36 when offline, 12 px padding. */
+.err:empty{display:none}
+#view a.tile,#view a.panel,#view a.caut,#view a.cautmain{color:var(--ink)}   /* the link colour rule above is more specific than a class */
+.t48{min-height:48px;height:48px}
+.btn.amber{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+#view:has(.carscreen){padding-bottom:12px;max-width:none}
+.btn.big.logwork{min-height:64px;height:64px}
+header .brand{min-height:48px}
+header .btn{white-space:nowrap}
+.caut.row{flex-wrap:nowrap}
+.tsmall{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.carscreen{width:100%;min-width:0}
+.needs>a.src{display:flex;align-items:center;min-height:var(--tap)}
+.homerow{display:flex;gap:12px;flex-wrap:wrap}
+.homerow .btn{min-height:var(--tap)}
+@media (max-width:560px){.homerow{display:grid;grid-template-columns:1fr 1fr}.cars{grid-template-columns:minmax(0,1fr)}}
+.badges{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.badges .pill,.tile .pill{margin-left:0;vertical-align:baseline}
+.mono{font-family:var(--mono)}
+.carscreen{--netH:0px;display:flex;gap:12px;height:calc(100vh - 56px - 24px - var(--netH));min-height:0}
+body.offline .carscreen{--netH:36px}
+.leftcol,.liftleft{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-width:0;min-height:0}
+.rightcol{display:flex;flex-direction:column;gap:10px;width:300px;flex:none;min-height:0}
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:10px;flex:1 1 auto;min-height:0}
+.tile{display:flex;flex-direction:column;gap:6px;align-items:stretch;justify-content:flex-start;text-align:left;text-transform:none;letter-spacing:0;font:inherit;color:var(--ink);background:var(--panel);border:2px solid var(--line);border-radius:14px;padding:14px 16px;min-height:64px;min-width:0;overflow:hidden;text-decoration:none;cursor:pointer}
+.tile .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.tile .lbl{white-space:nowrap}
+.tbig{font:600 44px/1.05 var(--mono);overflow-wrap:anywhere}
+.tsmall{font:500 22px/1.2 var(--mono);color:var(--muted);overflow-wrap:anywhere}
+.tile[data-key="lift"] .tbig{font-size:36px}
+.tile[data-key="lift"] .tsmall{font:400 16px/1.25 var(--body)}
+.clamp2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.caut{display:flex;align-items:center;gap:12px;min-height:56px;max-height:64px;padding:0 12px 0 14px;background:var(--warn-bg);border:2px solid var(--warn);border-radius:12px;color:var(--ink);text-decoration:none;flex:none}
+.caut.block{background:var(--lo-bg);border-color:var(--lo)}
+.caut .cautmain{display:flex;align-items:center;gap:12px;flex:1 1 auto;min-width:0;color:inherit;text-decoration:none}
+.caut .cauttitle{font:800 15px var(--display);letter-spacing:1px;text-transform:uppercase;white-space:nowrap}
+.caut.block .cauttitle,.caut.block .cautsum{font-size:22px}
+.cautsum{font-size:17px;flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.caut .ic{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.caut .pill{margin-left:0}
+.ibtn{display:inline-flex;align-items:center;justify-content:center;width:48px;min-width:48px;height:48px;min-height:48px;padding:0;border-radius:50%;font:700 20px var(--mono);text-transform:none;letter-spacing:0;color:var(--muted);flex:none}
+.panel{background:var(--panel);border:2px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:4px;color:var(--ink);text-decoration:none;min-width:0}
+.panel.needs{border-color:var(--warn)}
+.panel.needs>.lbl{color:var(--accent)}
+.needrow{display:flex;align-items:center;gap:10px;justify-content:space-between}
+.needrow button{min-height:48px;height:48px}
+.logwork{width:100%}
+.notsent{color:var(--warn);font-size:.9rem}
+.recallline{background:none;border:0;min-height:var(--tap);justify-content:flex-start;text-align:left;text-transform:none;letter-spacing:0;font:400 14px var(--body);color:var(--muted);padding:0 4px}
+.editcarbtn{margin-top:auto}
+@media (max-width:899px){
+  .carscreen{display:flex;flex-direction:column;height:auto}
+  .rightcol{width:auto;flex:none}
+  .tiles{grid-template-columns:minmax(0,1fr);grid-template-rows:none}
+  .tbig{font-size:36px}
+  .tile{min-height:var(--tap)}
+  .btn.big.logwork{order:9;position:sticky;bottom:8px;min-height:52px;height:52px}
+}
+/* the drawer (D2): 440 px from the right, a bottom sheet on the phone */
+.drawerwrap{position:fixed;inset:0;z-index:40}
+.dimmer{position:absolute;inset:0;background:rgb(0 0 0 / .45)}
+.drawer{position:absolute;top:0;right:0;bottom:0;width:440px;max-width:100%;background:var(--panel2);border-left:3px solid var(--accent);padding:16px 20px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;box-shadow:-20px 0 40px rgb(0 0 0 / .55)}
+@media (max-width:899px){.drawer{top:auto;left:0;width:auto;max-height:88vh;border-left:0;border-top:3px solid var(--accent);box-shadow:0 -20px 40px rgb(0 0 0 / .55)}}
+.dhead{justify-content:space-between;flex:none}
+.dhead button{min-height:48px;height:48px}
+.dtitle{color:var(--accent)}
+.dbig{font:600 56px/1 var(--mono);overflow-wrap:anywhere}
+.dsmall{font:500 26px/1.15 var(--mono);color:var(--muted);overflow-wrap:anywhere}
+.drawer dl{grid-template-columns:minmax(0,1fr);gap:6px}
+.drawer dt{padding-top:6px}
+.drawer .form{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}
+.drawer .form .field:has(input[name=source]),.drawer .form .field:has(input[name=note]),.drawer .form .field:has(input[name=value]),.drawer .form>.row,.drawer .form>.toggle,.drawer .form>.err{grid-column:1/-1}
+.drawer input[name=source]{text-overflow:ellipsis;white-space:nowrap}
+.drawer .form>.row:last-of-type{position:sticky;bottom:-16px;background:var(--panel2);padding:8px 0}
+.dacts{flex:none}
+.rangenote{color:var(--muted)}
+/* the Lift screen (D3): 560 px of cautions and points on the left, the chart on the right */
+.liftleft{width:560px;flex:none}
+.liftright{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-width:0;min-height:0}
+.liftleft .caut{display:block;max-height:none;padding:14px 16px}
+.liftleft .caut .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.liftleft .caut .badges{margin-left:auto}
+.cautfull{font-size:20px;line-height:1.3;margin-top:8px}
+.pointspanel{flex:1 1 auto;min-height:0;overflow:auto}
+.pointspanel .row{display:flex;align-items:center;gap:10px}
+.pointspanel .badges{margin-left:auto}
+.v28{font:600 28px/1.25 var(--mono)}
+.chartline{gap:14px;flex:none}
+.grow{flex:1 1 auto}
+.t64{min-height:64px}
+.chartbox{background:#ece9e2;border-radius:10px;color:#333;padding:10px;display:flex;flex-direction:column;gap:6px;flex:1 1 auto;min-height:0}
+.chartbox .src{color:#555}
+.lzstage{flex:1 1 auto;min-height:0;background:#e9e6dd;border:3px solid var(--accent);border-radius:6px;position:relative}
+@media (max-width:899px){
+  .liftscreen{flex-direction:column}
+  .liftleft{width:auto}
+  .lzstage{height:60vh;flex:none}
+}

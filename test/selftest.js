@@ -631,6 +631,19 @@ if (hasProc) {
     ok((await call(`/api/jobs/${job2}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest' } })).s === 200, 'fail');
     ok((await call(`/api/vehicles/${car}?peek=1`)).d.jobs.find(j => j.id === job2)?.status === 'failed', 'not failed');
   });
+  // HANDOFF 19 (Rick 2026-10-29): the self-test fails jobs on purpose; they must not stay as failed jobs (the Admin page turned PROBLEM from them).
+  // The self-test token removes failed jobs whose error text starts with "selftest"; the processor token and a real failed job are left alone.
+  await t('fail: failed test jobs are removed again (tool token only; the processor is refused; a real failure stays)', async () => {
+    const mk = async () => (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'tires', field: 'Size' }] } })).d.id;
+    const failIt = async (id, error) => { ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: id } })).d.id === id, 'claim ' + id); ok((await call(`/api/jobs/${id}/fail`, { as: 'proc', method: 'POST', body: { error } })).s === 200, 'fail ' + id); };
+    // A failed job with a real-looking error is made in local mode only: it could not be removed again on live.
+    const mine = await mk(), real = LOCAL ? await mk() : null; await failIt(mine, 'selftest cleanup'); if (real) await failIt(real, 'HTTP 429 rate limit');
+    ok((await call('/api/jobs/selftest', { as: 'proc', method: 'DELETE' })).s === 403, 'the processor token may remove jobs');
+    const r = await call('/api/jobs/selftest', { method: 'DELETE' }); ok(r.s === 200 && r.d.removed >= 1, 'tool token: ' + r.s + ' ' + JSON.stringify(r.d));
+    const jobs = (await call(`/api/vehicles/${car}?peek=1`)).d.jobs;
+    ok(!jobs.some(j => j.id === mine), 'the failed test job is still there'); if (real) ok(jobs.some(j => j.id === real && j.status === 'failed'), 'a real failed job was removed');
+    return `removed ${r.d.removed}`;
+  });
   // HANDOFF 13 (Rick): the server refuses High on a safety field from the processor unless the source cites a page ("p.").
   await t('result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise', async () => {
     const job3 = (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } })).d.id;
@@ -1284,9 +1297,19 @@ if (health.schema >= '0013') {
         if (!bi || bi.level !== 'red' || !/without its lines/.test(bi.reason) || big.overall !== 'red') b.push('a too large health row: ' + JSON.stringify(bi) + ' ' + big.overall);
         if (it('n100_report')) b.push('a fresh report is called old');
         await push([{ ts: now, kind: 'd1_usage', level: 'amber', text: 'D1', data: { day: 'x', databases: [{ name: 'liftpad', rows_written: 55000, rows_read: 100 }] } }]);
-        s = await lv(); let w = s.d1.items.find(i => /rows_written/.test(i.name)); if (!w || w.level !== 'amber' || !/55,000 rows written today of 100,000 free \(55%\)/.test(w.reason)) b.push('d1 55%: ' + JSON.stringify(w));
+        // HANDOFF 19 (Rick 2026-10-29): free plan = levels against the free daily limits; Workers Paid (LP_D1_PLAN=paid) = the free-limit % is grey info and the
+        // colour is the share of the monthly included amounts (so 55,000 and 85,000 rows written today are "info" and the month line stays green).
+        const PAID = process.env.LP_D1_PLAN === 'paid';
+        s = await lv(); let w = s.d1.items.find(i => /rows_written$/.test(i.name));
+        if (PAID) {
+          if (s.d1.plan !== 'paid') b.push('plan: ' + s.d1.plan);
+          if (!w || w.level !== 'info' || !/55,000 rows written today = 55% of the old free daily limit \(info only on Workers Paid\)/.test(w.reason)) b.push('d1 55% paid: ' + JSON.stringify(w));
+          const mo = s.d1.items.find(i => /rows_written_month$/.test(i.name)); if (!mo || mo.level !== 'green' || !/of 50,000,000 included/.test(mo.reason)) b.push('d1 month paid: ' + JSON.stringify(mo));
+        } else if (!w || w.level !== 'amber' || !/55,000 rows written today of 100,000 free \(55%\)/.test(w.reason)) b.push('d1 55%: ' + JSON.stringify(w));
         await push([{ ts: now, kind: 'd1_usage', level: 'red', text: 'D1', data: { day: 'x', databases: [{ name: 'liftpad', rows_written: 85000, rows_read: 100 }] } }]);
-        s = await lv(); w = s.d1.items.find(i => /rows_written/.test(i.name)); if (!w || w.level !== 'red') b.push('d1 85%: ' + JSON.stringify(w));
+        s = await lv(); w = s.d1.items.find(i => /rows_written$/.test(i.name));
+        if (PAID) { if (!w || w.level !== 'info') b.push('d1 85% paid is not grey info: ' + JSON.stringify(w)); if (s.d1.items.some(i => i.level === 'red' || i.level === 'amber')) b.push('a paid D1 line is coloured at 85% of the free limit: ' + JSON.stringify(s.d1.items.filter(i => i.level !== 'info' && i.level !== 'green').map(i => i.name))); }
+        else if (!w || w.level !== 'red') b.push('d1 85%: ' + JSON.stringify(w));
         // a failed job: 429 and a timeout, in words; the secret in the error text is not shown
         const c = await mkCar(); const ids = [];
         for (const err of ['HTTP 429 rate_limit_error ' + FAKE_KEY, 'timed out after 120 s']) {
@@ -1377,6 +1400,8 @@ await t('cleanup: temp values (history kept) and temp car removed', async () => 
   if (valId) { const h = (await tc(`/api/values/${valId}/history`)).d; chk(Array.isArray(h) && h.length && h[h.length - 1].action === 'delete', 'no delete history row'); }
   else chk(false, 'no value id (the value check failed): history not checked');
   if (car) { const s = (await tc('/api/vehicles/' + car, { method: 'DELETE' })).s; chk(s === 200, 'delete car ' + s); chk((await tc('/api/vehicles/' + car)).s === 404, 'car still there'); }
+  // HANDOFF 19: the jobs the run failed on purpose go too, so the Admin page shows no PROBLEM from test jobs (HANDOFF 18 C3 counts failed jobs of the last 24 hours).
+  { const sw = await tc('/api/jobs/selftest', { method: 'DELETE' }); chk(sw.s === 200, 'remove the failed test jobs ' + sw.s); const sw2 = await tc('/api/jobs/selftest', { method: 'DELETE' }); chk(sw2.s === 200 && sw2.d.removed === 0, 'a failed test job is left: ' + JSON.stringify(sw2.d)); }
   ok(!bad2.length, bad2.join('; '));
 });
 await t('sweep after the run: no SELFTEST car is left', async () => { const r = await sweep(); ok(!r.bad.length && r.still === 0, `${r.bad.join('; ')} still ${r.still}`); return `${r.n} removed by the sweep`; });

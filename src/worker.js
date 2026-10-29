@@ -1,7 +1,7 @@
 // LiftPad API. Every request comes here first (run_worker_first); paths outside /api/ go to the
 // static app in /public (Workers Assets).
 import { lookupLinks } from './links.js';
-import { vinCheckDigit, feItems, feVariants, matchFeOption, canadianTrims, engineMatches, parseDoorcardRead, feRowFresh, VIN_SHAPE, scrubText, parseRecalls, pickWeight, maskVin, scrubDeep } from './lib.js';
+import { vinCheckDigit, feItems, feVariants, matchFeOption, canadianTrims, engineMatches, parseDoorcardRead, feRowFresh, VIN_SHAPE, scrubText, parseRecalls, pickWeight, maskVin, scrubDeep, d1Lines, d1IsPaid, d1Month } from './lib.js';
 // Cloudflare Access sits in front of the whole hostname. This code adds one check of its own:
 // processor routes (and the test clock) need the Access JWT of a service token on an allow-list.
 // Values: one row per value in `vals`; every change writes a `history` row in the same D1 batch.
@@ -662,7 +662,6 @@ async function curbDecision(env, v, b, me) {
 // the self-test tool and any service token get 403. Secrets are scrubbed again here before the insert; a VIN is masked to its last 4.
 const OPS_KINDS = ['queue', 'worker_run', 'health', 'backup', 'token_check', 'export', 'd1_usage'], OPS_LEVELS = ['green', 'amber', 'red'];
 const OPS_KEEP_DAYS = 30, OPS_PUSH_MAX = 60, OPS_DATA_MAX = 6000;
-const D1_FREE = { rows_written: 100000, rows_read: 5000000 };
 const NY = 'America/New_York';
 // Rick's own Access login: an e-mail, no service token. LP_ADMIN_EMAILS (optional, comma list) narrows it to those addresses; unset = every
 // address that the Access policy lets in (the policy is the first gate).
@@ -715,17 +714,12 @@ const latestOps = async (env, kind) => {
   try { r.data = r.data_json ? JSON.parse(r.data_json) : null; } catch (e) { r.data = null; }
   delete r.data_json; return r;
 };
-// The D1 line: today's rows_written and rows_read per database against the free limits (50% amber, 80% red; Kuma alerts at 50%).
-function d1Lines(row, nowMs) {
-  if (!row || !row.data || !Array.isArray(row.data.databases)) return [{ name: 'd1_usage', level: 'amber', reason: 'No D1 usage report has arrived yet.' }];
-  const age = (nowMs - Date.parse(row.ts)) / 3600e3, out = [];
-  for (const d of row.data.databases.slice(0, 6)) for (const k of ['rows_written', 'rows_read']) {
-    const n = Number(d[k]), pct = Math.round(100 * n / D1_FREE[k]);
-    out.push({ name: `d1_${String(d.name).replace(/[^\w-]/g, '').slice(0, 30)}_${k}`, level: pct >= 80 ? 'red' : pct >= 50 ? 'amber' : 'green',
-      reason: `${d.name}: ${Number.isFinite(n) ? n.toLocaleString('en-US') : '?'} ${k.replace('_', ' ')} today of ${D1_FREE[k].toLocaleString('en-US')} free (${Number.isFinite(pct) ? pct : '?'}%).` });
-  }
-  if (age > 26) out.push({ name: 'd1_usage_age', level: 'amber', reason: `The D1 usage report is ${Math.round(age)} hours old.` });
-  return out;
+// The D1 lines are in lib.js (d1Lines): free limits by default, the monthly included amounts on Workers Paid (LP_D1_PLAN = "paid"). The month so far
+// is the last d1_usage report of each UTC day of this month, added up (at most 31 rows).
+async function d1MonthRows(env, nowMs) {
+  const start = new Date(nowMs).toISOString().slice(0, 8) + '01';
+  const rows = (await env.DB.prepare("SELECT data_json FROM ops_log WHERE id IN (SELECT max(id) FROM ops_log WHERE kind='d1_usage' AND ts >= ? GROUP BY substr(ts, 1, 10))").bind(start).all()).results;
+  return rows.map(r => { try { return JSON.parse(r.data_json); } catch (e) { return null; } }).filter(Boolean);
 }
 async function adminStatus(env, me, url, withLog) {
   const day = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('day') || '') ? url.searchParams.get('day') : nyDay(me.nowMs);
@@ -763,13 +757,16 @@ async function adminStatus(env, me, url, withLog) {
   const recent = (await env.DB.prepare("SELECT id, kind, result_summary, updated_at FROM jobs WHERE status='done' AND result_summary IS NOT NULL ORDER BY updated_at DESC LIMIT 5").all()).results
     .map(j => ({ id: j.id, kind: j.kind, at: j.updated_at, summary: scrubText(j.result_summary).slice(0, 200) }));
   const results = { level: 'green', reason: `${prop.v} proposed value${prop.v === 1 ? '' : 's'} and ${prop.p} proposed VIN${prop.p === 1 ? '' : 's'} wait in Needs confirming.`, proposed_values: prop.v, proposed_vins: prop.p, recent };
-  const d1items = d1Lines(d1, me.nowMs);
-  const all = [queue.level, workerRuns.level, ...items.map(i => i.level), ...d1items.map(i => i.level)];
-  const out = { now: me.now, day, kind, overall: worstOf(all), queue, worker_runs: workerRuns, results, n100: { as_of: health ? health.ts : null, items }, d1: { as_of: d1 ? d1.ts : null, items: d1items } };
+  const paid = d1IsPaid(env.LP_D1_PLAN);
+  const d1items = d1Lines(d1, me.nowMs, paid ? 'paid' : 'free', paid ? d1Month(await d1MonthRows(env, me.nowMs)) : {});
+  const all = [queue.level, workerRuns.level, ...items.map(i => i.level), ...d1items.map(i => i.level)];   // worstOf ignores the grey "info" lines
+  const out = { now: me.now, day, kind, overall: worstOf(all), queue, worker_runs: workerRuns, results, n100: { as_of: health ? health.ts : null, items }, d1: { as_of: d1 ? d1.ts : null, plan: paid ? 'paid' : 'free', items: d1items } };
   if (withLog) {
     const s = nyStart(day), e = nyStart(nyDay(s + 36 * 3600e3));
     out.log = (await env.DB.prepare(`SELECT id, ts, kind, level, text FROM ops_log WHERE ts >= ? AND ts < ? ${kind ? 'AND kind = ?' : "AND kind <> 'health'"} ORDER BY ts DESC, id DESC LIMIT 200`)
       .bind(...[new Date(s).toISOString(), new Date(e).toISOString(), ...(kind ? [kind] : [])]).all()).results;
+    // On Workers Paid the D1 usage lines of the log are grey info too (the N100 writes them against the free limits for the Kuma alert).
+    if (paid) out.log.forEach(l => { if (l.kind === 'd1_usage') l.level = 'info'; });
   }
   return out;
 }
@@ -1397,6 +1394,13 @@ const app = {
         const wanted = Array.isArray(b.fields) && b.fields.length ? b.fields.map(f => ({ tab: String(f.tab || ''), field: String(f.field || '') })) : await missingFields(env, v);
         if (!wanted.length) return bad('Nothing to research: every field has a value');
         return json({ ok: true, id: await queueJob(env, v, kind, wanted, me) }, 201);
+      }
+      // HANDOFF 19: the self-test fails jobs on purpose and removes them again, so the Admin page shows no PROBLEM from test jobs. Only the self-test tool
+      // token (never the processor, never a browser login) and only FAILED jobs whose error text starts with "selftest". The processor allowlist refuses it first.
+      if (p === '/api/jobs/selftest' && m === 'DELETE') {
+        if (!me.tool || me.processor) return bad('This route is for the self-test tool token only', 403);
+        const gone = (await env.DB.prepare("DELETE FROM jobs WHERE status='failed' AND error LIKE 'selftest%' RETURNING id").all()).results;
+        return json({ ok: true, removed: gone.length });
       }
       if (p.startsWith('/api/jobs/') && !me.processor) return bad('Processor only. This route needs the processor service token.', 403);
       if (p === '/api/jobs/claim' && m === 'POST') {
