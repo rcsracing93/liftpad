@@ -1,8 +1,8 @@
 // Network first. If the network fails, use the last saved copy, so lookups work in the garage without Wi-Fi.
 // /api/ is never answered with the app page (Handoff 3 step 0, 2026-10-17): a typed /api/ address
 // is not handled here at all, and a failed /api/ fetch gets its saved JSON copy or a JSON error.
-const C = 'liftpad-v4';
-const SHELL = ['/', '/index.html', '/app.js', '/app.css', '/manifest.webmanifest', '/icon.svg'];
+const C = 'liftpad-v5';
+const SHELL = ['/', '/index.html', '/app.js', '/app.css', '/manifest.webmanifest', '/icon.svg', '/fonts.css'];
 const offline = async (hit) => { const h = new Headers(hit.headers); h.set('x-liftpad-cache', 'offline'); return new Response(await hit.blob(), { status: hit.status, headers: h }); };
 self.addEventListener('install', e => e.waitUntil(caches.open(C).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== C).map(k => caches.delete(k)))).then(() => self.clients.claim())));

@@ -1,7 +1,7 @@
 // LiftPad API. Every request comes here first (run_worker_first); paths outside /api/ go to the
 // static app in /public (Workers Assets).
 import { lookupLinks } from './links.js';
-import { vinCheckDigit, feItems, feVariants, matchFeOption, canadianTrims, engineMatches, parseDoorcardRead, feRowFresh, VIN_SHAPE } from './lib.js';
+import { vinCheckDigit, feItems, feVariants, matchFeOption, canadianTrims, engineMatches, parseDoorcardRead, feRowFresh, VIN_SHAPE, scrubText, parseRecalls, pickWeight, maskVin, scrubDeep } from './lib.js';
 // Cloudflare Access sits in front of the whole hostname. This code adds one check of its own:
 // processor routes (and the test clock) need the Access JWT of a service token on an allow-list.
 // Values: one row per value in `vals`; every change writes a `history` row in the same D1 batch.
@@ -31,7 +31,9 @@ const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
 // the caller (checked in the route). ALI page images (/api/ali/...) are not in this list, so they stay 403.
 const PROC_ROUTES = [
   ['GET', /^\/api\/(whoami|tabs|vehicles|needs-confirming|service-log\.csv)$/], ['GET', /^\/api\/vehicles\/\d+$/], ['GET', /^\/api\/photos\/\d+\/[0-9TZ-]+\.(?:jpg|png|webp)$/],
-  ['POST', /^\/api\/vehicles\/\d+\/values$/], ['POST', /^\/api\/jobs\/claim$/], ['POST', /^\/api\/jobs\/\d+\/(result|renew|fail)$/]];
+  ['POST', /^\/api\/vehicles\/\d+\/values$/], ['POST', /^\/api\/jobs\/claim$/], ['POST', /^\/api\/jobs\/\d+\/(result|renew|fail)$/],
+  // HANDOFF 18 (C1): the N100 pushes the ops log. Only this POST; every GET under /api/admin/ is Rick's own login (checked in the route).
+  ['POST', /^\/api\/admin\/log$/]];
 
 // ---------- Identity: Access JWT (Cf-Access-Jwt-Assertion), RS256, keys from the team certs URL ----------
 let jwks = null, jwksAt = 0;
@@ -297,6 +299,8 @@ async function vehicle(env, id, me, touch) {
   // Opus review finding 8: the summary of a photo read says whether the car has a saved VIN ("VIN matches / differs / read"): not for the processor.
   if (me.processor) v.jobs.forEach(j => { if (j.kind === 'read_doorcard') j.result_summary = null; });
   v.hidden = hidden(v, me.nowMs); v.mine = v.grp === 'mine' ? 1 : 0;
+  // HANDOFF 18 (C7, C8): the cached recalls answer and the curb weight; facts_due tells the app to post /facts once the page is drawn.
+  if (!me.processor) { const cf = await carFacts(env, v, me.nowMs); v.recalls = cf.recalls; v.curb = cf.curb; v.weight_error = cf.weight_error; v.facts_due = cf.due; }
   v.no_vin = !v.vin; v.no_doorcard = !placardFields(v.values).size;   // HANDOFF 17 (B10), computed
   return v;
 }
@@ -556,6 +560,220 @@ async function trimNames(env, year, make, model) {
   } catch (e) { /* NHTSA down (503 is common): the list has the LiftPad names only */ }
   return out;
 }
+// ---------- Recalls and curb weight (HANDOFF 18, C7, C8) ----------
+// Once a day per car, never through the research model, and only after the car page is on screen (the app posts /api/vehicles/<id>/facts).
+// Recalls: NHTSA recallsByVehicle has no per-VIN "open" status, so the line says "N recalls for this model year". When the car has a saved VIN,
+// the model name comes from the NHTSA VIN decode (Rick 2026-10-28: the full VIN may go to NHTSA); if that fails, the car's own year, make and
+// model are used. A good answer is kept 20 hours; a failed try is repeated after 1 hour; the old answer stays when a try fails.
+const FACTS_OK_MS = 20 * 3600e3, FACTS_RETRY_MS = 3600e3;
+const fresh2 = (ok, tr, nowMs) => (ok && nowMs - Date.parse(ok) < FACTS_OK_MS) || (tr && nowMs - Date.parse(tr) < FACTS_RETRY_MS);
+async function nhtsaJson(url) {
+  const r = await fetch(url, { headers: { accept: 'application/json' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+async function recallNames(env, v) {
+  const out = [];
+  if (v.vin && VIN_SHAPE.test(String(v.vin).toUpperCase())) {
+    try {
+      const d = (await nhtsaJson(`${env.NHTSA}/DecodeVinValues/${String(v.vin).toUpperCase()}?format=json`)).Results[0];
+      if (d && d.Make && d.Model && parseInt(d.ModelYear, 10)) out.push({ make: d.Make, model: d.Model, year: parseInt(d.ModelYear, 10), by: 'vin' });
+    } catch (e) { /* the decode failed: the car's own names are used */ }
+  }
+  const nm = (await env.DB.prepare('SELECT nhtsa_name FROM makes WHERE name=?').bind(v.make).first() || {}).nhtsa_name || v.make;
+  out.push({ make: nm, model: v.model, year: v.year, by: 'saved' });
+  return out;
+}
+async function refreshRecalls(env, v, f, me) {
+  if (fresh2(f && f.recalls_ok_at, f && f.recalls_try_at, me.nowMs)) return;
+  let hit = null, empty = null;
+  for (const c of await recallNames(env, v)) {
+    try {
+      const items = parseRecalls(await nhtsaJson(`${env.RECALLS}/recallsByVehicle?make=${encodeURIComponent(c.make)}&model=${encodeURIComponent(c.model)}&modelYear=${c.year}`));
+      if (items && items.length) { hit = { ...c, items }; break; }
+      if (items && !empty) empty = { ...c, items };   // an empty list from one spelling is kept, but the next name is tried before "0 recalls" is shown
+    } catch (e) { /* try the next name (the i4 answers HTTP 400 for some names) */ }
+  }
+  if (!hit) hit = empty;
+  if (hit) {
+    await env.DB.prepare(`INSERT INTO car_facts(vehicle_id, recalls_json, recalls_count, recalls_by, recalls_model, recalls_ok_at, recalls_try_at, recalls_error) VALUES(?,?,?,?,?,?,?,NULL)
+      ON CONFLICT(vehicle_id) DO UPDATE SET recalls_json=excluded.recalls_json, recalls_count=excluded.recalls_count, recalls_by=excluded.recalls_by, recalls_model=excluded.recalls_model,
+      recalls_ok_at=excluded.recalls_ok_at, recalls_try_at=excluded.recalls_try_at, recalls_error=NULL`)
+      .bind(v.id, JSON.stringify(hit.items), hit.items.length, hit.by, `${hit.year} ${hit.make} ${hit.model}`.slice(0, 80), me.now, me.now).run();
+  } else {
+    await env.DB.prepare(`INSERT INTO car_facts(vehicle_id, recalls_try_at, recalls_error) VALUES(?,?,?)
+      ON CONFLICT(vehicle_id) DO UPDATE SET recalls_try_at=excluded.recalls_try_at, recalls_error=excluded.recalls_error`).bind(v.id, me.now, 'NHTSA did not give a recalls answer').run();
+  }
+}
+// Curb weight from the Canadian specs: a PROPOSED value. A confirmed value is never replaced (the UPDATE says so, not only the check).
+async function refreshWeight(env, v, f, me) {
+  if (v.curb_status === 'confirmed') return;
+  if (fresh2(v.curb_at, f && f.weight_try_at, me.nowMs)) return;
+  let err = '';
+  try {
+    const nm = (await env.DB.prepare('SELECT nhtsa_name FROM makes WHERE name=?').bind(v.make).first() || {}).nhtsa_name || v.make;
+    const w = pickWeight(canadianTrims(await nhtsaJson(`${env.NHTSA}/GetCanadianVehicleSpecifications/?Year=${v.year}&Make=${encodeURIComponent(nm)}&Model=${encodeURIComponent(v.model)}&units=&format=json`)), v.trim);
+    if (w) {
+      await env.DB.prepare("UPDATE vehicles SET curb_lb=?, curb_front_pct=?, curb_source=?, curb_status='proposed', curb_at=? WHERE id=? AND curb_status IS NOT 'confirmed'").bind(w.lb, w.front_pct, w.source, me.now, v.id).run();
+      await env.DB.prepare(`INSERT INTO car_facts(vehicle_id, weight_try_at, weight_error) VALUES(?,?,NULL) ON CONFLICT(vehicle_id) DO UPDATE SET weight_try_at=excluded.weight_try_at, weight_error=NULL`).bind(v.id, me.now).run();
+      return;
+    }
+    err = 'No Canadian weight found for this car';
+  } catch (e) { err = 'NHTSA did not give a weight answer'; }
+  await env.DB.prepare(`INSERT INTO car_facts(vehicle_id, weight_try_at, weight_error) VALUES(?,?,?) ON CONFLICT(vehicle_id) DO UPDATE SET weight_try_at=excluded.weight_try_at, weight_error=excluded.weight_error`).bind(v.id, me.now, err).run();
+}
+async function carFacts(env, v, nowMs = Date.now()) {
+  const f = await env.DB.prepare('SELECT * FROM car_facts WHERE vehicle_id=?').bind(v.id).first();
+  let items = []; try { items = f && f.recalls_json ? JSON.parse(f.recalls_json) : []; } catch (e) { items = []; }
+  return {
+    due: !fresh2(f && f.recalls_ok_at, f && f.recalls_try_at, nowMs) || (v.curb_status !== 'confirmed' && !fresh2(v.curb_at, f && f.weight_try_at, nowMs)),
+    recalls: f && f.recalls_ok_at ? { count: f.recalls_count, by: f.recalls_by, model: f.recalls_model, as_of: f.recalls_ok_at, items, error: f.recalls_error || null } : (f && f.recalls_error ? { count: null, error: f.recalls_error, items: [] } : null),
+    curb: v.curb_lb ? { lb: v.curb_lb, front_pct: v.curb_front_pct, source: v.curb_source, status: v.curb_status, at: v.curb_at } : null,
+    weight_error: f && f.weight_error || null,
+  };
+}
+async function refreshFacts(env, v, me) {
+  let f = await env.DB.prepare('SELECT * FROM car_facts WHERE vehicle_id=?').bind(v.id).first();
+  await refreshRecalls(env, v, f, me);
+  f = await env.DB.prepare('SELECT * FROM car_facts WHERE vehicle_id=?').bind(v.id).first();
+  await refreshWeight(env, v, f, me);
+  return carFacts(env, await vehicleRow(env, v.id));
+}
+// Rick types or confirms the weight. { action: 'confirm', lb?, front_pct? } keeps the proposed numbers or replaces them with his; { action: 'clear' } removes it.
+async function curbDecision(env, v, b, me) {
+  if (b.action === 'clear') {
+    await env.DB.prepare('UPDATE vehicles SET curb_lb=NULL, curb_front_pct=NULL, curb_source=NULL, curb_status=NULL, curb_at=NULL WHERE id=?').bind(v.id).run();
+    return json({ ok: true, curb: null });
+  }
+  if (b.action !== 'confirm') return bad('action is confirm or clear');
+  const typed = b.lb !== undefined && b.lb !== null && b.lb !== '';
+  const lb = typed ? Number(b.lb) : v.curb_lb;
+  if (!Number.isInteger(lb) || lb < 500 || lb > 20000) return bad('The curb weight is a whole number of pounds from 500 to 20000');
+  let fp = b.front_pct === undefined ? v.curb_front_pct : (b.front_pct === null || b.front_pct === '' ? null : Number(b.front_pct));
+  if (fp !== null && fp !== undefined && (!Number.isInteger(fp) || fp < 20 || fp > 80)) return bad('The front share is a whole percent from 20 to 80');
+  if (!typed && !v.curb_lb) return bad('There is no proposed weight to confirm');
+  await env.DB.prepare("UPDATE vehicles SET curb_lb=?, curb_front_pct=?, curb_source=?, curb_status='confirmed', curb_at=? WHERE id=?")
+    .bind(lb, fp ?? null, typed ? 'Typed by Rick' : v.curb_source, me.now, v.id).run();
+  return json({ ok: true, curb: (await carFacts(env, await vehicleRow(env, v.id))).curb });
+}
+
+// ---------- Admin page (HANDOFF 18, C1 to C5, C10) ----------
+// ops_log rows come from the N100 (POST /api/admin/log, processor token). The page itself is Rick's own Access login only: the processor,
+// the self-test tool and any service token get 403. Secrets are scrubbed again here before the insert; a VIN is masked to its last 4.
+const OPS_KINDS = ['queue', 'worker_run', 'health', 'backup', 'token_check', 'export', 'd1_usage'], OPS_LEVELS = ['green', 'amber', 'red'];
+const OPS_KEEP_DAYS = 30, OPS_PUSH_MAX = 60, OPS_DATA_MAX = 6000;
+const D1_FREE = { rows_written: 100000, rows_read: 5000000 };
+const NY = 'America/New_York';
+// Rick's own Access login: an e-mail, no service token. LP_ADMIN_EMAILS (optional, comma list) narrows it to those addresses; unset = every
+// address that the Access policy lets in (the policy is the first gate).
+const rickOnly = (me, env) => { const a = list(env && env.LP_ADMIN_EMAILS).map(x => x.toLowerCase()); return !!me.email && !me.token && (!a.length || a.includes(me.email.toLowerCase())); };
+const worstOf = ls => ls.includes('red') ? 'red' : ls.includes('amber') ? 'amber' : 'green';
+const nyDay = ms => new Intl.DateTimeFormat('en-CA', { timeZone: NY }).format(new Date(ms));
+// UTC start of a New York calendar day (the offset is 4 or 5 hours), and the start of the next one.
+function nyStart(day) {
+  const [y, m, d] = day.split('-').map(Number);
+  for (const off of [4, 5]) { const s = Date.UTC(y, m - 1, d, off); if (nyDay(s) === day && nyDay(s - 1) !== day) return s; }
+  return Date.UTC(y, m - 1, d);
+}
+// A job error in words (Rick 2026-10-26: "error text in words").
+function errorWords(e) {
+  const t = String(e || '');
+  if (/daily_limit/i.test(t)) return 'The daily job limit was reached.';
+  if (/\b429\b|rate.?limit/i.test(t)) return 'The Claude API was busy (error 429). The job can be tried again.';
+  if (/\b529\b|overload/i.test(t)) return 'The Claude API was overloaded (error 529).';
+  if (/time.?out|timed out|ETIMEDOUT/i.test(t)) return 'The Claude API did not answer in time (timeout).';
+  if (/\b401\b|\b403\b|unauthor|forbidden|invalid.*key/i.test(t)) return 'The Claude API key or the service token was refused.';
+  if (/worker broke/i.test(t)) return 'The research worker stopped with an error.';
+  return scrubText(t).slice(0, 160) || 'No error text.';
+}
+async function adminLogPush(env, b, me) {
+  const rows = Array.isArray(b.rows) ? b.rows : [];
+  if (rows.length > OPS_PUSH_MAX) return bad(`At most ${OPS_PUSH_MAX} rows in one push`);
+  const extra = list(env.LP_SCRUB_WORDS), stmts = [];
+  for (const r of rows) {
+    if (!r || !OPS_KINDS.includes(r.kind) || !OPS_LEVELS.includes(r.level)) return bad('A row has an unknown kind or level');
+    const t = Date.parse(r.ts), ts = Number.isFinite(t) && Math.abs(t - me.nowMs) < 2 * 864e5 ? new Date(t).toISOString() : me.now;
+    // scrubbed string by string (the structure stays valid JSON); a data field over the limit is dropped and the row says so
+    let data = r.data === undefined || r.data === null ? null : JSON.stringify(scrubDeep(r.data, extra));
+    let dropped = false;
+    if (data !== null && data.length > OPS_DATA_MAX) { data = null; dropped = true; }
+    stmts.push(env.DB.prepare('INSERT INTO ops_log(ts, kind, level, text, data_json) VALUES(?,?,?,?,?)').bind(ts, r.kind, r.level, (scrubText(r.text, extra) + (dropped ? ' (details too large, not kept)' : '')).slice(0, 500), data));
+  }
+  let pruned = 0;
+  if (b.prune) {
+    // the real clock, never the test clock (a processor request with a future x-lp-now must not be able to empty the log)
+    const cut = new Date(Date.now() - OPS_KEEP_DAYS * 864e5).toISOString();
+    const p = await env.DB.prepare('DELETE FROM ops_log WHERE ts < ?').bind(cut).run();
+    pruned = p.meta && p.meta.changes || 0;
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return json({ ok: true, inserted: stmts.length, pruned });
+}
+const latestOps = async (env, kind) => {
+  const r = await env.DB.prepare('SELECT ts, level, text, data_json FROM ops_log WHERE kind=? ORDER BY ts DESC, id DESC LIMIT 1').bind(kind).first();
+  if (!r) return null;
+  try { r.data = r.data_json ? JSON.parse(r.data_json) : null; } catch (e) { r.data = null; }
+  delete r.data_json; return r;
+};
+// The D1 line: today's rows_written and rows_read per database against the free limits (50% amber, 80% red; Kuma alerts at 50%).
+function d1Lines(row, nowMs) {
+  if (!row || !row.data || !Array.isArray(row.data.databases)) return [{ name: 'd1_usage', level: 'amber', reason: 'No D1 usage report has arrived yet.' }];
+  const age = (nowMs - Date.parse(row.ts)) / 3600e3, out = [];
+  for (const d of row.data.databases.slice(0, 6)) for (const k of ['rows_written', 'rows_read']) {
+    const n = Number(d[k]), pct = Math.round(100 * n / D1_FREE[k]);
+    out.push({ name: `d1_${String(d.name).replace(/[^\w-]/g, '').slice(0, 30)}_${k}`, level: pct >= 80 ? 'red' : pct >= 50 ? 'amber' : 'green',
+      reason: `${d.name}: ${Number.isFinite(n) ? n.toLocaleString('en-US') : '?'} ${k.replace('_', ' ')} today of ${D1_FREE[k].toLocaleString('en-US')} free (${Number.isFinite(pct) ? pct : '?'}%).` });
+  }
+  if (age > 26) out.push({ name: 'd1_usage_age', level: 'amber', reason: `The D1 usage report is ${Math.round(age)} hours old.` });
+  return out;
+}
+async function adminStatus(env, me, url, withLog) {
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('day') || '') ? url.searchParams.get('day') : nyDay(me.nowMs);
+  const kind = OPS_KINDS.includes(url.searchParams.get('kind')) ? url.searchParams.get('kind') : '';
+  // Queue: live from the jobs table.
+  const cnt = {}; (await env.DB.prepare('SELECT status, count(*) n FROM jobs GROUP BY status').all()).results.forEach(r => { cnt[r.status] = r.n; });
+  const oldest = await env.DB.prepare("SELECT min(created_at) t FROM jobs WHERE status='queued'").first();
+  const waitMin = oldest && oldest.t ? Math.round((me.nowMs - Date.parse(oldest.t)) / 60e3) : 0;
+  const failed = (await env.DB.prepare("SELECT id, kind, attempts, error, updated_at FROM jobs WHERE status='failed' AND updated_at > ? ORDER BY updated_at DESC LIMIT 8").bind(new Date(me.nowMs - 7 * 864e5).toISOString()).all()).results
+    .map(j => ({ id: j.id, kind: j.kind, attempts: j.attempts, at: j.updated_at, why: errorWords(j.error) }));
+  const failed24 = failed.filter(j => Date.parse(j.at) > me.nowMs - 864e5).length;
+  const expired = (await env.DB.prepare("SELECT count(*) n FROM jobs WHERE status='claimed' AND lease_until < ?").bind(me.now).first()).n;
+  const qLevel = waitMin > 120 || failed24 >= 3 ? 'red' : waitMin > 30 || failed24 > 0 || expired > 0 ? 'amber' : 'green';
+  const qReason = qLevel === 'green' ? `Queue is clear: ${cnt.queued || 0} waiting, ${cnt.claimed || 0} running.`
+    : [waitMin > 30 ? `The oldest waiting job is ${waitMin} minutes old.` : '', failed24 ? `${failed24} job${failed24 === 1 ? '' : 's'} failed in the last 24 hours.` : '', expired ? `${expired} running job${expired === 1 ? ' has' : 's have'} lost its lease.` : ''].filter(Boolean).join(' ');
+  const queue = { level: qLevel, reason: qReason, counts: { queued: cnt.queued || 0, claimed: cnt.claimed || 0, done: cnt.done || 0, failed: cnt.failed || 0 }, oldest_wait_min: waitMin, failed };
+  // Worker runs: the last pushed run, and the cost lines from the health report.
+  const health = await latestOps(env, 'health'), run = await latestOps(env, 'worker_run'), d1 = await latestOps(env, 'd1_usage');
+  const hAge = health ? (me.nowMs - Date.parse(health.ts)) / 3600e3 : null;
+  // The N100 sends each item flat: { name, level, reason, ...extra facts }. A nested "data" object is accepted too. The extra facts are the item's data.
+  let items = health && health.data && Array.isArray(health.data.items) ? health.data.items.map(i => {
+    const { name, level, reason, data, ...rest } = i || {};
+    return { name: String(name).slice(0, 40), level: OPS_LEVELS.includes(level) ? level : 'amber', reason: scrubText(reason).slice(0, 200), data: data || (Object.keys(rest).length ? rest : undefined) };
+  }) : [];
+  if (health && !items.length) items = [{ name: 'n100_report', level: health.level, reason: `The health report came without its lines (too large or damaged). ${health.text}`.slice(0, 200) }];
+  if (!health) items = [{ name: 'n100_report', level: 'red', reason: 'No health report has arrived from the N100 yet.' }];
+  else if (hAge > 1) items.unshift({ name: 'n100_report', level: hAge > 3 ? 'red' : 'amber', reason: `The N100 health report is ${hAge.toFixed(1)} hours old. The collector may have stopped.` });
+  const cost = items.find(i => i.name === 'research_cost');
+  const costOut = cost ? { today_usd: cost.data && cost.data.today_usd, month_usd: cost.data && cost.data.month_usd, daily_cap_usd: cost.data && cost.data.daily_cap_usd } : null;
+  const runItem = items.find(i => i.name === 'research_worker_run');
+  const workerRuns = { level: worstOf([runItem ? runItem.level : 'amber', cost ? cost.level : 'green']), reason: runItem ? runItem.reason : 'No research worker line in the health report.',
+    last_run: run ? { ts: run.ts, level: run.level, text: run.text, data: run.data } : null, cost: costOut };
+  // Results: what research and door-card reads proposed (the work is in Needs confirming).
+  const prop = await env.DB.prepare("SELECT (SELECT count(*) FROM vals WHERE status='proposed') v, (SELECT count(*) FROM photo_reads WHERE status='proposed') p").first();
+  const recent = (await env.DB.prepare("SELECT id, kind, result_summary, updated_at FROM jobs WHERE status='done' AND result_summary IS NOT NULL ORDER BY updated_at DESC LIMIT 5").all()).results
+    .map(j => ({ id: j.id, kind: j.kind, at: j.updated_at, summary: scrubText(j.result_summary).slice(0, 200) }));
+  const results = { level: 'green', reason: `${prop.v} proposed value${prop.v === 1 ? '' : 's'} and ${prop.p} proposed VIN${prop.p === 1 ? '' : 's'} wait in Needs confirming.`, proposed_values: prop.v, proposed_vins: prop.p, recent };
+  const d1items = d1Lines(d1, me.nowMs);
+  const all = [queue.level, workerRuns.level, ...items.map(i => i.level), ...d1items.map(i => i.level)];
+  const out = { now: me.now, day, kind, overall: worstOf(all), queue, worker_runs: workerRuns, results, n100: { as_of: health ? health.ts : null, items }, d1: { as_of: d1 ? d1.ts : null, items: d1items } };
+  if (withLog) {
+    const s = nyStart(day), e = nyStart(nyDay(s + 36 * 3600e3));
+    out.log = (await env.DB.prepare(`SELECT id, ts, kind, level, text FROM ops_log WHERE ts >= ? AND ts < ? ${kind ? 'AND kind = ?' : "AND kind <> 'health'"} ORDER BY ts DESC, id DESC LIMIT 200`)
+      .bind(...[new Date(s).toISOString(), new Date(e).toISOString(), ...(kind ? [kind] : [])]).all()).results;
+  }
+  return out;
+}
+
 // How the VIN decode tells the fuel (the Oil tab and the service cart read vehicles.fuel).
 function fuelOf(d) {
   const el = d.ElectrificationLevel || '', fp = d.FuelTypePrimary || '';
@@ -835,6 +1053,17 @@ const app = {
       }
       if (p.startsWith('/api/ali/')) return bad('Not a page image address. Use /api/ali/<edition>/p<NNN>.jpg', 400);
       if (p === '/api/whoami' && m === 'GET') return json({ email: me.email, token: me.token ? 'service token' : '', processor: me.processor, tool: me.tool, device: me.device, now: me.now });
+      // HANDOFF 18 (C1, C5): the ops log. The N100 pushes with the processor token; everything else under /api/admin/ is Rick's own login only.
+      if (p === '/api/admin/log' && m === 'POST') {
+        if (!me.processor) return bad('Only the processor token pushes the log', 403);
+        return adminLogPush(env, await req.json().catch(() => ({})), me);
+      }
+      if (p.startsWith('/api/admin/')) {
+        if (!rickOnly(me, env)) return bad('The Admin page is for Rick only', 403);
+        if (p === '/api/admin/status' && m === 'GET') return json(await adminStatus(env, me, url, true));
+        if (p === '/api/admin/dot' && m === 'GET') return json({ level: (await adminStatus(env, me, url, false)).overall });
+        return bad('Not found', 404);
+      }
       if (p === '/api/makes' && m === 'GET') return json(await makes(env, url.searchParams.get('q') || ''));
       if (p === '/api/models' && m === 'GET') {
         const make = url.searchParams.get('make'); const year = parseInt(url.searchParams.get('year'), 10);
@@ -1057,6 +1286,7 @@ const app = {
         // The service log goes with the car, but not silently: one history row per visit says it was deleted with the car.
         await env.DB.batch([env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM photo_reads WHERE vehicle_id=?').bind(+mm[1]),
+          env.DB.prepare('DELETE FROM car_facts WHERE vehicle_id=?').bind(+mm[1]),   // HANDOFF 18: the cached recalls go with the car
           env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim NOT LIKE 'SELFTEST%'").bind(me.now, me.device, +mm[1]),
           // A self-test car (trim starts with SELFTEST) leaves nothing behind: its visits and their history rows go (Rick 2026-10-27).
           env.DB.prepare("DELETE FROM service_log_history WHERE entry_id IN (SELECT e.id FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
@@ -1082,7 +1312,12 @@ const app = {
         const body = await req.arrayBuffer();
         if (!body.byteLength || body.byteLength > PHOTO_MAX) return bad(`A photo must be 1 byte to ${PHOTO_MAX / 1048576} MB`);
         const name = `${me.now.replace(/[:.]/g, '-')}.${ext}`, key = `photos/${v.id}/${name}`;
-        await env.BUCKET.put(key, body, { httpMetadata: { contentType: ct } });
+        // HANDOFF 18 (C0.1): an R2 put can fail once ("put: internal error (10001)"). Try once more; if it fails again, say so in plain words.
+        let stored = false;
+        for (let i = 0; i < 2 && !stored; i++) {
+          try { await env.BUCKET.put(key, body, { httpMetadata: { contentType: ct } }); stored = true; } catch (e) { stored = false; }
+        }
+        if (!stored) return bad('Upload failed - try again', 502);
         return json({ name, url: '/api/' + key, size: body.byteLength }, 201);
       }
       mm = p.match(/^\/api\/photos\/(\d+)\/([0-9TZ-]+\.(?:jpg|png|webp))$/);
@@ -1105,6 +1340,17 @@ const app = {
       if (mm && m === 'POST') {
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         return queueDoorcard(env, v, String((await req.json().catch(() => ({}))).photo || ''), me);
+      }
+      // HANDOFF 18 (C7, C8): refresh the recalls and the Canadian-specs weight of one car (at most once a day each); Rick confirms or types the weight.
+      mm = p.match(/^\/api\/vehicles\/(\d+)\/facts$/);
+      if (mm && m === 'POST') {
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        return json(await refreshFacts(env, v, me));
+      }
+      mm = p.match(/^\/api\/vehicles\/(\d+)\/weight$/);
+      if (mm && m === 'POST') {
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        return curbDecision(env, v, await req.json().catch(() => ({})), me);
       }
       mm = p.match(/^\/api\/vin-proposals\/(\d+)\/(confirm|reject)$/);
       if (mm && m === 'POST') return decideVinProposal(env, +mm[1], mm[2], await req.json().catch(() => ({})), me);

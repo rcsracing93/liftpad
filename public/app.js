@@ -82,10 +82,12 @@ let showHidden = false;
 // confirming (with its count) and + Car in the header.
 async function home() {
   const live = fresh();
-  const [cars, need] = await Promise.all([api('/vehicles' + (showHidden ? '?hidden=1' : '')), api('/needs-confirming')]);
+  // HANDOFF 18 (C3): the gear button shows only when the Admin page answers (Rick's own login); a red dot when anything is red.
+  const [cars, need, dot] = await Promise.all([api('/vehicles' + (showHidden ? '?hidden=1' : '')), api('/needs-confirming'), api('/admin/dot').catch(() => null)]);
   if (!live()) return;
   crumb(device);
-  $('#hnav').innerHTML = `<a class="btn" href="#/history">History</a><a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a><a class="btn primary" href="#/add">+ Car</a>`;
+  const gear = dot ? `<a class="btn gear" id="gearbtn" href="#/admin" aria-label="Admin${dot.level === 'red' ? ' - something is red' : ''}"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.4 7.4 0 0 0-1.7-1L14.9 3h-4l-.4 2.9a7.4 7.4 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.4 7.4 0 0 0 1.7 1l.4 2.9h4l.4-2.9a7.4 7.4 0 0 0 1.7-1l2.4 1 2-3.4zM12.9 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>Admin${dot.level === 'red' ? '<span class="reddot" role="img" aria-label="red"></span>' : ''}</a>` : '';
+  $('#hnav').innerHTML = `<a class="btn" href="#/history">History</a><a class="btn" href="#/confirm">Needs confirming<span class="count">${need.count}</span></a>${gear}<a class="btn primary" href="#/add">+ Car</a>`;
   // HANDOFF 10: Home shows only a block (warn = 2, an open problem). A caution (warn = 1) is on the Lift tab only.
   const status = c => c.nblock ? ['warn', 'Warning - see the Lift tab'] : c.nproposed ? ['todo', `${c.nproposed} value${c.nproposed === 1 ? '' : 's'} to confirm`]
     : c.nvals ? ['ok', 'All values confirmed'] : ['none', 'No values yet'];
@@ -100,9 +102,53 @@ async function home() {
     <section aria-label="Frequent" class="tabbody"><h2 class="lbl">Frequent</h2><div class="cars small">${g('frequent').map(tile).join('')}${g('frequent').length < 3 ? '<div class="empty">Mark a visitor Frequent to keep it here</div>' : ''}</div></section>
     <section aria-label="Visitors" class="tabbody"><h2 class="lbl">Visitors - hidden 30 days after the last visit</h2>
       <div class="chips">${g('visitor').map(c => `<a class="chip" href="#/car/${c.id}">${c.year} ${esc(c.make)} ${esc(c.model)}<span>${c.hidden ? 'hidden · ' : ''}${ago(c)}</span></a>`).join('') || '<div class="empty">No visitors</div>'}</div>
-      <label class="toggle"><input type="checkbox" id="showhid" ${showHidden ? 'checked' : ''}><span class="st"></span>Show hidden visitors (not seen for 30 days)</label></section>
-    <div class="row"><span class="src">This screen: ${esc(device)}</span><button class="ghost" id="rename">Change name</button></div>`;
-  $('#showhid').onchange = e => { showHidden = e.target.checked; home(); };
+      ${showHidden ? '<p class="note">Hidden visitors are shown. Turn this off on the Admin page.</p>' : ''}</section>
+    <div class="row"><span class="src">This screen: ${esc(device)}</span></div>`;
+}
+
+// ---------- Admin (HANDOFF 18, C3, C6) ----------
+// Rick's own login only (the Worker answers 403 to every other caller). Kuma stays the alerting; this page is where he looks for the why.
+let adminDay = '', adminKind = '';
+const LV = { green: 'OK', amber: 'Check', red: 'Problem' };
+const lvPill = l => `<span class="pill lv-${esc(l)}" style="margin-left:0">${LV[l] || esc(l)}</span>`;
+const ITEM_LABEL = { disk_root: 'Disk (N100)', disk_nas: 'Disk (NAS)', backup_file: 'Last backup', backup_nas_copy: 'NAS copy of the backup', backup_nas_mount: 'NAS backups share', backup_run: 'Backup job',
+  health_ping_run: 'Health ping job', token_check_run: 'Token check job', token_expiry: 'Token expiry', research_worker_run: 'Research worker', research_cost: 'Research cost',
+  service_log_export: 'Service log export', n100_report: 'N100 report' };
+const itemLabel = i => ITEM_LABEL[i.name] || String(i.name).replace(/^d1_/, 'D1 ').replace(/_/g, ' ');
+const aitem = i => `<li class="aitem lv-${esc(i.level)}">${lvPill(i.level)} <b>${esc(itemLabel(i))}</b><span class="areason">${esc(i.reason)}</span>${i.data && i.data.expires ? `<span class="areason src">Expires: ${Object.entries(i.data.expires).map(([k, d]) => `${esc(k.replace(/_/g, ' '))} ${esc(d)}`).join(', ')}</span>` : ''}</li>`;
+async function adminPage() {
+  const live = fresh();
+  let d;
+  try { d = await api('/admin/status?' + new URLSearchParams({ ...(adminDay ? { day: adminDay } : {}), ...(adminKind ? { kind: adminKind } : {}) })); }
+  catch (e) { if (!live()) return; crumb('Admin'); $('#view').innerHTML = `<section class="card"><h2>Admin</h2><p class="err">${esc(e.message)}</p><a class="btn" href="#/">Home</a></section>`; return; }
+  if (!live()) return;
+  crumb('Admin');
+  adminDay = d.day;
+  const q = d.queue, w = d.worker_runs, r = d.results;
+  const lr = w.last_run;
+  const money = n => n == null ? '-' : '$' + Number(n).toFixed(2);
+  const KINDS = ['queue', 'worker_run', 'health', 'backup', 'token_check', 'export', 'd1_usage'];
+  $('#view').innerHTML = `<div class="carhead"><a class="btn" href="#/">Home</a><div><h2>Admin ${lvPill(d.overall)}</h2><div class="src">As of ${esc(when(d.now))} UTC. Kuma sends the alerts. This page shows the reason.</div></div></div>
+    <section class="card" id="adm-queue" aria-label="Queue"><h3>Queue ${lvPill(q.level)}</h3><p>${esc(q.reason)}</p>
+      <p class="src">Waiting ${q.counts.queued} · running ${q.counts.claimed} · done ${q.counts.done} · failed ${q.counts.failed}${q.oldest_wait_min ? ` · oldest waiting ${q.oldest_wait_min} min` : ''}</p>
+      ${q.failed.length ? `<ul class="alist">${q.failed.map(j => `<li class="aitem lv-amber"><b>Job ${j.id} (${esc(j.kind)})</b><span class="areason">${esc(j.why)} Tries: ${j.attempts}. ${esc(when(j.at))}</span></li>`).join('')}</ul>` : ''}</section>
+    <section class="card" id="adm-worker" aria-label="Worker runs"><h3>Worker runs ${lvPill(w.level)}</h3><p>${esc(w.reason)}</p>
+      <p class="src">${lr ? `Last run ${esc(when(lr.ts))} UTC: ${esc(lr.text)}${lr.data && lr.data.duration_s != null ? ` · ${esc(lr.data.duration_s)} s` : ''}${lr.data && lr.data.calls != null ? ` · ${esc(lr.data.calls)} calls` : ''}` : 'No run has been pushed yet.'}</p>
+      <p class="src">Cost today ${money(w.cost && w.cost.today_usd)} of ${money(w.cost && w.cost.daily_cap_usd)} · this month ${money(w.cost && w.cost.month_usd)}</p></section>
+    <section class="card" id="adm-results" aria-label="Results"><h3>Results ${lvPill(r.level)}</h3><p>${esc(r.reason)}</p><a class="btn" href="#/confirm">Open Needs confirming</a>
+      ${r.recent.length ? `<ul class="alist">${r.recent.map(j => `<li class="aitem lv-green"><b>Job ${j.id} (${esc(j.kind)})</b><span class="areason">${esc(j.summary)}</span></li>`).join('')}</ul>` : ''}</section>
+    <section class="card" id="adm-n100" aria-label="N100 health"><h3>N100 health</h3><p class="src">${d.n100.as_of ? 'Report from ' + esc(when(d.n100.as_of)) + ' UTC' : 'No report yet'}</p><ul class="alist">${d.n100.items.map(aitem).join('')}</ul></section>
+    <section class="card" id="adm-d1" aria-label="D1 usage"><h3>D1 usage today</h3><p class="src">${d.d1.as_of ? 'Report from ' + esc(when(d.d1.as_of)) + ' UTC. Free limits: 100,000 rows written and 5,000,000 rows read a day.' : 'No report yet'}</p><ul class="alist">${d.d1.items.map(aitem).join('')}</ul></section>
+    <section class="card" id="adm-log" aria-label="Log"><h3>Log</h3>
+      <div class="row"><div class="field"><label for="admday">Day (New York)</label><input id="admday" type="date" value="${esc(d.day)}"></div>
+      <div class="field"><label for="admkind">Kind</label><select id="admkind"><option value="">all (no health lines)</option>${KINDS.map(k => `<option value="${k}" ${d.kind === k ? 'selected' : ''}>${k.replace('_', ' ')}</option>`).join('')}</select></div></div>
+      ${d.log.length ? `<ul class="alist">${d.log.map(l => `<li class="aitem lv-${esc(l.level)}">${lvPill(l.level)} <b>${esc(l.kind.replace('_', ' '))}</b><span class="areason">${esc(l.text)}</span><span class="areason src">${esc(when(l.ts))} UTC</span></li>`).join('')}</ul>` : '<div class="empty">No log lines for this day and kind</div>'}</section>
+    <section class="card" id="adm-settings" aria-label="Settings"><h3>This screen</h3>
+      <div class="row"><span class="src">This screen is called: ${esc(device)}</span><button class="ghost" id="rename">Change name</button></div>
+      <label class="toggle"><input type="checkbox" id="showhid" ${showHidden ? 'checked' : ''}><span class="st"></span>Show hidden visitors on Home (not seen for 30 days)</label></section>`;
+  $('#admday').onchange = e => { adminDay = e.target.value; adminPage(); };
+  $('#admkind').onchange = e => { adminKind = e.target.value; adminPage(); };
+  $('#showhid').onchange = e => { showHidden = e.target.checked; };
   $('#rename').onclick = () => pickDevice();
 }
 
@@ -308,6 +354,40 @@ const adaptersBlock = (n, foot, hideCar) => {
     ${n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}${n.cautions_hidden ? `<div class="src cautionhidden">Chart caution hidden. The car's own caution above applies.</div>` : ''}
     ${hideBtn}${end}</div>` };
 };
+// HANDOFF 18 (C7, C8): the recalls line and the curb weight. Both come from the Worker's daily cache; the page posts /facts once it is drawn.
+// NHTSA lists recalls by model year, not by VIN, so the line says "for this model year". The VIN button opens NHTSA's own lookup with the
+// VIN filled in, in a new tab (rel noreferrer): the full VIN is in that link only, never in a log or on the Admin page.
+const NHTSA_VIN_URL = 'https://www.nhtsa.gov/recalls?vin=';
+const recallInner = v => {
+  const r = v.recalls, s = n => n === 1 ? '' : 's';
+  const vinBtn = v.vin ? `<a class="btn" id="vinrecall" href="${NHTSA_VIN_URL}${encodeURIComponent(v.vin)}" target="_blank" rel="noopener noreferrer">Check my VIN at NHTSA</a>` : '';
+  let line;
+  if (!r) line = '<span class="note">Recalls: checking...</span>';
+  else if (r.count == null) line = `<span class="note">Recalls are not available right now. ${esc(r.error || '')}</span>`;
+  else if (!r.count) line = `<span class="recalls-n">0 recalls for this model year</span>`;
+  else line = `<details class="recalls"><summary>${r.count} recall${s(r.count)} for this model year</summary>
+    <ul class="alist">${r.items.map(i => `<li class="aitem"><b>${esc(i.campaign)}</b> <span class="src">${esc(i.date)} · ${esc(i.component)}</span><span class="areason">${esc(i.summary)}</span><span class="areason"><b>Fix:</b> ${esc(i.remedy)}</span></li>`).join('')}</ul></details>`;
+  const more = r && r.count != null ? `<span class="src">${esc(r.model || '')} · as of ${esc(String(r.as_of || '').slice(0, 10))} · this list is for the model year, not for your VIN.</span>` : '';
+  return `${line}${more}${vinBtn}`;
+};
+const lbPlain = n => Number(n).toLocaleString('en-US');
+const weightInner = v => {
+  const c = v.curb;
+  if (!c) return `<div class="lbl">Curb weight</div><span class="note">${v.weight_error ? esc(v.weight_error) + '.' : 'Checking the Canadian specs...'}</span>${weightForm(v, false)}`;
+  const split = c.front_pct != null ? `<span class="src">${c.front_pct}% front (${lbPlain(Math.round(c.lb * c.front_pct / 100))} lb) · ${100 - c.front_pct}% rear (${lbPlain(c.lb - Math.round(c.lb * c.front_pct / 100))} lb)</span>` : '';
+  return `<div class="lbl">Curb weight</div><div><span class="val">${lbPlain(c.lb)} lb</span> ${pill(c.status === 'confirmed' ? 'confirmed' : 'proposed')}</div>${split}
+    <span class="src">${esc(c.source || '')}${c.status === 'confirmed' ? '' : '. AI-checked only until you confirm it.'}</span>
+    ${c.status === 'confirmed' ? '' : '<div class="row"><button class="ok" id="wconfirm">Confirm this weight</button></div>'}${weightForm(v, true)}`;
+};
+const weightForm = (v, has) => `<details id="wedit"><summary class="lbl">${has ? 'Type my own weight' : 'Type the weight myself'}</summary>
+  <div class="row"><div class="field"><label for="wlb">Curb weight (lb)</label><input id="wlb" inputmode="numeric" autocomplete="off"></div>
+  <div class="field"><label for="wfp">Front share (%)</label><input id="wfp" inputmode="numeric" autocomplete="off" placeholder="optional"></div>
+  <button id="wsave">Save and confirm</button></div><p class="err" id="werr"></p></details>`;
+function wireWeight(v) {
+  const post = body => api(`/vehicles/${v.id}/weight`, { method: 'POST', body }).then(d => { v.curb = d.curb; $('#weightbox').innerHTML = weightInner(v); wireWeight(v); }).catch(e => { const el = $('#werr'); if (el) el.textContent = e.message; });
+  const c = $('#wconfirm'); if (c) c.onclick = () => post({ action: 'confirm' });
+  const sv = $('#wsave'); if (sv) sv.onclick = () => { const b = { action: 'confirm', lb: $('#wlb').value.trim() }; if ($('#wfp').value.trim()) b.front_pct = $('#wfp').value.trim(); post(b); };
+}
 async function car(id) {
   const live = fresh();
   if (!meta) meta = await api('/tabs');
@@ -386,10 +466,11 @@ async function car(id) {
   crumb(`${v.year} ${v.make} ${v.model}`);
   $('#view').innerHTML = `${firstLook}<section class="card">
     <div class="carhead"><a class="btn" href="#/">My cars</a><div><h2>${esc(carName(v))}</h2><div class="src">${esc(v.trim)} · ${GROUP[v.grp]}</div></div></div>
+    <div class="recallbox" id="recallbox">${recallInner(v)}</div>
     ${tabRow(v)}
     <div class="${pageCard ? 'liftgrid' : 'tabbody'}"><div class="tabbody">
     ${threeLine}${ad.stop ? ad.html : ''}${rows.filter(s => s.warn).sort((a, b) => b.warn - a.warn).map(s => `<div class="warn${s.warn === 2 ? ' bad' : ''}" data-level="${s.warn === 2 ? 'block' : 'caution'}"><dl><dt><b>${s.warn === 2 ? 'Do not lift yet' : 'Caution'}</b> - ${esc(s.field)}</dt>${valueDd(s)}</dl></div>`).join('')}
-    ${ali}${ad.stop ? '' : ad.html}${evNote}
+    ${ali}${ad.stop ? '' : ad.html}${tab === 'lift' ? `<div class="weightbox" id="weightbox">${weightInner(v)}</div>` : ''}${evNote}
     ${evNote && !rows.length ? '' : `<dl>${rows.filter(s => !s.warn).map(s => `<dt>${esc(s.field)}${s.is_safety ? ' <span class="tag">safety</span>' : ''}</dt>${valueDd(s)}`).join('') || '<dt>Values</dt><dd class="note">Nothing yet. Add the first value below, or tap Research.</dd>'}</dl>`}
     ${hiddenTires ? `<p class="src hiddennote">The door card wins: ${hiddenTires} value${hiddenTires === 1 ? '' : 's'} for other wheel sizes ${hiddenTires === 1 ? 'is' : 'are'} hidden (kept in the history).</p>` : ''}
     ${tab === 'tires' ? `<a class="btn primary big" href="#/car/${v.id}/jamb">Door-jamb photo</a><p class="note">The label on the driver door pillar is the maker's own source. Take a photo, then type what it says.</p>` : ''}
@@ -414,6 +495,14 @@ async function car(id) {
     <p class="note">The VIN stays on this car and goes only to NHTSA, to decode the engine and the EV flag.</p><p class="err" id="vinerr"></p></div>
   <div class="row"><button class="ghost" id="del">Delete car</button></div></details><p id="delmsg"></p>`;
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; car(id); });
+  if (tab === 'lift') wireWeight(v);
+  // Once a day per car the Worker asks NHTSA (recalls, Canadian-specs weight). The page is already drawn; only the two boxes are redrawn.
+  if (v.facts_due) api(`/vehicles/${id}/facts`, { method: 'POST', body: {} }).then(f => {
+    if (!live()) return;
+    v.recalls = f.recalls; v.curb = f.curb; v.weight_error = f.weight_error;
+    const rb = $('#recallbox'); if (rb) rb.innerHTML = recallInner(v);
+    const wb = $('#weightbox'); if (wb && !wb.querySelector('details[open]')) { wb.innerHTML = weightInner(v); wireWeight(v); }
+  }).catch(() => { const rb = $('#recallbox'); if (live() && rb && !v.recalls) { v.recalls = { count: null, error: 'The check did not finish.', items: [] }; rb.innerHTML = recallInner(v); } });
   document.querySelectorAll('.vcard').forEach(d => d.addEventListener('click', e => { if (!e.target.closest('button,a,input,select,textarea,form')) d.classList.toggle('open'); }));
   const ct = $('#cautiontoggle'); if (ct) ct.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { hide_chart_cautions: +ct.dataset.hide } }).then(() => car(id)).catch(fail);
   $('#ownsave').onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { owner: $('#ownin').value, fuel: $('#fuelin').value } }).then(() => car(id)).catch(e => { $('#ownerr').textContent = e.message; });
@@ -543,6 +632,14 @@ async function shrink(file) {
     return await new Promise(r => c.toBlob(b => r(b || file), 'image/jpeg', 0.85));
   } catch (e) { return file; }
 }
+// HANDOFF 18 (C0.2): a photo name is a UTC time (2026-10-28T12-34-58-123Z.jpg). Show it as local time, "2026-10-28 08:34".
+const photoWhen = name => {
+  const m = String(name).match(/^(\d{4})-(\d\d)-(\d\d)T(\d\d)-(\d\d)-(\d\d)(?:-(\d{1,3}))?Z/);
+  if (!m) return name;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
 async function jamb(id) {
   const live = fresh();
   const v = await api(`/vehicles/${id}?peek=1`);
@@ -556,7 +653,7 @@ async function jamb(id) {
     <label class="btn big" for="jcam">Take photo and type the values</label><input type="file" id="jcam" accept="image/*" capture="environment" hidden>
     <label class="btn big" for="jpick">Choose from photos</label><input type="file" id="jpick" accept="image/*" hidden>
     <p class="err" id="jerr"></p>
-    ${photos.length ? `<h3 class="lbl">Earlier photos</h3><div class="row">${photos.slice(0, 6).map(ph => `<a class="btn" href="#/car/${v.id}/jamb/${esc(ph.name)}">${esc(ph.name.slice(0, 10))} ${esc(ph.name.slice(11, 16).replace('-', ':'))}</a>`).join('')}</div>` : ''}
+    ${photos.length ? `<h3 class="lbl">Earlier photos</h3><div class="row">${photos.slice(0, 6).map(ph => `<a class="btn" href="#/car/${v.id}/jamb/${esc(ph.name)}">${esc(photoWhen(ph.name))}</a>`).join('')}</div>` : ''}
     <a class="btn" href="#/car/${v.id}">Back to the car</a></section>`;
   const up = scan => async e => {
     const f = e.target.files && e.target.files[0]; if (!f) return;
@@ -599,7 +696,11 @@ async function jambRead(id, name) {
   if (!live()) return;
   const own = f => v.values.find(x => x.tab === 'tires' && x.field === f && x.scope === 'car');
   const cur = f => (own(f) || v.values.find(x => x.tab === 'tires' && x.field === f) || {}).value || '';
-  const pr = cur('Pressure').match(/(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/) || cur('Pressure').match(/(\d+(?:\.\d+)?)/);
+  // HANDOFF 18 (C0.3): a model value is often written "38 F / 44 R psi", "38 psi F / 44 psi R" or "Front 38, Rear 44". The old pattern needed
+  // "38 / 44", read only the 38 and put it in the rear field too (the i4 rear psi, placard 38 F / 44 R). Now: the first two numbers from 10 to 99
+  // (tire sizes skipped) are front and rear; one number is both. (The same rule is psiPair in src/lib.js, graded by test_lib.js.)
+  const psiNums = (cur('Pressure').replace(/\b\d{3}\/\d{2}\s?[A-Za-z]{0,2}\s?R?\s?\d{2}\b/g, ' ').match(/\d+(?:\.\d+)?/g) || []).filter(x => +x >= 10 && +x <= 99);
+  const pr = psiNums.length ? [null, psiNums[0], psiNums[1] || psiNums[0]] : null;
   const num = s => (String(s).match(/\d+(?:\.\d+)?/) || [''])[0];
   const src = `/api/photos/${v.id}/${name}`;
   crumb(`${v.year} ${v.make} ${v.model} · check the read`);
@@ -940,6 +1041,7 @@ async function route() {
     else if (h === '#/add') add();
     else if (h === '#/confirm') await confirmPage();
     else if (h === '#/apps') await appsPage();
+    else if (h === '#/admin') await adminPage();
     else if (h === '#/history') await historyPage(0);
     else if (/^#\/car\/\d+\/history$/.test(h)) await historyPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/log$/.test(h)) await logPage(h.split('/')[2]);

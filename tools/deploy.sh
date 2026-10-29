@@ -104,8 +104,10 @@ else echo "D1 exists"; fi
 sed -i -e "s/__LP_D1_ID__/$DB/" -e "s/__LP_D1_NAME__/$DBN/" -e "s/__LP_HOSTNAME__/$LP_HOSTNAME/" wrangler.toml
 # Quoted values only: the comment at the top of wrangler.toml also names __LP_.
 if grep -q '"__LP_' wrangler.toml; then echo "STOP: wrangler.toml still has a placeholder"; exit 1; fi
-# The app icon is built here, not kept in git (the repo admits no .svg).
-printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#e0a100"/><path d="M14 50V14h6v36zM44 50V14h6v36zM20 30h24v5H20z" fill="#141716"/></svg>' > public/icon.svg
+# The app icons are built here, not kept in git (the repo admits no .svg and ignores .png). HANDOFF 18 (C9): tools/make_icons.py draws
+# public/icon.svg and public/icons/*.png from one description of the mark.
+command -v python3 > /dev/null 2>&1 || apk add --no-cache python3 > /dev/null 2>&1 || apt-get install -y -qq python3 > /dev/null 2>&1   # the node:22-alpine deploy image has none
+python3 -I tools/make_icons.py public > /dev/null || { echo "STOP: the icons could not be made"; exit 1; }
 if [ "$DRY" = 1 ]; then
   # The dry run reads the migration plan only (no table check write path, no migration). Pending migrations must be in the allowed list.
   sh tools/migrate.sh > /tmp/plan.txt 2>&1 || { cat /tmp/plan.txt; echo "STOP (dry run): the migration plan failed"; exit 1; }
@@ -124,7 +126,7 @@ step "D deploy"
 WDRY=''; [ "$DRY" = 1 ] && WDRY='--dry-run --outdir /tmp/dry-out'
 # shellcheck disable=SC2086 # WDRY is empty or two flags, split on purpose
 npx wrangler deploy $WDRY --var "LP_ACCESS_CERTS:https://$TEAM/cdn-cgi/access/certs" --var "LP_ACCESS_AUD:$AUD" \
-  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" ${LP_BUILD:+--var "LP_BUILD:$LP_BUILD"} 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
+  --var "LP_PROCESSOR_IDS:$PROC_ID" --var "LP_TOOL_IDS:$SELF_ID,$PROC_ID" --var "LP_AUTO_RESEARCH:${LP_AUTO_RESEARCH:-0}" --var "LP_ADMIN_EMAILS:$LP_ACCESS_EMAIL" ${LP_BUILD:+--var "LP_BUILD:$LP_BUILD"} 2>&1 | grep -v -i -e token -e 'LP_' | tail -8
 if [ "$DRY" = 1 ]; then
   [ -s /tmp/dry-out/worker.js ] || { echo "STOP (dry run): wrangler built no worker.js"; exit 1; }
   echo "dry run: Worker built ($(wc -c < /tmp/dry-out/worker.js) bytes), nothing uploaded"

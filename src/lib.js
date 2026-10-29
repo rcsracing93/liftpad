@@ -105,6 +105,59 @@ export function parseDoorcardRead(r) {
   return { sf, sr, pf, pr, sp, spPsi };
 }
 
+// ---------- Secret scrubbing (HANDOFF 18, REVIEW 2.9) ----------
+// Used for every text that goes into ops_log. The N100 scrubs with the same patterns before the push (ops/ops_push.py), the Worker again
+// before the insert. Order matters little; each pattern is replaced by a fixed word. A VIN shape is masked to its last 4 (not removed).
+// `extra` = more words to remove (the Access team host, for example).
+const SCRUB_PATTERNS = [
+  [/Bearer\s+\S+/g, '[scrubbed]'],
+  [/sk-ant-\S*/g, '[scrubbed]'],
+  [/CF_ACCESS\S*/g, '[scrubbed]'],
+  [/\b[0-9a-fA-F]{32,}\b/g, '[scrubbed]'],
+  [/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[scrubbed]'],
+  [/[\w-]+\.cloudflareaccess\.com/gi, '[scrubbed]'],
+  [/(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])/g, '[scrubbed]'],   // a Cloudflare API token is 40 characters (the N100 sends none, but cf.env has one)
+];
+export function scrubText(s, extra = []) {
+  let t = String(s ?? '');
+  for (const [re, to] of SCRUB_PATTERNS) t = t.replace(re, to);
+  for (const w of extra) if (w) t = t.split(w).join('[scrubbed]');
+  // any run of 17 or more VIN letters and digits, in any case, with or without a word boundary ("VIN1HGC...") is masked to its last 4
+  return t.replace(/[A-HJ-NPR-Z0-9]{17,}/gi, m => '*'.repeat(m.length - 4) + m.slice(-4));
+}
+// The same scrub on every string inside a value (the JSON structure is kept: scrubbing the JSON text would let one match eat the rest of it).
+export function scrubDeep(x, extra = []) {
+  if (typeof x === 'string') return scrubText(x, extra);
+  if (Array.isArray(x)) return x.map(i => scrubDeep(i, extra));
+  if (x && typeof x === 'object') return Object.fromEntries(Object.entries(x).map(([k, v]) => [scrubText(k, extra), scrubDeep(v, extra)]));
+  return x;
+}
+// Pressures of a saved text, front then rear: "38 F / 44 R psi", "38 psi F / 44 psi R", "Front 38, Rear 44", "32 psi" (rear = front). Tire sizes are skipped.
+export function psiPair(text) {
+  const t = String(text ?? '').replace(/\b\d{3}\/\d{2}\s?[A-Za-z]{0,2}\s?R?\s?\d{2}\b/g, ' ');
+  const n = (t.match(/\d+(?:\.\d+)?/g) || []).filter(x => +x >= 10 && +x <= 99);
+  return n.length ? [n[0], n[1] || n[0]] : null;
+}
+
+// ---------- NHTSA recalls (HANDOFF 18, C8) ----------
+// recallsByVehicle answers { Count, results: [ { NHTSACampaignNumber, ReportReceivedDate "dd/mm/yyyy", Component, Summary, Consequence, Remedy } ] }.
+// The campaign number starts with the two-digit year and V (vehicle) or E (equipment: a tire, a child seat). Only V campaigns are counted
+// for the car; the E ones are not about this car. Texts are cut so the cached row stays small. null = the answer is not a recalls answer.
+export function parseRecalls(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.results)) return null;
+  const cut = (x, n) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const seen = new Set(), items = [];
+  for (const r of data.results) {
+    const num = cut(r.NHTSACampaignNumber, 20);
+    if (!num || seen.has(num) || !/^\d\d[Vv]/.test(num)) continue;
+    seen.add(num);
+    const d = String(r.ReportReceivedDate || '').match(/^(\d\d)\/(\d\d)\/(\d{4})$/);
+    items.push({ campaign: num.toUpperCase(), date: d ? `${d[3]}-${d[2]}-${d[1]}` : '', component: cut(r.Component, 120), summary: cut(r.Summary, 500), consequence: cut(r.Consequence, 300), remedy: cut(r.Remedy, 300) });
+  }
+  items.sort((a, b) => b.date.localeCompare(a.date) || b.campaign.localeCompare(a.campaign));
+  return items;
+}
+
 // ---------- NHTSA Canadian specs ----------
 // Names are Canada-market names ("CIVIC EX-T/TOURING 4DR SEDAN"); every one is labelled "Canadian specs" by the caller.
 export function canadianTrims(data) {
@@ -115,7 +168,27 @@ export function canadianTrims(data) {
     const name = String(spec.Model || '').trim();
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    out.push({ name, curb_lb: spec.CW ? Math.round(+spec.CW * 2.2046226) : null });
+    out.push({ name, curb_lb: spec.CW ? Math.round(+spec.CW * 2.2046226) : null, front_pct: frontPct(spec.WD) });
   }
   return out;
+}
+// The weight split is "48/52" (front/rear), in field WD. Front share in percent, or null when the text is not a split that adds to 100.
+export function frontPct(text) {
+  const m = String(text ?? '').match(/^\s*(\d{2})\s*[/:-]\s*(\d{2})\s*$/);
+  return m && +m[1] + +m[2] === 100 ? +m[1] : null;
+}
+// HANDOFF 18 (C7): the curb weight line for a car. A row whose model name holds the car's trim as a whole word is the trim's weight; all
+// such rows must agree (the same weight), else the lookup falls back to the base model = the lightest row. { lb, front_pct, source } or null.
+// source is always "Canadian specs, base model" or "Canadian specs, <row name>" (Rick: base model is the label when the trim does not match).
+export function pickWeight(rows, trim) {
+  const have = (rows || []).filter(r => r.curb_lb > 0);
+  if (!have.length) return null;
+  const t = String(trim ?? '').trim().toLowerCase();
+  if (t) {
+    const word = new RegExp('(^|[^a-z0-9])' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+') + '($|[^a-z0-9])', 'i');
+    const hit = have.filter(r => word.test(r.name));
+    if (hit.length && new Set(hit.map(r => r.curb_lb)).size === 1) return { lb: hit[0].curb_lb, front_pct: hit[0].front_pct ?? null, source: `Canadian specs, ${hit[0].name}` };
+  }
+  const base = have.reduce((a, b) => (b.curb_lb < a.curb_lb ? b : a));
+  return { lb: base.curb_lb, front_pct: base.front_pct ?? null, source: 'Canadian specs, base model' };
 }

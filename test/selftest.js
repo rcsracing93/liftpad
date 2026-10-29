@@ -37,7 +37,7 @@ if (LOCAL) {
 }
 // HANDOFF 17: a fake fueleconomy.gov for the local run (run_selftest_local.sh starts the Worker with FE=http://127.0.0.1:8789/fe). It serves
 // SAVED answers from the 2026-10-26 probe, the three shapes (list, one object, null), and counts the requests so the D1 cache can be graded.
-const FE_HITS = { n: 0 };
+const FE_HITS = { n: 0 }, RC_HITS = { n: 0 }, CAN_HITS = { n: 0 };
 let feSrv = null;
 if (LOCAL) {
   const MENUS = {
@@ -54,9 +54,27 @@ if (LOCAL) {
     const u = new URL(q.url, 'http://x'), g = k => u.searchParams.get(k);
     // Ultrareview B #8 (2026-10-28): a fake NHTSA decode, so the VIN checks run without the network (the container may be offline). It answers the
     // VIN decode with the public example vehicle (a 2013 Ford F-150, 3.5 L, 6 cyl); every other NHTSA path answers 503 ("NHTSA down", as the tests expect).
+    // HANDOFF 18: the recalls (RECALLS=.../recalls) and the Canadian-specs weight. recallsByVehicle answers by model name (the saved shapes of the
+    // 2026-10-28 probe: campaigns with V and E numbers, dates as dd/mm/yyyy); an unknown model is 400, as NHTSA does for the i4. RC_HITS counts the asks.
+    if (u.pathname.startsWith('/recalls/')) {
+      RC_HITS.n++; r.setHeader('content-type', 'application/json');
+      const m = (g('model') || '').toLowerCase();
+      const rec = (n, d, e) => ({ NHTSACampaignNumber: n, ReportReceivedDate: d, Component: 'FUEL SYSTEM: PUMP', Summary: 'The fuel pump may fail.', Consequence: 'Stall.', Remedy: 'Free replacement.', ...e });
+      if (m === 'f-150') { r.end(JSON.stringify({ Count: 3, results: [rec('20V314000', '28/05/2020'), rec('18V421000', '20/06/2018'), rec('19E012000', '01/01/2019')] })); return; }
+      if (m === 'hornet b') { r.end(JSON.stringify({ Count: 1, results: [rec('73V001000', '02/02/1973')] })); return; }
+      r.statusCode = 400; r.end(JSON.stringify({ message: 'Bad request' })); return;
+    }
+    if (u.pathname.startsWith('/nhtsa/GetCanadianVehicleSpecifications')) {
+      CAN_HITS.n++; r.setHeader('content-type', 'application/json');
+      if ((g('Model') || '') !== 'Hornet B') { r.statusCode = 503; r.end('{}'); return; }
+      const row = (name, cw, wd) => ({ Specs: [{ Name: 'Model', Value: name }, { Name: 'CW', Value: cw }, { Name: 'WD', Value: wd }] });
+      r.end(JSON.stringify({ Count: 2, Results: [row('HORNET 2DR SEDAN', '1100', '55/45'), row('HORNET SELFTEST B 2DR', '1250', '56/44')] }));
+      return;
+    }
     if (u.pathname.startsWith('/nhtsa/')) {
       r.setHeader('content-type', 'application/json');
       if (!u.pathname.startsWith('/nhtsa/DecodeVinValues/')) { r.statusCode = 503; r.end('{}'); return; }
+      if (u.pathname.split('/').pop().startsWith('9')) { r.statusCode = 500; r.end('{}'); return; }   // a VIN decode that fails (the recalls fall back to the car's own names)
       r.end(JSON.stringify({ Results: [{ Make: 'FORD', Model: 'F-150', ModelYear: '2013', Trim: 'XLT', Series: '', DisplacementL: '3.5', EngineCylinders: '6', EngineModel: '', FuelTypePrimary: 'Gasoline', FuelTypeSecondary: '', ElectrificationLevel: '', DriveType: '4x4', ErrorCode: '0', ErrorText: '' }] }));
       return;
     }
@@ -71,7 +89,7 @@ if (LOCAL) {
 const hdr = as => {
   const h = { 'content-type': 'application/json', 'x-lp-device': 'selftest' };
   if (LOCAL) {
-    const c = { tool: { common_name: 'selftest-id' }, proc: { common_name: 'processor-id' }, phone: { email: 'owner@example.com' } }[as];
+    const c = { tool: { common_name: 'selftest-id' }, proc: { common_name: 'processor-id' }, phone: { email: 'owner@example.com' }, other: { email: 'someone-else@example.com' }, phonecase: { email: 'OWNER@Example.com' } }[as];
     if (c) h['cf-access-jwt-assertion'] = sign(c);
     // Known-bad samples for the JWT check (STANDARD 6.9): processor claims, but a wrong signature or an old token.
     if (as === 'forged') h['cf-access-jwt-assertion'] = sign({ common_name: 'processor-id' }, sign.other);
@@ -1161,6 +1179,191 @@ if (health.schema >= '0012') {
     for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
   }
 } else skip('HANDOFF 17: engine lists, VIN check digit, photo read, badges', 'schema before 0012');
+
+// ---------- HANDOFF 18: the Admin page, the ops log, recalls and the curb weight ----------
+// Local mode only for everything that writes ops_log rows or asks the fake NHTSA (a live run must leave no row behind). The live run checks the
+// refusals: every /api/admin/* GET is 403 for the tool token (and for the processor token when there is one).
+// The only VINs are the public NHTSA example VIN (on the allowlist of the export check), and two made-up VINs that FAIL the check digit and are built
+// from parts, so this file holds no VIN-shaped literal: NODEC starts with 9 (the fake VIN decode fails for it; saved with not_us), PLANT_VIN is
+// planted in the scrub test. The fake Anthropic key is built from two parts for the same reason (the export check looks for the sk-ant- text).
+if (health.schema >= '0013') {
+  const GOOD = '1FTFW1CT5DFC10312', NODEC = '9TESTX' + '000XX000000', PLANT_VIN = '3TESTY' + '000YY' + '000001', FAKE_KEY = 'sk-' + 'ant-api03-SECRETSECRET', made = [];
+  const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const PLANT = 'Bearer abc123token ' + FAKE_KEY + ' CF_ACCESS_CLIENT_SECRET ' + 'a'.repeat(40) + ' someone@example.com team-x.cloudflareaccess.com ' + PLANT_VIN;
+  const PLANTED = ['Bearer abc123token', FAKE_KEY, 'CF_ACCESS_CLIENT_SECRET', 'a'.repeat(32), 'someone@example.com', 'cloudflareaccess.com', PLANT_VIN];
+  const push = async (rows, now, extra = {}) => call('/api/admin/log', { as: 'proc', method: 'POST', now, body: { rows, ...extra } });
+  try {
+    await t('HANDOFF 18 C5: every /api/admin/* GET is refused for the tool token' + (hasProc ? ' and the processor token' : '') + '; a forged or expired token is refused too', async () => {
+      const b = [];
+      for (const p of ['/api/admin/status', '/api/admin/dot', '/api/admin/nothing']) {
+        const r = await call(p); if (r.s !== 403) b.push(`tool ${p}: ${r.s}`);
+        if (hasProc) { const q = await call(p, { as: 'proc' }); if (q.s !== 403) b.push(`processor ${p}: ${q.s}`); }
+        if (LOCAL) for (const who of ['forged', 'expired']) { const q = await call(p, { as: who }); if (q.s !== 403) b.push(`${who} ${p}: ${q.s}`); }
+      }
+      if (hasProc) { const r = await call('/api/admin/log', { method: 'POST', body: { rows: [] } }); if (r.s !== 403) b.push('the tool token pushed the log: ' + r.s); }
+      ok(!b.length, b.join('; ')); return 'tool, processor, forged, expired';
+    });
+    // Rick 2026-10-28 (live deploy run 2): the processor may POST /api/admin/log and nothing else under /api/admin. Safe on LIVE: the push is EMPTY
+    // (no rows, no prune), so nothing is written. The allowlist, not LP_ADMIN_EMAILS, is what lets the processor in; LP_ADMIN_EMAILS guards the rest.
+    if (hasProc) await t('HANDOFF 18 C5: the processor token may POST /api/admin/log (an empty push, nothing written) and may not GET any /api/admin route or POST another admin path; the tool token may not push', async () => {
+      const b = [];
+      const e = await call('/api/admin/log', { as: 'proc', method: 'POST', body: { rows: [] } });
+      if (e.s !== 200 || !e.d || e.d.ok !== true || e.d.inserted !== 0 || e.d.pruned !== 0) b.push('empty push as the processor: ' + e.s + ' ' + JSON.stringify(e.d));
+      for (const p of ['/api/admin/status', '/api/admin/dot', '/api/admin/log', '/api/admin/nothing']) { const r = await call(p, { as: 'proc' }); if (r.s !== 403) b.push(`processor GET ${p}: ${r.s}`); }
+      for (const p of ['/api/admin/status', '/api/admin/dot', '/api/admin/nothing']) { const r = await call(p, { as: 'proc', method: 'POST', body: {} }); if (r.s !== 403) b.push(`processor POST ${p}: ${r.s}`); }
+      const tp = await call('/api/admin/log', { method: 'POST', body: { rows: [] } }); if (tp.s !== 403) b.push('the tool token pushed: ' + tp.s);
+      ok(!b.length, b.join('; ')); return 'processor: empty POST 200; every GET and other POST 403';
+    }); else skip('HANDOFF 18 C5: the processor token and /api/admin/log', 'no processor token');
+    if (LOCAL) {
+      // Rick 2026-10-28: the Admin page is for the login in LP_ADMIN_EMAILS only (deploy.sh sets it from LP_ACCESS_EMAIL in the private deploy.env;
+      // the local run sets owner@example.com). Any other Access login is refused on the page routes and on /api/admin, GET and POST.
+      await t('HANDOFF 18 C5: any other Access login (an e-mail that is not LP_ADMIN_EMAILS) gets 403 on /api/admin/*, the page data and the gear dot; the listed login gets 200; a different case of the listed address is accepted', async () => {
+        const b = [];
+        for (const p of ['/api/admin/status', '/api/admin/dot', '/api/admin/nothing']) {
+          const o = await call(p, { as: 'other' }); if (o.s !== 403 || !/Rick only/.test((o.d && o.d.error) || '')) b.push(`other login ${p}: ${o.s} ${JSON.stringify(o.d)}`);
+        }
+        const po = await call('/api/admin/log', { as: 'other', method: 'POST', body: { rows: [{ kind: 'backup', level: 'green', text: 'x' }] } }); if (po.s !== 403) b.push('other login pushed the log: ' + po.s);
+        const ok1 = await call('/api/admin/status', { as: 'phone' }); if (ok1.s !== 200 || !ok1.d || !ok1.d.queue) b.push('the listed login: ' + ok1.s);
+        const ok2 = await call('/api/admin/dot', { as: 'phone' }); if (ok2.s !== 200) b.push('the listed login, dot: ' + ok2.s);
+        const ok3 = await call('/api/admin/dot', { as: 'phonecase' }); if (ok3.s !== 200) b.push('the listed address in another letter case: ' + ok3.s);
+        ok(!b.length, b.join('; ')); return 'other login 403, listed login 200';
+      });
+      await t('HANDOFF 18 C1/C4: the processor pushes rows; secrets are scrubbed in the Worker (text and data); a VIN is masked to its last 4; bad kind or level, too many rows, a far time are handled', async () => {
+        const b = [], now = new Date().toISOString();
+        // The health row gets a time 5 hours ago (the test clock), so the next check can see an old report; no later row is pushed before it.
+        const hOld = new Date(Date.now() - 5 * 3600e3).toISOString();
+        const r0 = await push([{ ts: hOld, kind: 'health', level: 'amber', text: 'N100 health: amber', data: { items: [{ name: 'disk_root', level: 'amber', reason: 'disk / 85% full ' + PLANT, pad: PLANT, note: ['x ' + PLANT] }] } }], hOld);
+        const r1 = await push([{ ts: now, kind: 'backup', level: 'red', text: 'backup failed: ' + PLANT }]);
+        if (r0.s !== 200 || r0.d.inserted !== 1 || r1.s !== 200 || r1.d.inserted !== 1) b.push('push: ' + r0.s + JSON.stringify(r0.d) + ' ' + r1.s + JSON.stringify(r1.d));
+        const st = await call('/api/admin/status', { as: 'phone' }); if (st.s !== 200) { b.push('status as Rick: ' + st.s); return ok(false, b.join('; ')); }
+        const all = JSON.stringify(st.d);
+        for (const w of PLANTED) if (all.includes(w)) b.push('the status still holds: ' + w);
+        if (!all.includes('*'.repeat(13) + PLANT_VIN.slice(-4))) b.push('the VIN is not masked to the last 4');
+        if (!/backup failed/.test(JSON.stringify(st.d.log))) b.push('the backup row is not in the log');
+        if ((await push([{ ts: now, kind: 'nonsense', level: 'red', text: 'x' }])).s !== 400) b.push('an unknown kind was accepted');
+        if ((await push([{ ts: now, kind: 'backup', level: 'purple', text: 'x' }])).s !== 400) b.push('an unknown level was accepted');
+        if ((await push(Array.from({ length: 61 }, () => ({ ts: now, kind: 'backup', level: 'green', text: 'x' })))).s !== 400) b.push('61 rows were accepted');
+        const n0 = (await call('/api/admin/status', { as: 'phone' })).d.log.length;
+        await push([{ ts: '2020-01-01T00:00:00Z', kind: 'export', level: 'green', text: 'far-past-row' }]);
+        const lg = (await call('/api/admin/status', { as: 'phone' })).d.log; if (lg.length !== n0 + 1 || !lg.some(l => l.text === 'far-past-row' && Math.abs(Date.parse(l.ts) - Date.now()) < 60e3)) b.push('a time 6 years ago was not replaced by now');
+        ok(!b.length, b.join('; ')); return 'scrub, mask, 400s, far time';
+      });
+      await t('HANDOFF 18 C1: the prune call deletes rows older than 30 days and keeps the rest; the log filters by day and kind', async () => {
+        const b = [], old = new Date(Date.now() - 40 * 864e5).toISOString();
+        const r = await push([{ ts: old, kind: 'export', level: 'green', text: 'forty-days-old-row' }], old);   // the test clock (tool token) lets a row take an old time
+        if (r.s !== 200) b.push('push with a test clock: ' + r.s);
+        const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(old));
+        const s1 = (await call('/api/admin/status?day=' + day, { as: 'phone' })).d; if (!s1.log.some(l => l.text === 'forty-days-old-row')) b.push('the old row is not in the log of its day');
+        if ((await call('/api/admin/status?day=' + day + '&kind=backup', { as: 'phone' })).d.log.some(l => l.text === 'forty-days-old-row')) b.push('the kind filter kept an export row');
+        if (!(await call('/api/admin/status?day=' + day + '&kind=export', { as: 'phone' })).d.log.some(l => l.text === 'forty-days-old-row')) b.push('the kind filter lost the export row');
+        const p = await push([{ ts: new Date().toISOString(), kind: 'export', level: 'green', text: 'fresh-row' }], undefined, { prune: true });
+        if (p.s !== 200 || !(p.d.pruned >= 1)) b.push('prune: ' + p.s + JSON.stringify(p.d));
+        if ((await call('/api/admin/status?day=' + day, { as: 'phone' })).d.log.some(l => l.text === 'forty-days-old-row')) b.push('the old row survived the prune');
+        if (!(await call('/api/admin/status', { as: 'phone' })).d.log.some(l => l.text === 'fresh-row')) b.push('the fresh row was pruned');
+        ok(!b.length, b.join('; ')); return 'prune at 30 days, day and kind filter';
+      });
+      await t('HANDOFF 18 C3/C10: the status turns amber or red with the reason in words: old N100 report, red item, D1 at 55% and 85%, a failed job with a 429 and a timeout', async () => {
+        const b = [], lv = async () => (await call('/api/admin/status', { as: 'phone' })).d;
+        const hOld = new Date(Date.now() - 5 * 3600e3).toISOString();
+        await push([{ ts: hOld, kind: 'health', level: 'green', text: 'N100 health: green', data: { items: [{ name: 'disk_root', level: 'green', reason: 'disk / 20% full' }] } }], hOld);
+        let s = await lv(); const old = s.n100.items.find(i => i.name === 'n100_report'); if (!old || old.level !== 'red' || !/hours old/.test(old.reason)) b.push('a 5 hour old report: ' + JSON.stringify(old));
+        const now = new Date().toISOString();
+        await push([{ ts: now, kind: 'health', level: 'red', text: 'N100 health: red', data: { items: [{ name: 'disk_nas', level: 'red', reason: 'NAS mount missing' }, { name: 'backup_file', level: 'red', reason: 'backup older than 26 h (30 h)' },
+          { name: 'research_worker_run', level: 'red', reason: 'last research worker run failed (error)' }, { name: 'research_cost', level: 'green', reason: 'research cost today $0.10', today_usd: 0.1, month_usd: 1, daily_cap_usd: 2 },   // flat, as health_collect.py writes it
+          { name: 'token_expiry', level: 'green', reason: 'all tokens have more than 60 days left', expires: { cloudflare_api_token: '2027-12-31' } }] } }]);
+        s = await lv(); const it = n => s.n100.items.find(i => i.name === n);
+        if (!it('disk_nas') || it('disk_nas').level !== 'red' || it('disk_nas').reason !== 'NAS mount missing') b.push('disk_nas: ' + JSON.stringify(it('disk_nas')));
+        if (!it('backup_file') || !/older than 26 h/.test(it('backup_file').reason)) b.push('backup_file');
+        if (s.overall !== 'red' || s.worker_runs.level !== 'red' || !/failed/.test(s.worker_runs.reason)) b.push('overall/worker: ' + s.overall + ' ' + s.worker_runs.level);
+        if (s.worker_runs.cost.today_usd !== 0.1 || s.worker_runs.cost.daily_cap_usd !== 2) b.push('cost: ' + JSON.stringify(s.worker_runs.cost));
+        if (!it('token_expiry') || !it('token_expiry').data || it('token_expiry').data.expires.cloudflare_api_token !== '2027-12-31') b.push('token expiry dates: ' + JSON.stringify(it('token_expiry')));
+        // a health row whose details were too large is kept, with its own level, as one line (not an empty card)
+        await push([{ ts: new Date(Date.now() + 1000).toISOString(), kind: 'health', level: 'red', text: 'N100 health: red (big)', data: { items: [{ name: 'disk_root', level: 'red', reason: 'x'.repeat(7000) }] } }]);
+        const big = await lv(); const bi = big.n100.items.find(i => i.name === 'n100_report');
+        if (!bi || bi.level !== 'red' || !/without its lines/.test(bi.reason) || big.overall !== 'red') b.push('a too large health row: ' + JSON.stringify(bi) + ' ' + big.overall);
+        if (it('n100_report')) b.push('a fresh report is called old');
+        await push([{ ts: now, kind: 'd1_usage', level: 'amber', text: 'D1', data: { day: 'x', databases: [{ name: 'liftpad', rows_written: 55000, rows_read: 100 }] } }]);
+        s = await lv(); let w = s.d1.items.find(i => /rows_written/.test(i.name)); if (!w || w.level !== 'amber' || !/55,000 rows written today of 100,000 free \(55%\)/.test(w.reason)) b.push('d1 55%: ' + JSON.stringify(w));
+        await push([{ ts: now, kind: 'd1_usage', level: 'red', text: 'D1', data: { day: 'x', databases: [{ name: 'liftpad', rows_written: 85000, rows_read: 100 }] } }]);
+        s = await lv(); w = s.d1.items.find(i => /rows_written/.test(i.name)); if (!w || w.level !== 'red') b.push('d1 85%: ' + JSON.stringify(w));
+        // a failed job: 429 and a timeout, in words; the secret in the error text is not shown
+        const c = await mkCar(); const ids = [];
+        for (const err of ['HTTP 429 rate_limit_error ' + FAKE_KEY, 'timed out after 120 s']) {
+          const j = await call('/api/jobs', { method: 'POST', body: { vehicle_id: c.d.id, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } });
+          const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j.d && j.d.id, kinds: ['research', 'workup'] } });
+          if (cl.d && cl.d.id) { await call(`/api/jobs/${cl.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: err } }); ids.push(cl.d.id); } else b.push('no claim for the job: ' + JSON.stringify(cl.d));
+        }
+        s = await lv(); const why = s.queue.failed.map(f => f.why).join(' | ');
+        if (!/busy \(error 429\)/.test(why) || !/did not answer in time/.test(why) || /SECRET/.test(JSON.stringify(s))) b.push('failed job words: ' + why);
+        if (s.queue.level === 'green' || !/failed in the last 24 hours/.test(s.queue.reason)) b.push('queue: ' + s.queue.level + ' ' + s.queue.reason);
+        const dot = await call('/api/admin/dot', { as: 'phone' }); if (dot.s !== 200 || dot.d.level !== 'red') b.push('dot: ' + dot.s + JSON.stringify(dot.d));
+        ok(!b.length, b.join('; ')); return 'levels and reasons';
+      });
+    } else skip('HANDOFF 18 C1/C3/C4/C10: the ops log, scrubbing, prune, levels', 'local mode only (a live run leaves no log row behind)');
+
+    if (LOCAL) {
+      await t('HANDOFF 18 C8: recalls by the VIN decode (model name from the decode), counted once a day, never the E (equipment) campaigns; a failed decode falls back to the car\'s own names; no VIN change', async () => {
+        const b = [], c = await mkCar({ vin: GOOD }), id = c.d.id;
+        const a = await carOf(id); if (a.recalls !== null || a.facts_due !== true) b.push('before the first ask: ' + JSON.stringify([a.recalls, a.facts_due]));
+        const n0 = RC_HITS.n, r = await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} });
+        if (r.s !== 200 || !r.d.recalls || r.d.recalls.count !== 2 || r.d.recalls.by !== 'vin' || !/F-150/.test(r.d.recalls.model) || r.d.recalls.items.some(i => /E/.test(i.campaign))) b.push('by VIN: ' + r.s + JSON.stringify(r.d.recalls && [r.d.recalls.count, r.d.recalls.by, r.d.recalls.model]));
+        if (r.d.recalls && (r.d.recalls.items[0].campaign !== '20V314000' || r.d.recalls.items[0].date !== '2020-05-28')) b.push('order or date: ' + JSON.stringify(r.d.recalls.items[0]));
+        if (RC_HITS.n - n0 !== 1) b.push('NHTSA asked ' + (RC_HITS.n - n0) + ' times');
+        await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} }); if (RC_HITS.n - n0 !== 1) b.push('a second ask the same minute went to NHTSA again');
+        const v = await carOf(id); if (!v.recalls || v.recalls.count !== 2 || v.facts_due !== false) b.push('the car payload: ' + JSON.stringify([v.recalls && v.recalls.count, v.facts_due]));
+        await call(`/api/vehicles/${id}/facts`, { method: 'POST', now: new Date(Date.now() + 21 * 3600e3).toISOString(), body: {} }); if (RC_HITS.n - n0 !== 2) b.push('after 21 hours NHTSA was not asked again: ' + (RC_HITS.n - n0));
+        const d = await mkCar({ vin: NODEC, not_us: true }), n1 = RC_HITS.n, r2 = await call(`/api/vehicles/${d.d.id}/facts`, { method: 'POST', body: {} });
+        if (!r2.d.recalls || r2.d.recalls.by !== 'saved' || r2.d.recalls.count !== 1 || !/Hornet B/i.test(r2.d.recalls.model) || RC_HITS.n - n1 !== 1) b.push('fallback to the saved names: ' + JSON.stringify(r2.d.recalls && [r2.d.recalls.by, r2.d.recalls.count, r2.d.recalls.model]));
+        const e = await mkCar(), r3 = await call(`/api/vehicles/${e.d.id}/facts`, { method: 'POST', body: {} }); if (!r3.d.recalls || r3.d.recalls.by !== 'saved' || r3.d.recalls.count !== 1) b.push('a car with no VIN: ' + JSON.stringify(r3.d.recalls));
+        if ((await carOf(id)).vin !== GOOD || (await carOf(d.d.id)).vin !== NODEC) b.push('A SAVED VIN CHANGED');
+        ok(!b.length, b.join('; ')); return 'by VIN, fallback, once a day';
+      });
+      await t('HANDOFF 18 C8: a model NHTSA answers 400 for (the i4) says "not available", never "0 recalls"; the try is repeated after 1 hour, not before; an old good answer stays', async () => {
+        const b = [], c = await mkCar({ model: 'Failmodel' }), id = c.d.id, n0 = RC_HITS.n;
+        const r = await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} });
+        if (!r.d.recalls || r.d.recalls.count !== null || !/did not give a recalls answer/.test(r.d.recalls.error || '')) b.push('failed answer: ' + JSON.stringify(r.d.recalls));
+        const k = RC_HITS.n - n0; await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} }); if (RC_HITS.n - n0 !== k) b.push('the failed try was repeated at once');
+        await call(`/api/vehicles/${id}/facts`, { method: 'POST', now: new Date(Date.now() + 61 * 60e3).toISOString(), body: {} }); if (RC_HITS.n - n0 <= k) b.push('the failed try was not repeated after 61 minutes');
+        ok(!b.length, b.join('; ')); return 'failure is not zero';
+      });
+      await t('HANDOFF 18 C7: the curb weight is PROPOSED from the Canadian specs (the trim row, else the base model), with the split; the processor cannot ask or confirm; Rick confirms or types; a confirmed weight is never replaced; no VIN change', async () => {
+        const b = [], c = await mkCar({ vin: GOOD }), id = c.d.id, n0 = CAN_HITS.n;
+        const r = await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} });
+        const w = r.d.curb; if (!w || w.lb !== 2756 || w.front_pct !== 56 || w.status !== 'proposed' || w.source !== 'Canadian specs, HORNET SELFTEST B 2DR') b.push('trim row: ' + JSON.stringify(w));
+        const base = await mkCar({ trim: 'SELFTEST C' }), rb = await call(`/api/vehicles/${base.d.id}/facts`, { method: 'POST', body: {} });
+        if (!rb.d.curb || rb.d.curb.lb !== 2425 || rb.d.curb.front_pct !== 55 || rb.d.curb.source !== 'Canadian specs, base model') b.push('base model: ' + JSON.stringify(rb.d.curb));
+        const nf = await mkCar({ model: 'Failmodel' }), rf = await call(`/api/vehicles/${nf.d.id}/facts`, { method: 'POST', body: {} });
+        if (rf.d.curb !== null || !rf.d.weight_error) b.push('no Canadian answer: ' + JSON.stringify([rf.d.curb, rf.d.weight_error]));
+        const k = CAN_HITS.n - n0; await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} }); if (CAN_HITS.n - n0 !== k) b.push('the weight was asked again the same minute');
+        if (hasProc) {
+          if ((await call(`/api/vehicles/${id}/facts`, { as: 'proc', method: 'POST', body: {} })).s !== 403) b.push('the processor asked for facts');
+          if ((await call(`/api/vehicles/${id}/weight`, { as: 'proc', method: 'POST', body: { action: 'confirm' } })).s !== 403) b.push('the processor confirmed a weight');
+        }
+        for (const [body, why] of [[{ action: 'confirm', lb: 'abc' }, 'lb abc'], [{ action: 'confirm', lb: 100 }, 'lb 100'], [{ action: 'confirm', lb: 30000 }, 'lb 30000'], [{ action: 'confirm', front_pct: 90 }, 'front 90'], [{ action: 'nonsense' }, 'action']]) {
+          const x = await call(`/api/vehicles/${id}/weight`, { method: 'POST', body }); if (x.s !== 400) b.push(`${why}: ${x.s}`);
+        }
+        const none = await mkCar({ model: 'Failmodel' }); if ((await call(`/api/vehicles/${none.d.id}/weight`, { method: 'POST', body: { action: 'confirm' } })).s !== 400) b.push('confirm with no weight');
+        const cf = await call(`/api/vehicles/${id}/weight`, { method: 'POST', body: { action: 'confirm' } }); if (cf.s !== 200 || cf.d.curb.status !== 'confirmed' || cf.d.curb.lb !== 2756) b.push('confirm: ' + JSON.stringify(cf.d));
+        const ty = await call(`/api/vehicles/${id}/weight`, { method: 'POST', body: { action: 'confirm', lb: '2800', front_pct: 58 } }); if (ty.s !== 200 || ty.d.curb.lb !== 2800 || ty.d.curb.front_pct !== 58 || ty.d.curb.source !== 'Typed by Rick' || ty.d.curb.status !== 'confirmed') b.push('typed: ' + JSON.stringify(ty.d));
+        await call(`/api/vehicles/${id}/facts`, { method: 'POST', now: new Date(Date.now() + 25 * 3600e3).toISOString(), body: {} });
+        const after = (await carOf(id)).curb; if (!after || after.lb !== 2800 || after.status !== 'confirmed') b.push('a confirmed weight was replaced: ' + JSON.stringify(after));
+        const cl = await call(`/api/vehicles/${id}/weight`, { method: 'POST', body: { action: 'clear' } }); if (cl.s !== 200 || cl.d.curb !== null || (await carOf(id)).curb !== null) b.push('clear');
+        if ((await carOf(id)).vin !== GOOD) b.push('A SAVED VIN CHANGED');
+        const pc = (await call('/api/vehicles', { as: 'proc' })).d.find(x => x.id === id); if (hasProc && pc && 'recalls' in pc) b.push('the processor list has recalls');
+        const pv = hasProc ? (await call(`/api/vehicles/${id}?peek=1`, { as: 'proc' })).d : null; if (pv && ('recalls' in pv || 'curb' in pv || 'facts_due' in pv || 'vin' in pv)) b.push('the processor car has recalls, curb or a VIN key');
+        ok(!b.length, b.join('; ')); return 'proposed, confirm, typed, never replaced';
+      });
+      await t('HANDOFF 18 C8: a car with cached facts can be deleted (its car_facts row goes with it)', async () => {
+        const c = await mkCar(), id = c.d.id; await call(`/api/vehicles/${id}/facts`, { method: 'POST', body: {} });
+        const d = await call('/api/vehicles/' + id, { method: 'DELETE' }); made.splice(made.indexOf(id), 1);
+        ok(d.s === 200 && (await call('/api/vehicles/' + id)).s === 404, 'delete ' + d.s); return 'deleted';
+      });
+    } else skip('HANDOFF 18 C7/C8: recalls and curb weight through the Worker', 'local mode only (the fake NHTSA)');
+  } finally {
+    for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
+  }
+} else skip('HANDOFF 18: Admin, ops log, recalls, curb weight', 'schema before 0013');
 
 // ---------- cleanup ----------
 // Every step runs and every problem is listed, so one failed step (a network error, or no value id

@@ -22,8 +22,13 @@ body{background:var(--bg);color:var(--ink);font:17px/1.45 var(--body);padding-le
 .wrap{max-width:1280px;margin:0 auto;display:grid;gap:20px}
 #view{display:grid;gap:24px;min-width:0}
 header{display:flex;align-items:center;gap:12px 18px;flex-wrap:wrap;border-bottom:4px solid var(--accent);padding-bottom:12px}
-.brand{color:inherit;text-decoration:none;display:inline-flex;align-items:center;min-height:var(--tap)}
-header h1{font:700 2.2rem/1 var(--display);letter-spacing:.03em;text-transform:uppercase;margin:0}
+/* HANDOFF 18 (C9): header style H2. Stripe chip flush left, italic Barlow Condensed 700 wordmark; 64 px tall on the lift screen, 56 px on the phone. */
+/* the font itself is in fonts.css (self-hosted, a data URI) */
+.brand{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:12px;height:56px;background:#121314}
+@media (min-width:900px){.brand{height:64px}}
+.logomark{height:100%;width:auto;aspect-ratio:1;flex:none}
+header h1{font:italic 700 2.2rem/1 "Barlow Condensed","Arial Narrow",Arial,sans-serif;letter-spacing:.04em;text-transform:uppercase;margin:0;color:#F2B824;display:inline-flex;gap:.12em;padding-right:6px}
+@media (min-width:900px){header h1{font-size:2.6rem}}
 header .sub{color:var(--muted)}
 .hnav{margin-left:auto;display:flex;gap:12px;flex-wrap:wrap}
 /* HANDOFF 6: the Apps button (header, every screen) and the Apps screen tiles */
@@ -198,7 +203,7 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 
 /* HANDOFF 15: Home button in the header (every page), value cards that open on a tap, the three-number line, the Service tab and the cart. */
-.homebtn{padding:0 22px}
+.homebtn{padding:0 22px}   /* HANDOFF 18 (C9) asks for at least 52 px (lift) and 48x44 (phone); the standard button size (64 / 48) is larger, so it stays */
 .vacts{display:none}
 .vcard.open .vacts{display:flex}
 .vcard{cursor:pointer}
@@ -227,7 +232,7 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
 .leaveask .card{max-width:520px;width:100%}
 /* Phone (suggestions 6 and 7): compact header, tab row that scrolls sideways with a gap, source line only after a tap on the value. */
 @media (max-width:560px){
-  header h1{font-size:1.5rem}
+  header h1{font-size:2rem}
   header{padding-bottom:8px;gap:8px 12px}
   .carhead h2{font-size:1.5rem}
   .tabs{display:flex;overflow-x:auto;gap:12px;scrollbar-width:none}
@@ -236,6 +241,22 @@ a:not(.carbtn):not(.btn):not(.brand):not(.chip),a:not(.carbtn):not(.btn):not(.br
   dd.open .src{display:block}
   .homebtn{padding:0 14px}
 }
+/* HANDOFF 18: Admin page (C3), gear button, recalls line (C8), curb weight (C7). Level is always a word as well as a colour. */
+.gear{gap:10px;padding:0 16px;position:relative}
+.gear svg{width:22px;height:22px;fill:currentColor;flex:none}
+.reddot{display:inline-block;width:14px;height:14px;border-radius:50%;background:var(--lo);border:2px solid var(--bg);margin-left:6px}
+.pill.lv-green{color:var(--hi);background:var(--hi-bg)}
+.pill.lv-amber{color:var(--warn);background:var(--warn-bg)}
+.pill.lv-red{color:var(--lo);background:var(--lo-bg)}
+.alist{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.aitem{display:grid;gap:2px;border-left:6px solid var(--line2);padding:6px 0 6px 12px;overflow-wrap:anywhere}
+.aitem.lv-green{border-left-color:var(--hi)} .aitem.lv-amber{border-left-color:var(--warn)} .aitem.lv-red{border-left-color:var(--lo)}
+.areason{color:var(--muted)}
+#view>section.card h3{font:700 1.4rem/1.2 var(--display)}
+.recallbox,.weightbox{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.weightbox{display:grid;gap:6px;border:2px solid var(--line);border-radius:10px;padding:12px 16px;background:var(--panel2)}
+.recallbox summary{min-height:var(--tap);display:flex;align-items:center;cursor:pointer;font-weight:600}
+.recalls-n{min-height:var(--tap);display:inline-flex;align-items:center;font-weight:600}
 /* Print view of the service history: plain black on white. */
 @media print{
   body{background:#fff;color:#000;font-size:12pt;padding:0}
