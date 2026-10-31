@@ -76,13 +76,24 @@ if [ ! -s /cfg/processor.env ]; then
   umask 077; jq -r '"CF_ACCESS_CLIENT_ID=" + .result.client_id + "\nCF_ACCESS_CLIENT_SECRET=" + .result.client_secret + "\nSVC_ID=" + .result.id' /tmp/proc.json > /cfg/processor.env; rm /tmp/proc.json
   echo "processor token created and saved to processor.env"
 fi
-PROC_ID=$(. /cfg/processor.env; printf '%s' "$CF_ACCESS_CLIENT_ID")
-PROC_SVC=$(. /cfg/processor.env; printf '%s' "$SVC_ID")
-if cf "$API/accounts/$A/access/apps/$APP/policies" | jq -e '.result | any(.name == "processor token")' >/dev/null; then echo "processor policy exists"
+# (svc.env, sourced above, set the same variable names for the self-test token: unset them first, so a processor.env without them gives an empty id, never the self-test id)
+PROC_ID=$(unset CF_ACCESS_CLIENT_ID; . /cfg/processor.env; printf '%s' "${CF_ACCESS_CLIENT_ID:-}")
+PROC_SVC=$(unset SVC_ID; . /cfg/processor.env; printf '%s' "${SVC_ID:-}")
+# HANDOFF 20 (E9, review fix 3): an empty id must never match anything. Stop before the policy step (and before any later change).
+[ -n "$PROC_ID" ] && [ -n "$PROC_SVC" ] || { echo "STOP: processor.env has no CF_ACCESS_CLIENT_ID or SVC_ID (the processor token id)"; exit 1; }
+# HANDOFF 20 (E9, TODO 5): a processor-policy failure stops the deploy. The policy must exist AND name the processor token of processor.env (a rotated
+# token with an old policy would lock the research worker out), and a failed create is an error, not a line of text. Dry run and real run both stop.
+POLS=$(cf "$API/accounts/$A/access/apps/$APP/policies")
+if printf '%s' "$POLS" | jq -e '.result | any(.name == "processor token")' >/dev/null; then
+  printf '%s' "$POLS" | jq -e --arg t "$PROC_SVC" '[.result[] | select(.name == "processor token") | .include[]? | .service_token.token_id? | select(. != null and . != "")] | any(. == $t)' >/dev/null \
+    || { echo "STOP: the Access policy 'processor token' does not name the processor token of processor.env"; exit 1; }
+  echo "processor policy exists"
 else
   need "the processor Access policy"
-  PREC=$(( $(cf "$API/accounts/$A/access/apps/$APP/policies" | jq '[.result[].precedence] | max // 0') + 1 ))
-  cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$PROC_SVC" --argjson p "$PREC" '{name:"processor token",decision:"non_identity",precedence:$p,include:[{service_token:{token_id:$t}}]}')" | jq -r '"policy processor: " + (if .success then "ok" else (.errors|tostring) end)'
+  PREC=$(( $(printf '%s' "$POLS" | jq '[.result[].precedence] | max // 0') + 1 ))
+  PRES=$(cf -X POST "$API/accounts/$A/access/apps/$APP/policies" -d "$(jq -n --arg t "$PROC_SVC" --argjson p "$PREC" '{name:"processor token",decision:"non_identity",precedence:$p,include:[{service_token:{token_id:$t}}]}')")
+  printf '%s' "$PRES" | jq -e '.success' >/dev/null || { echo "STOP: policy processor FAILED: $(printf '%s' "$PRES" | jq -c '.errors // "no answer"' 2> /dev/null || echo "no answer")"; exit 1; }
+  echo "policy processor: ok"
 fi
 # What the Worker needs to check an Access JWT: the app's AUD tag and the team's certs URL.
 # The team domain comes from deploy.env (LP_ACCESS_TEAM, e.g. myteam.cloudflareaccess.com):

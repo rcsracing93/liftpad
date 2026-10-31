@@ -429,6 +429,14 @@ function wireWeight(v) {
 let drawerKey = null;      // the open drawer: lift torque tires oil caution recalls checks edit
 let redraw = () => {};     // draws the screen under the drawer again (a save inside the drawer)
 const TILE_TAB = { wheels: 'torque', tires: 'tires', oil: 'oil', lift: 'lift' };
+// HANDOFF 20 (review fix 8): the NHTSA VIN decode is asked once per VIN per page; the car screen (EV oil tile) and the drawer share the answer.
+// A failed ask is forgotten, so the next screen tries again.
+const vinAsked = new Map(), vinDone = new Map();
+const vinDecode = vin => {
+  if (!vin) return Promise.resolve(null);
+  if (!vinAsked.has(vin)) vinAsked.set(vin, api('/vin?vin=' + encodeURIComponent(vin)).then(d => { vinDone.set(vin, d); return d; }).catch(() => { vinAsked.delete(vin); return null; }));
+  return vinAsked.get(vin);
+};
 const RANKC = { Low: 0, Medium: 1, High: 2 };
 // The value shown for a field: confirmed first. Ultrareview B #4: a value tagged for an engine is never a headline pick for a car with no engine set.
 const pickVal = (v, f) => { const c = v.values.filter(x => x.field === f && !x.hidden_by_placard && !x.no_headline && x.status !== 'rejected'); return c.find(x => x.status === 'confirmed') || c[0]; };
@@ -474,7 +482,7 @@ function tileData(v) {
     return { big, small, badges: badgesOf(weakest([p, sp, sz])) };
   };
   const oil = () => {
-    if (v.fuel === 'ev') return { big: 'No engine oil (EV)', small: '', badges: '<span class="pill st-confirmed">EV</span>' };
+    if (v.fuel === 'ev' || v.nhtsa_ev) return { big: 'No engine oil (EV)', small: '', badges: '<span class="pill st-confirmed">EV</span>' };
     const g = pickVal(v, 'Oil type'), q = pickVal(v, 'Quantity'), f = pickVal(v, 'Filter');
     const grade = g ? oilGrade(g.value, v) : '', qm = q && String(q.value).match(/(\d+(?:\.\d+)?)\s*(qt|quarts?|L|liters?|litres?)\b/i);
     const qty = qm ? `${qm[1]} ${/^l/i.test(qm[2]) ? 'L' : 'qt'}` : '';
@@ -510,8 +518,12 @@ const cautionsOf = v => v.values.filter(s => s.warn && !s.hidden_by_placard).sor
 async function car(id) {
   const live = fresh();
   if (!meta) meta = await api('/tabs');
-  const [v, svc] = await Promise.all([api('/vehicles/' + id), api(`/vehicles/${id}/service`).catch(() => ({ entries: [] }))]);
+  // HANDOFF 20 (E2): a failed visit list is marked, so offline with no saved copy does not say "No visits yet". A car that only NHTSA marks as EV
+  // (its fuel is not set) gets the EV oil tile too. Review fix 8: the VIN decode does not delay the screen; it is asked once per page (vinDecode)
+  // after the screen is drawn, the oil tile is redrawn when it says EV, and the drawer uses the same answer.
+  const [v, svc] = await Promise.all([api('/vehicles/' + id), api(`/vehicles/${id}/service`).catch(() => ({ entries: [], unavailable: true }))]);
   if (!live()) return;
+  if (v.vin && vinDone.get(v.vin) && vinDone.get(v.vin).ev) v.nhtsa_ev = true;   // seen before on this page: no flash, no request
   const T = tileData(v), cs = cautionsOf(v), c0 = cs[0], last = svc.entries[0], drafts = readDrafts().filter(d => d.car === +id);
   const stop = v.chart_notes && /^Do not use a 2-post/.test(v.chart_notes.kit_mark || '');
   crumb('', `<b>${esc(carName(v))}</b> <span class="trim">${esc(v.trim || '')}</span>`);
@@ -524,13 +536,23 @@ async function car(id) {
   $('#view').innerHTML = `<div class="carscreen" data-car="${id}">
     <div class="leftcol">${stopLine}${cautionLine}<div class="tiles">${tile('lift', 'Lift', T.lift)}${tile('wheels', 'Wheels off', T.wheels)}${tile('tires', 'Tires', T.tires)}${tile('oil', 'Oil', T.oil)}</div></div>
     <div class="rightcol"><a class="btn big amber logwork" href="#/car/${id}/log">Log work</a>
-      <a class="panel lastvisit" href="#/car/${id}/history"><span class="lbl">Last visit</span>${last ? `<span class="mono">${esc(last.date)} · ${miles(last.mileage)} mi</span><span>${last.items.map(itemLine).join(' · ')}</span>` : '<span>No visits yet.</span>'}
+      <a class="panel lastvisit" href="#/car/${id}/history"><span class="lbl">Last visit</span>${last ? `<span class="mono">${esc(last.date)} · ${miles(last.mileage)} mi</span><span>${last.items.map(itemLine).join(' · ')}</span>` : `<span>${svc.unavailable ? (navigator.onLine ? 'Could not load visits - try again.' : 'No saved visits offline.') : 'No visits yet.'}</span>`}
         ${drafts.map(d => `<span class="notsent">Not sent: ${esc(d.body.date)} · ${miles(d.body.mileage)} mi. It goes out when you are back online.</span>`).join('')}</a>
       <div id="needs">${needsHtml(v)}</div>
       <button type="button" class="recallline" id="recallbox" data-drawer="recalls">${esc(recallText(v))}</button>
       <button type="button" class="ghost editcarbtn" data-drawer="edit">Edit car</button></div></div>`;
   redraw = () => car(id);
   wireCar(v, id, live);
+  if (v.vin && v.fuel !== 'ev' && !v.nhtsa_ev) {
+    vinDecode(v.vin).then(dec => {
+      if (!dec || !dec.ev || !live()) return;
+      v.nhtsa_ev = true;
+      const el = document.querySelector('.tile[data-key="oil"]');
+      if (!el) return;
+      el.outerHTML = tile('oil', 'Oil', tileData(v).oil);
+      document.querySelector('.tile[data-key="oil"]').onclick = () => { drawerKey = TILE_TAB.oil; openDrawer(v, id, drawerKey); };
+    });
+  }
   if (drawerKey) openDrawer(v, id, drawerKey);
 }
 // Buttons of the car screen; the drawer has its own wiring (wireDrawer). Once a day per car the Worker asks NHTSA (recalls, Canadian-specs weight);
@@ -565,7 +587,7 @@ async function drawerBody(v, id, key) {
     : job.status === 'failed' ? `<span class="warn bad">Research failed: ${esc(job.error)}</span>` : `<span class="note">${job.status === 'claimed' ? 'Researching' : 'Queued'}</span>`;
   // The VIN decode (NHTSA only, cached) gives the engine for the lookup links and the EV flag.
   const lookTab = ['oil', 'torque', 'tires'].includes(key);
-  const dec = lookTab && v.vin ? await api('/vin?vin=' + encodeURIComponent(v.vin)).catch(() => null) : null;
+  const dec = lookTab && v.vin ? await vinDecode(v.vin) : null;
   // Decision 7: NHTSA says battery-electric -> no engine oil.
   let evNote = '';
   if (key === 'oil' && v.fuel === 'ev') evNote = `<div class="warn"><b>No engine oil (EV).</b> This car is battery-electric. It has no engine oil to change.</div>`;
@@ -1121,9 +1143,12 @@ function flagLow(entries) {
 }
 // HANDOFF 19 (D6): the cart is kept in this browser (lp-cart) so a reload does not lose it. A visit sent while offline is kept as a draft (lp-draft)
 // and sent through the normal server checks (date, mileage order, 409) when the connection is back.
-const cartSave = () => store.set('lp-cart', cart && !cart.editId ? JSON.stringify({ car: cart.car, items: [...cart.items.entries()], date: cart.date, mileage: cart.mileage }) : '');
-const cartDrop = () => { cart = null; store.set('lp-cart', ''); };
-const cartLoad = id => { try { const c = JSON.parse(store.get('lp-cart') || 'null'); return c && c.car === +id ? { car: c.car, items: new Map(c.items), date: c.date, mileage: c.mileage, editId: null, keep: null } : null; } catch (e) { return null; } };
+// HANDOFF 20 (E2): one saved cart per car. lp-cart holds { "<car id>": { items, date, mileage } }; the older single-cart form { car, items, date, mileage } is read as one entry.
+const cartAll = () => { try { const c = JSON.parse(store.get('lp-cart') || 'null'); return !c || typeof c !== 'object' ? {} : c.car != null ? { [c.car]: { items: c.items, date: c.date, mileage: c.mileage } } : c; } catch (e) { return {}; } };
+const cartWrite = all => store.set('lp-cart', Object.keys(all).length ? JSON.stringify(all) : '');
+const cartSave = () => { if (!cart || cart.editId) return; const all = cartAll(); all[cart.car] = { items: [...cart.items.entries()], date: cart.date, mileage: cart.mileage }; cartWrite(all); };
+const cartDrop = () => { const c = cart; cart = null; if (!c || c.editId) return; const all = cartAll(); delete all[c.car]; cartWrite(all); };
+const cartLoad = id => { const c = cartAll()[+id]; try { return c ? { car: +id, items: new Map(c.items), date: c.date, mileage: c.mileage, editId: null, keep: null } : null; } catch (e) { return null; } };
 // Drafts are a list (one per visit), so a second offline visit does not replace the first.
 const readDrafts = () => { try { const d = JSON.parse(store.get('lp-draft') || '[]'); return Array.isArray(d) ? d : [d]; } catch (e) { return []; } };
 const writeDrafts = list => store.set('lp-draft', list.length ? JSON.stringify(list) : '');
