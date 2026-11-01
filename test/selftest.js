@@ -1323,6 +1323,19 @@ if (health.schema >= '0013') {
         const dot = await call('/api/admin/dot', { as: 'phone' }); if (dot.s !== 200 || dot.d.level !== 'red') b.push('dot: ' + dot.s + JSON.stringify(dot.d));
         ok(!b.length, b.join('; ')); return 'levels and reasons';
       });
+      await t('HANDOFF 21 F7: the Admin status carries today\'s parts jobs (the N100 item research_parts, flat as health_collect.py writes it): jobs, posted, dropped, failed, the drop reasons; a failed parts job turns the worker line amber; no such item = parts is null', async () => {
+        const b = [], lv = async () => (await call('/api/admin/status', { as: 'phone' })).d;
+        const t1 = new Date(Date.now() + 1000).toISOString();
+        await push([{ ts: t1, kind: 'health', level: 'amber', text: 'N100 health: amber', data: { items: [{ name: 'research_worker_run', level: 'green', reason: 'last research worker run ok, 0.1 h ago' },
+          { name: 'research_parts', level: 'amber', reason: 'parts today: 2 of 5 jobs, 5 posted, 3 dropped (non-US source 2); 1 failed', jobs: 2, posted: 5, dropped: 3, failed: 1, daily_cap: 5, reasons: { 'non-US source': 2, 'source not checkable': 1 } }] } }]);
+        const s = await lv(), p = s.worker_runs.parts;
+        if (!p || p.jobs !== 2 || p.posted !== 5 || p.dropped !== 3 || p.failed !== 1 || p.daily_cap !== 5 || p.reasons['non-US source'] !== 2 || p.reasons['source not checkable'] !== 1 || p.level !== 'amber') b.push('parts: ' + JSON.stringify(p));
+        if (s.worker_runs.level !== 'amber') b.push('the worker line is ' + s.worker_runs.level);
+        const t2 = new Date(Date.now() + 2000).toISOString();
+        await push([{ ts: t2, kind: 'health', level: 'green', text: 'N100 health: green', data: { items: [{ name: 'research_worker_run', level: 'green', reason: 'last research worker run ok, 0.1 h ago' }] } }]);
+        const s2 = await lv(); if (s2.worker_runs.parts !== null) b.push('parts without an item: ' + JSON.stringify(s2.worker_runs.parts));
+        ok(!b.length, b.join('; ')); return 'parts line, amber on a failed job, null without the item';
+      });
     } else skip('HANDOFF 18 C1/C3/C4/C10: the ops log, scrubbing, prune, levels', 'local mode only (a live run leaves no log row behind)');
 
     if (LOCAL) {
@@ -1387,6 +1400,237 @@ if (health.schema >= '0013') {
     for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
   }
 } else skip('HANDOFF 18: Admin, ops log, recalls, curb weight', 'schema before 0013');
+
+// ---------- HANDOFF 21 (F2): parts routes ----------
+// The research worker posts parts only through its job result (kind parts). The processor token is refused on every other parts route and on
+// deleting a car. One bad item in a result is dropped with a reason; the good items are stored (one bad item must not 400 the job).
+// Every part number below is made up (they start with 99 or 98: no catalog uses them; the export gate refuses a real one): WIX 99011, Purolator PL99012,
+// Mopar 9910130AB; 98001 stands for the number that a New Zealand page gives and must never be stored.
+if (health.schema >= '0014' && hasProc) {
+  const GOOD = '1FTFW1CT5DFC10312', made = [];
+  const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
+  const US1 = 'https://www.rockauto.com/en/catalog/example,2020,sample+model,2.0l+l4,1000000,engine,oil+filter', US2 = 'https://www.oreillyauto.com/shop/b/oil-filters/selftest';
+  const SRC = `${US1} and ${US2}`;
+  const P = (o = {}) => ({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99011', confidence: 'Medium', source: SRC, ...o });
+  const research = async (id, parts) => {
+    const q = await call(`/api/vehicles/${id}/parts-research`, { method: 'POST', body: {} }); ok(q.s === 201 && q.d.id, 'queue ' + q.s + JSON.stringify(q.d));
+    const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } }); ok(cl.d && cl.d.id === q.d.id, 'claim ' + JSON.stringify(cl.d));
+    const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts } }); return { q, cl, r };
+  };
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const partsOf = async id => (await call(`/api/vehicles/${id}/parts`)).d;
+  const find = (d, item, choice) => d.parts.find(x => x.item === item && x.choice === choice);
+  const why = (r, re) => r.d.drops.some(x => re.test(x.reason));
+  let jeep = null, jp = null;
+  try {
+    await t('F2: the parts job request holds year, make, model, engine, trim and fuel only (no VIN, no owner); a claim with no kinds never gets it', async () => {
+      const c = await mkCar({ vin: GOOD }); await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { owner: 'Zed Q Owner' } });
+      const q = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); ok(q.s === 201, 'queue ' + q.s);
+      const again = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); ok(again.d.already === true && again.d.id === q.d.id, 'a second queue made a second job');
+      ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id } })).d.none === true, 'a claim with no kinds got the parts job');
+      ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['research', 'workup'] } })).d.none === true, 'a research claim got the parts job');
+      const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
+      ok(cl.d.kind === 'parts' && JSON.stringify(Object.keys(cl.d.request).sort()) === JSON.stringify(['engine', 'fuel', 'make', 'model', 'trim', 'year']), 'request keys ' + JSON.stringify(cl.d.request));
+      ok(!JSON.stringify(cl.d).includes(GOOD) && !/Zed/.test(JSON.stringify(cl.d)), 'the claim holds the VIN or the owner');
+      ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [] } })).s === 200, 'empty result');
+      return 'six keys';
+    });
+    await t('F2: a result must be a list; one bad item is dropped with its reason and the good item is stored (not a 400 for the job)', async () => {
+      const c = await mkCar(); jeep = c.d.id;
+      const bad1 = await call('/api/vehicles/' + jeep + '/parts-research', { method: 'POST', body: {} });
+      const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: bad1.d.id, kinds: ['parts'] } });
+      ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [] } })).s === 400, 'no parts list');
+      const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P({ item: 'bogus' }), P()] } });
+      ok(r.s === 200 && r.d.proposed === 1 && r.d.drops.length === 1 && /unknown item/.test(r.d.drops[0].reason), 'bad+good ' + r.s + JSON.stringify(r.d));
+      const d = await partsOf(jeep), o = find(d, 'oil_filter', 'first'); ok(o && o.part_no === '99011' && o.confidence === 'Medium' && o.status === 'proposed' && o.check_car === 1 && o.job_id === cl.d.id, JSON.stringify(o));
+      const job = (await carOf(jeep)).jobs.find(j => j.id === cl.d.id); ok(job && job.status === 'done' && /1 proposed part\(s\), 1 dropped/.test(job.result_summary), JSON.stringify(job));
+      ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P()] } })).s === 409, 'a done job took a second result');
+      return 'bad dropped, good stored';
+    });
+    await t('F2: grading case - WIX 99011 / Purolator PL99012 / Mopar 9910130AB from US sources; the New Zealand page number 98001 is dropped as non-US and never stored', async () => {
+      const c = await mkCar({ trim: 'SELFTEST B' }); jp = c.d.id;
+      const r = (await research(jp, [P({ source: 'https://www.wixfilters.com/en-nz/filters/98001' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' }),
+        P({ choice: 'oem', brand: 'Mopar', part_no: '9910130AB', also_fits: '09910130AA' }), P({ part_no: '99011', also_fits: '99011XP' })])).r;
+      ok(r.s === 200 && r.d.proposed === 3 && r.d.drops.length === 1 && /non-US source/.test(r.d.drops[0].reason), JSON.stringify(r.d));
+      const d = await partsOf(jp), nos = d.parts.map(x => x.part_no).sort(); ok(JSON.stringify(nos) === JSON.stringify(['99011', '9910130AB', 'PL99012']), 'stored ' + nos);
+      ok(!JSON.stringify(d).includes('98001') && find(d, 'oil_filter', 'first').also_fits === '99011XP' && d.parts.every(x => x.confidence === 'Medium' && x.check_car === 1 && x.status === 'proposed'), JSON.stringify(d.parts));
+      return 'three stored, 98001 dropped';
+    });
+    await t('F2: every server check drops its item with a reason (no URL, memory only, High part number, wrong brand, non-US host, locale path, size, missing size, no number, High fluid from the web, conflict not Low, slot twice)', async () => {
+      const c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [
+        P({ source: 'from my memory, WIX 99011' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', confidence: 'High' }), P({ item: 'cabin_air_filter', brand: 'Purolator' }),
+        P({ item: 'engine_air_filter', source: 'https://www.wixfilters.co.nz/x and ' + US1 }), P({ item: 'cabin_air_filter', choice: 'other', brand: 'Purolator', part_no: 'C35667', source: 'https://www.example.com/en-nz/a ' + US1 }),
+        { item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 40, confidence: 'Low', source: US1 }, { item: 'wiper_passenger', choice: 'first', brand: 'Bosch', confidence: 'Low', source: US1 },
+        P({ item: 'engine_air_filter', choice: 'other', brand: 'Purolator', part_no: '' }), { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'https://www.example.com/us/brake-fluid' },
+        P({ choice: 'oem', brand: 'Mopar', part_no: '9910130AB', conflict_no: '9910130AA' }), P({ item: 'cabin_air_filter', part_no: '99015' }), P({ item: 'cabin_air_filter', part_no: '99015XP' }),
+        P({ item: 'oil_filter', choice: 'first', part_no: 'bad!!no' }), { item: 'wiper_rear', choice: 'other', brand: 'Rain-X', size_in: 12, confidence: 'Low', source: US1 }])).r;
+      const want = [/no source/, /never High/, /must be WIX/, /non-US/, /non-US/, /8 to 32/, /size in inches/, /needs a part number/, /manual page/, /always Low/, /twice/, /not a part number/];
+      ok(r.s === 200, 'status ' + r.s); const miss = want.filter(re => !why(r, re)); ok(!miss.length, 'no drop for ' + miss + ' in ' + JSON.stringify(r.d.drops));
+      const wr = find(await partsOf(id), 'wiper_rear', 'other');
+      ok(r.d.proposed === 2 && wr && wr.size_in === 12 && wr.part_no === '' && wr.brand === 'Rain-X', 'the size-only Rain-X wiper was not stored ' + JSON.stringify(r.d));
+      return `${r.d.drops.length} dropped, ${r.d.proposed} stored`;
+    });
+    await t('F2: a fluid from an owner-manual page may be High, a part number never; a conflict stores one row with conflict_no and confidence Low', async () => {
+      const c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [{ item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'Owner manual p.312 (selftest)' },
+        { item: 'coolant', choice: 'spec', spec_text: 'OAT, selftest spec', confidence: 'Medium', source: US1 }, P({ part_no: '99011', conflict_no: '98002', confidence: 'Low', source: US1 + ' says 99011; ' + US2 + ' says 98002' })])).r;
+      ok(r.s === 200 && r.d.proposed === 3 && !r.d.drops.length, JSON.stringify(r.d));
+      const d = await partsOf(id), bf = find(d, 'brake_fluid', 'spec'), o = find(d, 'oil_filter', 'first');
+      ok(bf.confidence === 'High' && bf.part_no === '' && o.conflict_no === '98002' && o.confidence === 'Low' && o.part_no === '99011', JSON.stringify([bf, o]));
+      return 'manual High fluid, conflict row';
+    });
+    await t('F2: an electric car has no oil filter or engine air filter; its coolant needs a manual page', async () => {
+      const c = await mkCar(), id = c.d.id; await call('/api/vehicles/' + id, { method: 'PATCH', body: { fuel: 'ev' } });
+      const r = (await research(id, [P(), P({ item: 'engine_air_filter', part_no: '99014' }), P({ item: 'cabin_air_filter', part_no: '99015' }),
+        { item: 'coolant', choice: 'spec', spec_text: 'selftest', confidence: 'Medium', source: US1 }, { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'Medium', source: US1 }])).r;
+      ok(r.d.proposed === 2 && r.d.drops.length === 3 && r.d.drops.filter(x => /does not apply to an electric car/.test(x.reason)).length === 2 && r.d.drops.some(x => x.item === 'coolant/spec' && /manual page/.test(x.reason)), JSON.stringify(r.d));
+      const d = await partsOf(id); ok(!d.applies.includes('oil_filter') && !d.applies.includes('engine_air_filter') && d.applies.includes('cabin_air_filter') && d.fuel === 'ev', JSON.stringify(d.applies));
+      return 'EV items';
+    });
+    await t('F2: Rick confirms (check flag off, history row), a confirm is not repeated, a new search never overwrites a confirmed part and replaces a proposed one (with history), reject frees the slot', async () => {
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first'), ch = find(d0, 'oil_filter', 'other');
+      const cf = await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} }); if (cf.s !== 200 || cf.d.part.status !== 'confirmed' || cf.d.part.check_car !== 0 || !cf.d.part.confirmed_at || !cf.d.part.confirmed_by) b.push('confirm ' + JSON.stringify(cf.d));
+      if ((await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} })).s !== 409) b.push('a confirm was repeated');
+      const r = (await research(jp, [P({ part_no: '99999' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99999' })])).r;
+      if (r.d.skipped !== 1 || r.d.proposed !== 1) b.push('re-search ' + JSON.stringify(r.d));
+      const d1 = await partsOf(jp); if (find(d1, 'oil_filter', 'first').part_no !== '99011' || find(d1, 'oil_filter', 'first').status !== 'confirmed') b.push('a confirmed part was overwritten');
+      const ch1 = find(d1, 'oil_filter', 'other'); if (ch1.id !== ch.id || ch1.part_no !== 'PL99999' || ch1.check_car !== 1) b.push('the proposed row was not replaced in place ' + JSON.stringify(ch1));
+      const h = (await call(`/api/parts/${ch.id}/history`)).d; if (JSON.stringify(h.map(x => x.action)) !== JSON.stringify(['insert', 'update']) || !/PL99012/.test(h[1].old_json) || !/PL99999/.test(h[1].new_json)) b.push('history ' + JSON.stringify(h.map(x => x.action)));
+      const rj = await call(`/api/parts/${ch.id}/reject`, { method: 'POST', body: {} }); if (rj.s !== 200 || rj.d.part.status !== 'rejected') b.push('reject');
+      if (find(await partsOf(jp), 'oil_filter', 'other')) b.push('a rejected part is still listed');
+      const r2 = (await research(jp, [P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' })])).r; const n = find(await partsOf(jp), 'oil_filter', 'other');
+      if (r2.d.proposed !== 1 || !n || n.id === ch.id || n.part_no !== 'PL99012') b.push('the freed slot did not take a new row ' + JSON.stringify(r2.d));
+      const ho = (await call(`/api/parts/${o.id}/history`)).d; if (JSON.stringify(ho.map(x => x.action)) !== JSON.stringify(['insert', 'confirm'])) b.push('confirm history ' + JSON.stringify(ho.map(x => x.action)));
+      ok(!b.length, b.join('; ')); return 'confirm, replace, reject';
+    });
+    await t('F2: Rick edits a part (shape, size, High and empty checks) with a history row, and deletes one (history row kept)', async () => {
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first');
+      const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: 'wix 99011xp', source: 'Rick typed it' } }); if (e.s !== 200 || e.d.part.part_no !== 'WIX 99011XP' || e.d.part.source !== 'Rick typed it' || e.d.part.status !== 'confirmed') b.push('edit ' + e.s + JSON.stringify(e.d));
+      for (const [body, why2] of [[{ part_no: 'bad!!no' }, 'shape'], [{ confidence: 'High' }, 'High on a number'], [{ confidence: 'Sure' }, 'confidence'], [{ size_in: 40 }, 'size 40'], [{ size_in: 'big' }, 'size text'], [{}, 'empty']]) {
+        const x = await call(`/api/parts/${o.id}`, { method: 'PATCH', body }); if (x.s !== 400) b.push(`${why2}: ${x.s}`);
+      }
+      if ((await call('/api/parts/99999999', { method: 'PATCH', body: { part_no: '1234' } })).s !== 404) b.push('missing part');
+      const ho = (await call(`/api/parts/${o.id}/history`)).d; if (ho.map(x => x.action).join() !== 'insert,confirm,update' || !/99011"/.test(ho[2].old_json) || !/WIX 99011XP/.test(ho[2].new_json)) b.push('edit history ' + ho.map(x => x.action));
+      const del = find(await partsOf(jp), 'oil_filter', 'other'); const dl = await call(`/api/parts/${del.id}`, { method: 'DELETE' }); if (dl.s !== 200) b.push('delete ' + dl.s);
+      if (find(await partsOf(jp), 'oil_filter', 'other')) b.push('deleted part still listed');
+      const hd = (await call(`/api/parts/${del.id}/history`)).d; if (hd[hd.length - 1].action !== 'delete' || !/PL99012/.test(hd[hd.length - 1].old_json)) b.push('delete history');
+      ok(!b.length, b.join('; ')); return 'edit, delete, history';
+    });
+    await t('F2 review 3: Rick\'s edit keeps the per-item rules - a wiper keeps a size 8 to 32, a filter keeps its part number, a fluid keeps its spec text (400 otherwise, nothing changes)', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [P(), { item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, confidence: 'Medium', source: SRC },
+        { item: 'coolant', choice: 'spec', brand: '', spec_text: 'test coolant spec', confidence: 'Medium', source: SRC }])).r; ok(r.d.proposed === 3, JSON.stringify(r.d));
+      const d0 = await partsOf(id), f = find(d0, 'oil_filter', 'first'), w = find(d0, 'wiper_driver', 'first'), fl = find(d0, 'coolant', 'spec'), before = JSON.stringify(d0.parts);
+      for (const [pid, body, why2] of [[w.id, { size_in: null }, 'wiper size null'], [w.id, { size_in: '' }, 'wiper size empty'], [w.id, { size_in: '18in' }, 'wiper size text'], [f.id, { part_no: '' }, 'filter number cleared'], [fl.id, { spec_text: '' }, 'fluid spec cleared']]) {
+        const x = await call(`/api/parts/${pid}`, { method: 'PATCH', body }); if (x.s !== 400) b.push(`${why2}: ${x.s}`);
+      }
+      if (JSON.stringify((await partsOf(id)).parts) !== before) b.push('a refused edit changed a part');
+      const okw = await call(`/api/parts/${w.id}`, { method: 'PATCH', body: { size_in: 18 } }); if (okw.s !== 200 || okw.d.part.size_in !== 18) b.push('a valid size was refused');
+      ok(!b.length, b.join('; ')); return 'wiper, filter, fluid';
+    });
+    await t('F2 review 7: a .co address and a /catalog/ac-dc/ path are US sources; /en-nz/ and .co.nz are dropped as non-US', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [P({ source: 'https://www.partsgeek.co/catalog/x and ' + US1 }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', source: 'https://www.rockauto.com/en/catalog/ac-dc/x and ' + US1 }),
+        P({ item: 'cabin_air_filter', part_no: '99021', source: 'https://www.wixfilters.com/en-nz/f/1 and ' + US1 }), P({ item: 'engine_air_filter', part_no: '99031', source: 'https://www.wixfilters.co.nz/x and ' + US1 })])).r;
+      if (r.d.proposed !== 2 || r.d.drops.length !== 2 || !r.d.drops.every(x => /non-US/.test(x.reason))) b.push(JSON.stringify(r.d));
+      ok(!b.length, b.join('; ')); return 'short lists';
+    });
+    await t('F2 Opus 4: deleting a car closes its open parts job (a claim for it finds nothing), so no paid result can land on a car that gets the same id later', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const q = await call(`/api/vehicles/${id}/parts-research`, { method: 'POST', body: {} }); if (q.s !== 201) b.push('queue ' + q.s);
+      if ((await call('/api/vehicles/' + id, { method: 'DELETE' })).s !== 200) b.push('delete');
+      const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
+      if (!cl.d || cl.d.none !== true) b.push('the job of a deleted car was still claimable: ' + JSON.stringify(cl.d).slice(0, 120));
+      ok(!b.length, b.join('; ')); return 'job closed with the car';
+    });
+    await t('F2 Opus 7: the self-test token cannot turn a real car into a SELFTEST car, and cannot start a parts search on a car that is not one', async () => {
+      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Real', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+      const t1 = await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { trim: 'SELFTEST Z' } }); if (t1.s !== 403) b.push('trim to SELFTEST: ' + t1.s);
+      const t2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); if (t2.s !== 403) b.push('parts search: ' + t2.s);
+      ok(!b.length, b.join('; ')); return '403, 403';
+    });
+    await t('F2 seed: the tool token may queue a parts search on a real car only with {"seed":true} (the live seed of "yes research parts"); the answer of GET /parts says seed support; the test claims and closes its own job at once', async () => {
+      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Seed', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+      if ((await partsOf(c.d.id)).seed !== true) b.push('GET /parts does not say seed: true');
+      for (const [body, why2] of [[{}, 'no flag'], [{ seed: 'yes' }, 'seed not true'], [{ seed: false }, 'seed false']]) { const x = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body }); if (x.s !== 403) b.push(`${why2}: ${x.s}`); }
+      const q = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: { seed: true } }); if (q.s !== 201 || !q.d.id) b.push('seed queue ' + q.s + JSON.stringify(q.d));
+      if (q.d && q.d.id) {
+        const q2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: { seed: true } }); if (!q2.d || q2.d.already !== true) b.push('a second seed call made a second job');
+        const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
+        if (!cl.d || cl.d.id !== q.d.id || JSON.stringify(Object.keys(cl.d.request || {}).sort()) !== JSON.stringify(['engine', 'fuel', 'make', 'model', 'trim', 'year'])) b.push('claim ' + JSON.stringify(cl.d).slice(0, 160));
+        else if ((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [] } })).s !== 200) b.push('the test job could not be closed');
+      }
+      ok(!b.length, b.join('; ')); return 'seed flag';
+    });
+    await t('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [{ item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, also_fits: '99022', confidence: 'High', source: SRC }])).r;
+      if (r.d.proposed !== 0 || !why(r, /never High/)) b.push('result ' + JSON.stringify(r.d));
+      const r2 = (await research(id, [{ item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, also_fits: '99022', confidence: 'Medium', source: SRC }])).r; if (r2.d.proposed !== 1) b.push('medium ' + JSON.stringify(r2.d));
+      const w = find(await partsOf(id), 'wiper_driver', 'first'); const e = await call(`/api/parts/${w.id}`, { method: 'PATCH', body: { confidence: 'High' } }); if (e.s !== 400) b.push('edit to High: ' + e.s);
+      ok(!b.length, b.join('; ')); return 'never High';
+    });
+    await t('F2 review 5: Find parts does not overwrite a proposed row that Rick edited; a different number goes to conflict_no (Low) with a note; the skip is counted as edited by Rick', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      await research(id, [P()]); const o = find(await partsOf(id), 'oil_filter', 'first');
+      const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: '99011XP' } }); if (e.s !== 200 || e.d.part.status !== 'proposed') b.push('edit ' + e.s);
+      const r = (await research(id, [P({ part_no: '99077' })])).r;
+      if (r.d.skipped !== 1 || r.d.skipped_edited !== 1 || r.d.proposed !== 0) b.push('counts ' + JSON.stringify(r.d));
+      const n = find(await partsOf(id), 'oil_filter', 'first');
+      if (n.part_no !== '99011XP' || n.conflict_no !== '99077' || n.confidence !== 'Low' || !/Find parts later found 99077/.test(n.source) || n.check_car !== 1) b.push('row ' + JSON.stringify(n));
+      const r2 = (await research(id, [P({ part_no: '99077' })])).r; if (r2.d.skipped_edited !== 1) b.push('second search ' + JSON.stringify(r2.d));
+      const r3 = (await research(id, [P({ part_no: '99011XP' })])).r; const n3 = find(await partsOf(id), 'oil_filter', 'first'); if (r3.d.skipped_edited !== 1 || n3.part_no !== '99011XP') b.push('same number ' + JSON.stringify(r3.d));
+      ok(!b.length, b.join('; ')); return 'edited row kept, conflict shown';
+    });
+    await t('F2: the processor token is refused (403) on every parts route and on deleting a car; nothing changes', async () => {
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first'), before = JSON.stringify(d0.parts);
+      for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}],
+        [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE'], [`/api/parts/${o.id}/history`, 'GET'], [`/api/vehicles/${jp}`, 'DELETE']]) {
+        const x = await call(p, { as: 'proc', method: m, body }); if (x.s !== 403) b.push(`${m} ${p}: ${x.s}`);
+      }
+      if ((await call(`/api/vehicles/${jp}`)).s !== 200 || JSON.stringify((await partsOf(jp)).parts) !== before) b.push('the car or its parts changed');
+      if (LOCAL) for (const as of ['forged', 'expired']) if ((await call(`/api/parts/${o.id}/confirm`, { as, method: 'POST', body: {} })).s !== 403) b.push(as + ' token confirmed');   // a live run cannot sign a token (Access refuses those before the Worker)
+      ok(!b.length, b.join('; ')); return '8 routes, 403 each';
+    });
+    await t('F2: the self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (403 on any other car, nothing changes); Rick\'s login may', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [P(), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' })])).r; ok(r.d.proposed === 2, JSON.stringify(r.d));
+      const d0 = await partsOf(id), o = find(d0, 'oil_filter', 'first'), ch = find(d0, 'oil_filter', 'other');
+      try {
+        ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain' } })).s === 200, 'the trim change');   // a car that is not a SELFTEST car
+        const before = JSON.stringify((await partsOf(id)).parts);
+        for (const [p, m, body] of [[`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE']]) {
+          const x = await call(p, { method: m, body }); if (x.s !== 403) b.push(`tool ${m} ${p}: ${x.s}`);
+        }
+        if (JSON.stringify((await partsOf(id)).parts) !== before) b.push('a part changed');
+        if (LOCAL) {   // Rick's own login (a phone) is not gated
+          const cf = await call(`/api/parts/${o.id}/confirm`, { as: 'phone', method: 'POST', body: {} }); if (cf.s !== 200 || cf.d.part.status !== 'confirmed') b.push('Rick confirm ' + cf.s);
+          const pe = await call(`/api/parts/${ch.id}`, { as: 'phone', method: 'PATCH', body: { source: 'Rick typed it' } }); if (pe.s !== 200) b.push('Rick edit ' + pe.s);
+          if ((await call(`/api/parts/${ch.id}/reject`, { as: 'phone', method: 'POST', body: {} })).s !== 200) b.push('Rick reject');
+          if ((await call(`/api/parts/${o.id}`, { as: 'phone', method: 'DELETE' })).s !== 200) b.push('Rick delete');
+        }
+      } finally { await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST B' } }); }
+      const back = await call(`/api/parts/${(find(await partsOf(id), 'oil_filter', 'first') || { id: 0 }).id}/confirm`, { method: 'POST', body: {} });
+      if (!LOCAL && back.s !== 200) b.push('on a SELFTEST car the tool token was refused: ' + back.s);
+      ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
+    });
+    await t('F2: the processor may post parts only for a job it has claimed (an unclaimed or another job is 409), and the result needs a car', async () => {
+      const q = await call(`/api/vehicles/${jp}/parts-research`, { method: 'POST', body: {} });
+      ok((await call(`/api/jobs/${q.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P()] } })).s === 409, 'a queued job took a result');
+      const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
+      ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: new Array(41).fill(P()) } })).s === 400, 'more than 40 parts');
+      ok((await call(`/api/jobs/${cl.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } })).s === 200, 'fail'); return 'claim rule';
+    });
+    await t('F2: deleting a car removes its parts rows (no foreign key stop) and the car is gone', async () => {
+      ok((await partsOf(jp)).parts.length >= 2, 'the car holds no parts rows, so the delete proves nothing');
+      const d = await call('/api/vehicles/' + jp, { method: 'DELETE' }); made.splice(made.indexOf(jp), 1);
+      ok(d.s === 200 && (await call('/api/vehicles/' + jp)).s === 404, 'delete ' + d.s + JSON.stringify(d.d)); return 'deleted with parts';
+    });
+  } finally {
+    for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
+  }
+} else skip('HANDOFF 21 F2: parts routes', health.schema >= '0014' ? 'no processor token' : 'schema before 0014');
 
 // ---------- cleanup ----------
 // Every step runs and every problem is listed, so one failed step (a network error, or no value id

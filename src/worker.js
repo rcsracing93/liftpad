@@ -463,7 +463,8 @@ async function autoResearch(env, v, me) {
 }
 // HANDOFF 17 (B12): kinds = the job kinds the caller works on. The research worker asks for research and workup, the photo script for
 // read_doorcard, so neither takes the other's job. No kinds given = research and workup only (an old caller never gets a photo job).
-const JOB_KINDS = ['research', 'workup', 'read_doorcard'];
+// HANDOFF 21 (F2): 'parts' is claimed only when asked for by name; the default (no kinds given) stays research and workup.
+const JOB_KINDS = ['research', 'workup', 'read_doorcard', 'parts'];
 async function claimJob(env, me, onlyId, kinds) {
   const until = new Date(me.nowMs + LEASE_MIN * 60e3).toISOString();
   const ks = Array.isArray(kinds) && kinds.length ? kinds.filter(k => JOB_KINDS.includes(k)) : ['research', 'workup'];
@@ -480,6 +481,7 @@ async function jobResult(env, id, b, me) {
   if (!j) return bad('Job not found', 404);
   if (j.status !== 'claimed' || j.claimed_by !== me.token || !(j.lease_until > me.now)) return bad('This job is not claimed by you, or the lease ran out. Claim it again.', 409);
   if (j.kind === 'read_doorcard') return doorcardResult(env, j, b, me);
+  if (j.kind === 'parts') return partsResult(env, j, b, me);
   const rq = JSON.parse(j.request), vals = Array.isArray(b.values) ? b.values : null;
   if (!vals) return bad('Need values: a list of {tab, field, value, confidence, source}');
   const stmts = []; let skipped = 0;
@@ -507,6 +509,190 @@ async function jobResult(env, id, b, me) {
     .bind(`${vals.length - skipped} proposed value(s)${skipped ? `, ${skipped} skipped (already confirmed)` : ''}`, me.now, id, me.token));
   await env.DB.batch(stmts);
   return json({ ok: true, proposed: vals.length - skipped, skipped });
+}
+
+// ---------- Parts (HANDOFF 21, F2): filters, wipers, coolant and brake fluid spec ----------
+// The research worker posts parts only through its job result (kind 'parts'); the processor token is refused on every other parts route (the
+// allowlist PROC_ROUTES does not list them, and each route checks again). Only Rick (or the self-test tool) confirms, rejects, edits or deletes.
+// One bad item never fails the job (the HANDOFF 15 lesson): it is dropped with a reason, the good items are stored.
+const PART_KIND = { oil_filter: 'filter', engine_air_filter: 'filter', cabin_air_filter: 'filter', wiper_driver: 'wiper', wiper_passenger: 'wiper', wiper_rear: 'wiper', coolant: 'fluid', brake_fluid: 'fluid' };
+const PART_ITEMS = Object.keys(PART_KIND);
+const PART_CHOICES = { filter: ['first', 'other', 'oem'], wiper: ['first', 'other'], fluid: ['spec'] };
+// Decision 5: filters WIX first and Purolator other, wipers Bosch first and Rain-X other. The OEM cross-reference may name any maker.
+const PART_BRANDS = { filter: { first: ['WIX'], other: ['Purolator'] }, wiper: { first: ['Bosch'], other: ['Rain-X'] } };
+const brandKey = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const PART_NO_RE = /^[A-Z0-9][A-Z0-9 .\/-]{0,22}[A-Z0-9]$/, ALSO_RE = /^[A-Z0-9][A-Z0-9 ,.\/-]{0,38}$/, OEM_BRAND_RE = /^[A-Za-z][A-Za-z0-9 .&'-]{1,29}$/;
+const URL_RE = /https?:\/\/[^\s)<>"']+/gi;
+// Decision 6 + DECISIONS 2 point 7: a US car takes US sources only. A non-US host (any two-letter country domain but .us) or a locale path other
+// than en-us is "non-US", even on an allowed domain.
+// Short lists on purpose (local review finding 7); the same lists are in ops/research_worker.py. Nothing else counts as non-US (.co, .io, /catalog/ac-dc/ are fine).
+const NON_US_DOMAINS = ['co.nz', 'com.au', 'co.uk', 'ca', 'de', 'fr', 'pl', 'nl', 'it', 'es', 'in', 'my'];
+const NON_US_LOCALES = new Set(['en-nz', 'en-au', 'en-ap', 'en-gb', 'en-ca', 'en-my', 'en-in', 'de', 'fr', 'es', 'it', 'pl', 'nl']);
+const nonUsUrl = u => {
+  let x; try { x = new URL(u); } catch (e) { return true; }
+  const host = x.hostname.toLowerCase();
+  if (NON_US_DOMAINS.some(d => host === d || host.endsWith('.' + d))) return true;
+  const first = x.pathname.toLowerCase().replace(/^\/+/, '').split('/')[0].replace(/_/g, '-');
+  return NON_US_LOCALES.has(first);
+};
+const manualPage = s => /\bmanual\b/i.test(s) && /\bp(?:age|p?\.)\s*\d/i.test(s);
+// Checks the fields that must hold for a part however it arrives (the research worker or Rick's edit). Returns an error text or ''.
+function partFieldsErr(f) {
+  if (f.part_no && !PART_NO_RE.test(f.part_no)) return 'part number has a shape that is not a part number';
+  if (f.also_fits && !ALSO_RE.test(f.also_fits)) return 'also-fits has a shape that is not a part number';
+  if (f.conflict_no && !PART_NO_RE.test(f.conflict_no)) return 'conflict number has a shape that is not a part number';
+  if (f.size_in !== null && f.size_in !== undefined && !(Number.isFinite(f.size_in) && f.size_in >= 8 && f.size_in <= 32)) return 'wiper size must be 8 to 32 inches';
+  // never High on a part number (Opus pass F8, finding 8): High exists only for a fluid; a filter or wiper row is Medium at best, whichever number field it holds
+  if (PART_KIND[f.item] !== 'fluid' && f.confidence === 'High') return 'a part number is never High';
+  if (f.conflict_no && f.confidence !== 'Low') return 'a conflict between sources is always Low';
+  if (String(f.spec_text || '').length > 200 || /[\u0000-\u001f]/.test(String(f.spec_text || ''))) return 'spec text has at most 200 characters and no control characters';
+  return '';
+}
+// The per-item rules that hold for every stored part, however it arrives (local review finding 3, 2026-10-31): a filter or OEM row needs a part number,
+// a wiper needs a size of 8 to 32 inches, a fluid needs its spec text and has no part number. Rick's edit may not clear what research would never accept.
+function partItemErr(f) {
+  const kind = PART_KIND[f.item];
+  if (kind === 'filter' && !String(f.part_no || '').trim()) return 'a filter needs a part number';
+  if (kind === 'wiper' && !(Number.isFinite(f.size_in) && f.size_in !== null)) return 'a wiper needs its size in inches';
+  if (kind === 'fluid') {
+    if (!String(f.spec_text || '').trim()) return 'a fluid needs its spec text';
+    if (f.part_no || f.also_fits || f.conflict_no) return 'a fluid has no part number';
+  }
+  return '';
+}
+// One item of a parts result -> { row } or { err }. fuel is the car's fuel (ev: no oil filter, no engine air filter; coolant only from a manual page).
+function checkPart(x, fuel) {
+  if (!x || typeof x !== 'object') return { err: 'not an object' };
+  const item = String(x.item || ''), choice = String(x.choice || ''), kind = PART_KIND[item];
+  if (!kind) return { err: `unknown item "${item}"` };
+  if (!PART_CHOICES[kind].includes(choice)) return { err: `choice "${choice}" is not allowed for ${item}` };
+  if (fuel === 'ev' && (item === 'oil_filter' || item === 'engine_air_filter')) return { err: 'does not apply to an electric car' };
+  if (!CONF.includes(x.confidence)) return { err: 'confidence must be High, Medium or Low' };
+  const source = String(x.source || '').trim().slice(0, 1000), urls = source.match(URL_RE) || [], man = manualPage(source);
+  if (!urls.length && !man) return { err: 'no source: needs a URL or an owner-manual page' };
+  if (urls.some(nonUsUrl)) return { err: 'non-US source' };
+  const row = { item, choice, brand: '', part_no: String(x.part_no || '').trim().toUpperCase().replace(/\s+/g, ' '), also_fits: String(x.also_fits || '').trim().toUpperCase(),
+    conflict_no: String(x.conflict_no || '').trim().toUpperCase(), size_in: null, spec_text: String(x.spec_text || '').trim(), confidence: x.confidence, source };
+  if (kind === 'fluid') {
+    if (!row.spec_text) return { err: 'a fluid needs its spec text' };
+    if (row.part_no || row.also_fits || row.conflict_no) return { err: 'a fluid has no part number' };
+    if (row.confidence === 'High' && !man) return { err: 'High on a fluid needs an owner-manual page; the web is Medium at best' };
+    if (fuel === 'ev' && item === 'coolant' && !man) return { err: 'an electric car\'s coolant needs a manual page' };
+  } else {
+    const named = PART_BRANDS[kind][choice];
+    if (named) { if (brandKey(x.brand) !== brandKey(named[0])) return { err: `${choice} choice for ${item} must be ${named[0]}` }; row.brand = named[0]; }
+    else { const b = String(x.brand || '').trim(); if (!OEM_BRAND_RE.test(b)) return { err: 'the OEM cross-reference needs the maker name' }; row.brand = b; }
+    if (kind === 'filter') { if (!row.part_no) return { err: 'a filter needs a part number' }; row.spec_text = ''; }
+    else {
+      const sz = x.size_in === undefined || x.size_in === null || x.size_in === '' ? NaN : Number(x.size_in);
+      if (!Number.isFinite(sz)) return { err: 'a wiper needs its size in inches' };
+      row.size_in = sz; row.spec_text = '';   // the size alone is enough (Rick 2026-10-31)
+    }
+  }
+  const e = partFieldsErr(row); if (e) return { err: e };
+  return { row };
+}
+const PART_COLS = ['item', 'choice', 'brand', 'part_no', 'also_fits', 'conflict_no', 'size_in', 'spec_text', 'engine', 'status', 'confidence', 'source', 'check_car'];
+const partJsonSql = (a = '') => `json_object(${PART_COLS.map(c => `'${c}', ${a}${c}`).join(', ')})`;
+const PART_JSON = partJsonSql();
+const partJson = r => JSON.stringify(Object.fromEntries(PART_COLS.map(c => [c, r[c] ?? null])));
+// The items that apply to a car (EV: no oil filter, no engine air filter).
+const partsApply = fuel => PART_ITEMS.filter(i => !(fuel === 'ev' && (i === 'oil_filter' || i === 'engine_air_filter')));
+async function carParts(env, vid) {
+  return (await env.DB.prepare("SELECT id, vehicle_id, item, choice, brand, part_no, also_fits, conflict_no, size_in, spec_text, engine, status, confidence, source, check_car, job_id, created_at, updated_at, confirmed_at, confirmed_by FROM parts WHERE vehicle_id=? AND status <> 'rejected' ORDER BY id").bind(vid).all()).results;
+}
+async function partsResult(env, j, b, me) {
+  const items = Array.isArray(b.parts) ? b.parts : null;
+  if (!items) return bad('Need parts: a list of {item, choice, brand, part_no, size_in, spec_text, confidence, source}');
+  if (items.length > 40) return bad('At most 40 parts in one result');
+  const rq = JSON.parse(j.request), vid = parseInt(String(j.target).replace(/^car:/, ''), 10);
+  const car = Number.isInteger(vid) ? await env.DB.prepare('SELECT id, fuel, year, make, model FROM vehicles WHERE id=?').bind(vid).first() : null;
+  if (!car) return bad('The car of this job is gone', 409);
+  // Opus pass F8, finding 4: vehicles.id can be given again to the next car (no AUTOINCREMENT). A result is stored only on the car the job was asked about.
+  const same = (a, b) => String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
+  if (!same(rq.year, car.year) || !same(rq.make, car.make) || !same(rq.model, car.model)) return bad('The car of this job is not the car it was asked about (deleted and added again?); the result is not stored', 409);
+  const stmts = [], drops = [], seen = new Set(); let stored = 0, skipped = 0, skippedEdited = 0;
+  for (const x of items) {
+    const c = checkPart(x, car.fuel), label = x && typeof x === 'object' ? `${x.item}/${x.choice}` : '?';
+    if (c.err) { drops.push({ item: label, reason: c.err }); continue; }
+    const r = c.row, slot = r.item + '|' + r.choice;
+    if (seen.has(slot)) { drops.push({ item: label, reason: 'the slot is in this result twice' }); continue; }
+    seen.add(slot);
+    r.engine = String(rq.engine || '').trim().slice(0, 80);
+    const old = await env.DB.prepare("SELECT * FROM parts WHERE vehicle_id=? AND item=? AND choice=? AND status <> 'rejected'").bind(car.id, r.item, r.choice).first();
+    if (old && old.status === 'confirmed') { skipped++; continue; }   // a confirmed row is never overwritten by a new search
+    // A proposed row that Rick edited (an 'update' in its history by anyone but the processor) is treated like a confirmed one (local review finding 5):
+    // research does not overwrite it. A different part number from research goes into conflict_no (Low, said in the source) so that Rick sees it.
+    if (old && (await env.DB.prepare("SELECT 1 AS x FROM parts_history WHERE part_id=? AND action='update' AND device <> 'processor' LIMIT 1").bind(old.id).first())) {
+      skipped++; skippedEdited++;
+      const kind = PART_KIND[r.item];
+      // Opus pass F8, finding 6: an earlier conflict number (Rick's or an earlier search's) is never replaced, and both statements run only while the row is still
+      // proposed (the checks above are reads; Rick may confirm in between)
+      if (kind !== 'fluid' && r.part_no && old.part_no && !old.conflict_no && r.part_no !== old.part_no) {
+        const src = `${old.source} | Find parts later found ${r.part_no}: ${r.source}`.slice(0, 1000);
+        const nw = { ...old, conflict_no: r.part_no, confidence: 'Low', source: src, check_car: 1 };
+        if (!partFieldsErr(nw)) {
+          stmts.push(env.DB.prepare("INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, ?, " + PART_JSON + ", ?, ?, ? FROM parts WHERE id=? AND status='proposed' AND conflict_no=''").bind('update', partJson(nw), me.now, me.device, old.id),
+            env.DB.prepare("UPDATE parts SET conflict_no=?, confidence=?, source=?, check_car=1, job_id=?, updated_at=? WHERE id=? AND status='proposed' AND conflict_no=''").bind(nw.conflict_no, 'Low', src, j.id, me.now, old.id));
+        }
+      }
+      continue;
+    }
+    if (old) {   // a proposed row of the same slot is replaced, with a history row of the old state - only while it is still proposed and Rick has not edited it (Opus pass F8, finding 6)
+      const nw = { ...r, status: 'proposed', check_car: 1 };
+      const guard = "status='proposed' AND NOT EXISTS (SELECT 1 FROM parts_history h WHERE h.part_id = parts.id AND h.action='update' AND h.device <> 'processor')";
+      stmts.push(env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, ?, ' + PART_JSON + ', ?, ?, ? FROM parts WHERE id=? AND ' + guard).bind('update', partJson(nw), me.now, me.device, old.id),
+        env.DB.prepare("UPDATE parts SET brand=?, part_no=?, also_fits=?, conflict_no=?, size_in=?, spec_text=?, engine=?, confidence=?, source=?, check_car=1, job_id=?, updated_at=? WHERE id=? AND " + guard)
+          .bind(r.brand, r.part_no, r.also_fits, r.conflict_no, r.size_in, r.spec_text, r.engine, r.confidence, r.source, j.id, me.now, old.id));
+    } else {
+      stmts.push(env.DB.prepare("INSERT INTO parts(vehicle_id, item, choice, brand, part_no, also_fits, conflict_no, size_in, spec_text, engine, status, confidence, source, check_car, job_id, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'proposed',?,?,1,?,?,?)")
+        .bind(car.id, r.item, r.choice, r.brand, r.part_no, r.also_fits, r.conflict_no, r.size_in, r.spec_text, r.engine, r.confidence, r.source, j.id, me.now, me.now),
+        env.DB.prepare("INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, 'insert', NULL, " + PART_JSON + ", ?, ? FROM parts WHERE vehicle_id=? AND item=? AND choice=? AND status <> 'rejected'").bind(me.now, me.device, car.id, r.item, r.choice));
+    }
+    stored++;
+  }
+  const dropText = drops.map(d => `${d.item}: ${d.reason}`).join('; ');
+  stmts.push(env.DB.prepare("UPDATE jobs SET status='done', result_summary=?, lease_until=NULL, updated_at=? WHERE id=? AND status='claimed' AND claimed_by=?")
+    .bind(`${stored} proposed part(s)${skipped - skippedEdited ? `, ${skipped - skippedEdited} skipped (already confirmed)` : ''}${skippedEdited ? `, ${skippedEdited} skipped (edited by Rick)` : ''}${drops.length ? `, ${drops.length} dropped: ${dropText}` : ''}`.slice(0, 900), me.now, j.id, me.token));
+  await env.DB.batch(stmts);
+  return json({ ok: true, proposed: stored, skipped, skipped_edited: skippedEdited, drops });
+}
+// Rick (or the self-test tool) only. action: confirm, reject, update (set = the new fields), delete.
+async function changePart(env, id, action, set, me) {
+  const old = await env.DB.prepare('SELECT * FROM parts WHERE id=?').bind(id).first();
+  if (!old) return bad('Part not found', 404);
+  if (action === 'delete') {
+    await env.DB.batch([env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, ?, ' + PART_JSON + ', NULL, ?, ? FROM parts WHERE id=?').bind('delete', me.now, me.device, id),
+      env.DB.prepare('DELETE FROM parts WHERE id=?').bind(id)]);
+    return json({ ok: true });
+  }
+  if (action === 'confirm' && old.status !== 'proposed') return bad(`This part is ${old.status}, not proposed`, 409);
+  if (action === 'reject' && old.status === 'rejected') return bad('This part is already rejected', 409);
+  const nw = { ...old, ...set };
+  if (action === 'confirm') Object.assign(nw, { status: 'confirmed', check_car: 0 });
+  if (action === 'reject') nw.status = 'rejected';
+  const cols = Object.keys(set).concat(action === 'confirm' ? ['status', 'check_car', 'confirmed_at', 'confirmed_by'] : action === 'reject' ? ['status'] : []);
+  const vals = Object.assign({}, set, action === 'confirm' ? { status: 'confirmed', check_car: 0, confirmed_at: me.now, confirmed_by: me.device } : action === 'reject' ? { status: 'rejected' } : {});
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, ?, ' + PART_JSON + ', ?, ?, ? FROM parts WHERE id=?').bind(action, partJson(nw), me.now, me.device, id),
+    env.DB.prepare(`UPDATE parts SET ${cols.map(k => k + '=?').join(', ')}, updated_at=? WHERE id=?`).bind(...cols.map(k => vals[k]), me.now, id)]);
+  return json({ ok: true, part: await env.DB.prepare('SELECT * FROM parts WHERE id=?').bind(id).first() });
+}
+// Rick 2026-10-31: only Rick confirms. The self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (so the live
+// self-test can grade the routes); on any other car it is refused (403). Rick's own login is never gated here. A missing part falls through to 404.
+async function toolPartGate(env, partId, me) {
+  if (!me.tool) return null;
+  const r = await env.DB.prepare('SELECT v.trim FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.id=?').bind(partId).first();
+  return r && !/^SELFTEST/.test(r.trim || '') ? bad('The self-test token may decide parts on a SELFTEST car only. Only Rick confirms a part.', 403) : null;
+}
+async function queuePartsResearch(env, v, me) {
+  const open = await env.DB.prepare("SELECT id FROM jobs WHERE kind='parts' AND target=? AND status IN ('queued','claimed')").bind('car:' + v.id).first();
+  if (open) return json({ ok: true, id: open.id, already: true });
+  // Decision 4 (HANDOFF 21): year, make, model, engine, trim and fuel only. Never the VIN, the owner, the notes or the service log.
+  const req = { year: v.year, make: v.make, model: v.model, engine: v.engine || '', trim: v.trim || '', fuel: v.fuel || '' };
+  const r = await env.DB.prepare('INSERT INTO jobs(kind, target, request, status, created_at, updated_at) VALUES(?,?,?,?,?,?) RETURNING id')
+    .bind('parts', 'car:' + v.id, JSON.stringify(req), 'queued', me.now, me.now).first();
+  return json({ ok: true, id: r.id }, 201);
 }
 
 // ---------- Engine lists: fueleconomy.gov through the Worker (HANDOFF 17, B1-B3) ----------
@@ -750,8 +936,12 @@ async function adminStatus(env, me, url, withLog) {
   const cost = items.find(i => i.name === 'research_cost');
   const costOut = cost ? { today_usd: cost.data && cost.data.today_usd, month_usd: cost.data && cost.data.month_usd, daily_cap_usd: cost.data && cost.data.daily_cap_usd } : null;
   const runItem = items.find(i => i.name === 'research_worker_run');
-  const workerRuns = { level: worstOf([runItem ? runItem.level : 'amber', cost ? cost.level : 'green']), reason: runItem ? runItem.reason : 'No research worker line in the health report.',
-    last_run: run ? { ts: run.ts, level: run.level, text: run.text, data: run.data } : null, cost: costOut };
+  // HANDOFF 21 (F7): today's parts jobs, what they posted and dropped, and why (from the N100 health item research_parts; null when the report has none).
+  const pItem = items.find(i => i.name === 'research_parts'), pd = pItem && pItem.data;
+  const partsOut = pd ? { level: pItem.level, reason: pItem.reason, jobs: Number(pd.jobs) || 0, posted: Number(pd.posted) || 0, dropped: Number(pd.dropped) || 0, failed: Number(pd.failed) || 0, daily_cap: Number(pd.daily_cap) || 0,
+    reasons: pd.reasons && typeof pd.reasons === 'object' ? Object.fromEntries(Object.entries(pd.reasons).slice(0, 6).map(([k, n]) => [String(k).slice(0, 60), Number(n) || 0])) : {} } : null;
+  const workerRuns = { level: worstOf([runItem ? runItem.level : 'amber', cost ? cost.level : 'green', pItem ? pItem.level : 'green']), reason: runItem ? runItem.reason : 'No research worker line in the health report.',
+    last_run: run ? { ts: run.ts, level: run.level, text: run.text, data: run.data } : null, cost: costOut, parts: partsOut };
   // Results: what research and door-card reads proposed (the work is in Needs confirming).
   const prop = await env.DB.prepare("SELECT (SELECT count(*) FROM vals WHERE status='proposed') v, (SELECT count(*) FROM photo_reads WHERE status='proposed') p").first();
   const recent = (await env.DB.prepare("SELECT id, kind, result_summary, updated_at FROM jobs WHERE status='done' AND result_summary IS NOT NULL ORDER BY updated_at DESC LIMIT 5").all()).results
@@ -1245,6 +1435,9 @@ const app = {
           const trim = String(b.trim || '').trim();
           if (trim.length > TRIM_MAX || /[\u0000-\u001f]/.test(trim)) return bad(`A trim has at most ${TRIM_MAX} characters and no control characters`);
           if (trim === (v.trim || '')) return json({ ok: true, trim, changed: false });
+          // Opus pass F8, finding 7: the self-test token may decide parts only on a SELFTEST car, so it must not be able to turn a real car into one. It may set a
+          // SELFTEST trim only on a car that is one now or was one before (its own trim log in notes says so).
+          if (me.tool && /^SELFTEST/.test(trim) && !/^SELFTEST/.test(v.trim || '') && !/trim "SELFTEST/.test(v.notes || '')) return bad('The self-test token may not turn a car into a SELFTEST car', 403);
           const line = `${me.now.slice(0, 10)} trim "${v.trim || ''}" -> "${trim}" (${me.device})`;
           await env.DB.prepare("UPDATE vehicles SET trim=?, notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || char(10) || ? END WHERE id=?").bind(trim, line, line, v.id).run();
           const research_job = await autoResearch(env, { ...v, trim }, me);
@@ -1281,7 +1474,14 @@ const app = {
         const ids = (await env.DB.prepare("SELECT id FROM vals WHERE scope='car' AND vehicle_id=?").bind(+mm[1]).all()).results.map(r => r.id);
         for (const id of ids) await changeValue(env, id, 'delete', {}, me);
         // The service log goes with the car, but not silently: one history row per visit says it was deleted with the car.
-        await env.DB.batch([env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
+        // HANDOFF 21 (F2): the car's parts go with it, each with a history row (parts_history has no foreign key and stays).
+        // Opus pass F8, finding 4: an open parts job of this car is closed with the car (it would be paid for a car that is gone, and the id can be given to the next car)
+        await env.DB.batch([env.DB.prepare("UPDATE jobs SET status='failed', lease_until=NULL, error='the car was deleted', updated_at=? WHERE kind='parts' AND target=? AND status IN ('queued','claimed')").bind(me.now, 'car:' + +mm[1]),
+          env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT p.id, ?, ' + partJsonSql('p.') + ', NULL, ?, ? FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND v.trim NOT LIKE \'SELFTEST%\'').bind('delete', me.now, me.device, +mm[1]),
+          // A self-test car leaves nothing behind: its parts history goes with it (like its service-log history).
+          env.DB.prepare("DELETE FROM parts_history WHERE part_id IN (SELECT p.id FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
+          env.DB.prepare('DELETE FROM parts WHERE vehicle_id=?').bind(+mm[1]),
+          env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM photo_reads WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM car_facts WHERE vehicle_id=?').bind(+mm[1]),   // HANDOFF 18: the cached recalls go with the car
           env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim NOT LIKE 'SELFTEST%'").bind(me.now, me.device, +mm[1]),
@@ -1387,6 +1587,60 @@ const app = {
       }
       mm = p.match(/^\/api\/values\/(\d+)\/history$/);
       if (mm && m === 'GET') return json((await env.DB.prepare('SELECT * FROM history WHERE value_id=? ORDER BY id').bind(+mm[1]).all()).results);
+      // HANDOFF 21 (F2): parts. None of these routes is on the processor list (the allowlist answers 403 first); each also refuses the processor itself.
+      // The processor posts parts only through its job result (kind parts).
+      mm = p.match(/^\/api\/vehicles\/(\d+)\/parts$/);
+      if (mm && m === 'GET') {
+        if (me.processor) return bad('Parts are not for the processor', 403);
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        const parts = await carParts(env, v.id);
+        // seed: true = this Worker lets the seed runner (tool token, body {"seed":true}) queue a parts search on a real car; the runner checks it before it queues anything
+        return json({ vehicle_id: v.id, fuel: v.fuel || '', applies: partsApply(v.fuel), parts, proposed: parts.filter(x => x.status === 'proposed').length, seed: true });
+      }
+      mm = p.match(/^\/api\/vehicles\/(\d+)\/parts-research$/);
+      if (mm && m === 'POST') {
+        if (me.processor) return bad('The processor cannot start a parts search', 403);
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        // Opus pass F8, finding 7: a parts search costs money; the self-test token may queue one only on a SELFTEST car (autoResearch leaves the tool token out for the same reason).
+        // The one exception is the seed (Rick's "yes research parts", lp-run f-parts-seed): the runner sends {"seed":true} on purpose, one car at a time, in Rick's order. The
+        // research worker's own caps (5 parts jobs and 2 USD a day) still bound what is spent; a plain tool-token call without the flag stays 403.
+        if (me.tool && !/^SELFTEST/.test(v.trim || '')) {
+          const sb = await req.json().catch(() => ({}));
+          if (!sb || sb.seed !== true) return bad('The self-test token may start a parts search on a SELFTEST car only', 403);
+        }
+        return queuePartsResearch(env, v, me);
+      }
+      mm = p.match(/^\/api\/parts\/(\d+)$/);
+      if (mm && m === 'PATCH') {
+        if (me.processor) return bad('The processor cannot change a part', 403);
+        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
+        const b = await req.json().catch(() => ({})), set = {};
+        for (const k of ['brand', 'part_no', 'also_fits', 'conflict_no', 'spec_text', 'source']) if (k in b) set[k] = String(b[k] ?? '').trim();
+        for (const k of ['part_no', 'also_fits', 'conflict_no']) if (k in set) set[k] = set[k].toUpperCase().replace(/\s+/g, ' ');
+        if ('confidence' in b) { if (!CONF.includes(b.confidence)) return bad('Confidence must be High, Medium or Low'); set.confidence = b.confidence; }
+        if ('size_in' in b) { set.size_in = b.size_in === null || b.size_in === '' ? null : Number(b.size_in); if (set.size_in !== null && !Number.isFinite(set.size_in)) return bad('The wiper size must be a number of inches'); }
+        if (!Object.keys(set).length) return bad('Nothing to change');
+        const cur = await env.DB.prepare('SELECT * FROM parts WHERE id=?').bind(+mm[1]).first(); if (!cur) return bad('Part not found', 404);
+        const err = partFieldsErr({ ...cur, ...set }) || partItemErr({ ...cur, ...set }); if (err) return bad(err);
+        return changePart(env, +mm[1], 'update', set, me);
+      }
+      if (mm && m === 'DELETE') {
+        if (me.processor) return bad('The processor cannot delete a part', 403);
+        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
+        return changePart(env, +mm[1], 'delete', {}, me);
+      }
+      mm = p.match(/^\/api\/parts\/(\d+)\/(confirm|reject)$/);
+      if (mm && m === 'POST') {
+        // Only Rick confirms or rejects a part: a processor call can never do either.
+        if (me.processor) return bad('The processor cannot confirm or reject parts', 403);
+        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
+        return changePart(env, +mm[1], mm[2], {}, me);
+      }
+      mm = p.match(/^\/api\/parts\/(\d+)\/history$/);
+      if (mm && m === 'GET') {
+        if (me.processor) return bad('Parts are not for the processor', 403);
+        return json((await env.DB.prepare('SELECT * FROM parts_history WHERE part_id=? ORDER BY id').bind(+mm[1]).all()).results);
+      }
       if (p === '/api/jobs' && m === 'POST') {
         const b = await req.json(); const v = await vehicleRow(env, parseInt(b.vehicle_id, 10));
         if (!v) return bad('Car not found', 404);

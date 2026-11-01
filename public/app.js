@@ -134,6 +134,7 @@ async function prefetchAll(cars) {
     for (const c of cars) {
       const v = await api(`/vehicles/${c.id}?peek=1`);
       await api(`/vehicles/${c.id}/service`);
+      await api(`/vehicles/${c.id}/parts`).catch(() => null);   // HANDOFF 21 (F4): the Parts screen is in the saved copy (read only offline)
       if (c.grp !== 'visitor' && v.ali && v.ali.img) await fetch(v.ali.img);
     }
     store.set('lp-saved', String(Date.now()));
@@ -147,7 +148,7 @@ let adminDay = '', adminKind = '';
 const LV = { green: 'OK', amber: 'Check', red: 'Problem', info: 'Info' };   // info: grey, no colour judgement (D1 free-limit % on Workers Paid)
 const lvPill = l => `<span class="pill lv-${esc(l)}" style="margin-left:0">${LV[l] || esc(l)}</span>`;
 const ITEM_LABEL = { disk_root: 'Disk (N100)', disk_nas: 'Disk (NAS)', backup_file: 'Last backup', backup_nas_copy: 'NAS copy of the backup', backup_nas_mount: 'NAS backups share', backup_run: 'Backup job',
-  health_ping_run: 'Health ping job', token_check_run: 'Token check job', token_expiry: 'Token expiry', research_worker_run: 'Research worker', research_cost: 'Research cost',
+  health_ping_run: 'Health ping job', token_check_run: 'Token check job', token_expiry: 'Token expiry', research_worker_run: 'Research worker', research_cost: 'Research cost', research_parts: 'Parts search',
   service_log_export: 'Service log export', n100_report: 'N100 report' };
 const itemLabel = i => ITEM_LABEL[i.name] || String(i.name).replace(/^d1_/, 'D1 ').replace(/_/g, ' ');
 const aitem = i => `<li class="aitem lv-${esc(i.level)}">${lvPill(i.level)} <b>${esc(itemLabel(i))}</b><span class="areason">${esc(i.reason)}</span>${i.data && i.data.expires ? `<span class="areason src">Expires: ${Object.entries(i.data.expires).map(([k, d]) => `${esc(k.replace(/_/g, ' '))} ${esc(d)}`).join(', ')}</span>` : ''}</li>`;
@@ -169,7 +170,8 @@ async function adminPage() {
       ${q.failed.length ? `<ul class="alist">${q.failed.map(j => `<li class="aitem lv-amber"><b>Job ${j.id} (${esc(j.kind)})</b><span class="areason">${esc(j.why)} Tries: ${j.attempts}. ${esc(when(j.at))}</span></li>`).join('')}</ul>` : ''}</section>
     <section class="card" id="adm-worker" aria-label="Worker runs"><h3>Worker runs ${lvPill(w.level)}</h3><p>${esc(w.reason)}</p>
       <p class="src">${lr ? `Last run ${esc(when(lr.ts))} UTC: ${esc(lr.text)}${lr.data && lr.data.duration_s != null ? ` · ${esc(lr.data.duration_s)} s` : ''}${lr.data && lr.data.calls != null ? ` · ${esc(lr.data.calls)} calls` : ''}` : 'No run has been pushed yet.'}</p>
-      <p class="src">Cost today ${money(w.cost && w.cost.today_usd)} of ${money(w.cost && w.cost.daily_cap_usd)} · this month ${money(w.cost && w.cost.month_usd)}</p></section>
+      <p class="src">Cost today ${money(w.cost && w.cost.today_usd)} of ${money(w.cost && w.cost.daily_cap_usd)} · this month ${money(w.cost && w.cost.month_usd)}</p>
+      ${w.parts ? `<p class="src" id="adm-parts">Parts search today (UTC): ${w.parts.jobs} of ${w.parts.daily_cap} jobs · ${w.parts.posted} parts posted · ${w.parts.dropped} dropped${w.parts.failed ? ` · ${w.parts.failed} job${w.parts.failed === 1 ? '' : 's'} failed` : ''}${Object.keys(w.parts.reasons || {}).length ? ` (${Object.entries(w.parts.reasons).map(([k, n]) => `${esc(k)} ${n}`).join(', ')})` : ''}</p>` : ''}</section>
     <section class="card" id="adm-results" aria-label="Results"><h3>Results ${lvPill(r.level)}</h3><p>${esc(r.reason)}</p><a class="btn" href="#/confirm">Open Needs confirming</a>
       ${r.recent.length ? `<ul class="alist">${r.recent.map(j => `<li class="aitem lv-green"><b>Job ${j.id} (${esc(j.kind)})</b><span class="areason">${esc(j.summary)}</span></li>`).join('')}</ul>` : ''}</section>
     <section class="card" id="adm-n100" aria-label="N100 health"><h3>N100 health</h3><p class="src">${d.n100.as_of ? 'Report from ' + esc(when(d.n100.as_of)) + ' UTC' : 'No report yet'}</p><ul class="alist">${d.n100.items.map(aitem).join('')}</ul></section>
@@ -483,13 +485,16 @@ function tileData(v) {
   };
   const oil = () => {
     if (v.fuel === 'ev' || v.nhtsa_ev) return { big: 'No engine oil (EV)', small: '', badges: '<span class="pill st-confirmed">EV</span>' };
-    const g = pickVal(v, 'Oil type'), q = pickVal(v, 'Quantity'), f = pickVal(v, 'Filter');
+    const g = pickVal(v, 'Oil type'), q = pickVal(v, 'Quantity'), f0 = pickVal(v, 'Filter');
+    // HANDOFF 21 (F4): the first-choice oil filter of the Parts screen, with a "check" tag until Rick confirms it; it replaces the typed Filter value.
+    const pf = (v.parts || []).find(p => p.item === 'oil_filter' && p.choice === 'first' && p.status !== 'rejected' && p.part_no);
+    const f = pf ? { value: `${pf.brand} ${pf.part_no}`, html: `${esc(pf.brand)} ${esc(pf.part_no)}${pf.check_car ? ' <span class="chk">check</span>' : ''}` } : f0;
     const grade = g ? oilGrade(g.value, v) : '', qm = q && String(q.value).match(/(\d+(?:\.\d+)?)\s*(qt|quarts?|L|liters?|litres?)\b/i);
     const qty = qm ? `${qm[1]} ${/^l/i.test(qm[2]) ? 'L' : 'qt'}` : '';
     const spec = g && /·/.test(g.value) ? g.value.split('·').slice(1).join('·').trim() : '';
     const big = g ? (grade === null ? 'Several engines' : esc(grade ? grade + (qty ? ' · ' + qty : '') : String(g.value).slice(0, 30))) : missing('oil type');
-    const small = [grade === null ? 'see the drawer for each engine' : '', qty ? 'with filter' : missing('quantity'), spec && esc(spec), f && esc(f.value)].filter(Boolean).join(' · ');
-    return { big, small, badges: badgesOf(weakest([g, q, f])) };
+    const small = [grade === null ? 'see the drawer for each engine' : '', qty ? 'with filter' : missing('quantity'), spec && esc(spec), f && (f.html || esc(f.value))].filter(Boolean).join(' · ');
+    return { big, small, badges: badgesOf(weakest([g, q, f0])) };
   };
   const lift = () => {
     const a = v.ali, pts = pickVal(v, 'Points');
@@ -509,9 +514,14 @@ const needsHtml = v => {
   const rows = [...prop.map(s => { const txt = noNm(showVal(s)), long = txt.length > 40;
       return { t: `${esc(s.field)} <span class="mono">${esc(txt.slice(0, 40))}${long ? '...' : ''}</span> ${pill('proposed')}`, a: s.is_safety || s.warn || long ? `data-drawer="${esc(s.tab)}"` : `data-ok="${s.id}"`, check: !!(s.is_safety || s.warn || long) }; }),
     ...(c ? [{ t: `Curb weight <span class="mono">${lbPlain(c.lb)} lb</span> ${pill('proposed')}`, a: 'id="wconfirm2"', check: false }] : [])];
-  if (!rows.length) return '';
-  return `<div class="panel needs"><span class="lbl">Needs you</span>${rows.slice(0, 2).map(r => `<div class="needrow"><span>${r.t}</span>${r.check ? `<button class="t48" ${r.a}>Check</button>` : `<button class="ok t48 needsnet" ${r.a}>Confirm</button>`}</div>`).join('')}
-    ${rows.length > 2 ? `<a class="src" href="#/confirm">${rows.length - 2} more in Needs confirming</a>` : ''}<span class="src offlinewhy">Confirming needs a connection.</span></div>`;
+  // HANDOFF 21 (F4): proposed parts are counted here. The button is "Check" (it opens the Parts screen): a part number is checked against the car
+  // before Rick confirms it, so there is no one-tap Confirm for the whole list. The row is always shown (the Needs confirming page does not list parts).
+  const np = (v.parts || []).filter(p => p.status === 'proposed').length;
+  const partsRow = np ? { t: `<span class="mono">${np} part${np === 1 ? '' : 's'} proposed</span>`, a: `data-goto="#/car/${v.id}/parts"`, check: true } : null;
+  if (!rows.length && !partsRow) return '';
+  const keep = partsRow ? 1 : 2, shown = [...rows.slice(0, keep), ...(partsRow ? [partsRow] : [])];
+  return `<div class="panel needs"><span class="lbl">Needs you</span>${shown.map(r => `<div class="needrow"><span>${r.t}</span>${r.check ? `<button class="t48" ${r.a}>Check</button>` : `<button class="ok t48 needsnet" ${r.a}>Confirm</button>`}</div>`).join('')}
+    ${rows.length > keep ? `<a class="src" href="#/confirm">${rows.length - keep} more in Needs confirming</a>` : ''}<span class="src offlinewhy">Confirming needs a connection.</span></div>`;
 };
 // The caution line: amber for a standing step (warn 1), red and "Do not lift yet" for a block (warn 2).
 const cautionsOf = v => v.values.filter(s => s.warn && !s.hidden_by_placard).sort((a, b) => b.warn - a.warn);
@@ -521,8 +531,11 @@ async function car(id) {
   // HANDOFF 20 (E2): a failed visit list is marked, so offline with no saved copy does not say "No visits yet". A car that only NHTSA marks as EV
   // (its fuel is not set) gets the EV oil tile too. Review fix 8: the VIN decode does not delay the screen; it is asked once per page (vinDecode)
   // after the screen is drawn, the oil tile is redrawn when it says EV, and the drawer uses the same answer.
-  const [v, svc] = await Promise.all([api('/vehicles/' + id), api(`/vehicles/${id}/service`).catch(() => ({ entries: [], unavailable: true }))]);
+  // HANDOFF 21 (F4): the car's parts (the Parts button, the filter line on the Oil tile, the Needs you count). A failed answer leaves the screen as it was
+  // (no Parts button): an old Worker has no such route.
+  const [v, svc, pj] = await Promise.all([api('/vehicles/' + id), api(`/vehicles/${id}/service`).catch(() => ({ entries: [], unavailable: true })), api(`/vehicles/${id}/parts`).catch(() => null)]);
   if (!live()) return;
+  v.parts = pj ? pj.parts : []; v.partsOk = !!pj;
   if (v.vin && vinDone.get(v.vin) && vinDone.get(v.vin).ev) v.nhtsa_ev = true;   // seen before on this page: no flash, no request
   const T = tileData(v), cs = cautionsOf(v), c0 = cs[0], last = svc.entries[0], drafts = readDrafts().filter(d => d.car === +id);
   const stop = v.chart_notes && /^Do not use a 2-post/.test(v.chart_notes.kit_mark || '');
@@ -535,7 +548,7 @@ async function car(id) {
     <span class="val tbig">${t.big}</span>${t.small ? `<span class="val tsmall">${t.small}</span>` : ''}</${key === 'lift' ? 'a' : 'button'}>`;
   $('#view').innerHTML = `<div class="carscreen" data-car="${id}">
     <div class="leftcol">${stopLine}${cautionLine}<div class="tiles">${tile('lift', 'Lift', T.lift)}${tile('wheels', 'Wheels off', T.wheels)}${tile('tires', 'Tires', T.tires)}${tile('oil', 'Oil', T.oil)}</div></div>
-    <div class="rightcol"><a class="btn big amber logwork" href="#/car/${id}/log">Log work</a>
+    <div class="rightcol"><a class="btn big amber logwork" href="#/car/${id}/log">Log work</a>${v.partsOk ? `<a class="btn big partsbtn" href="#/car/${id}/parts">Parts</a>` : ''}
       <a class="panel lastvisit" href="#/car/${id}/history"><span class="lbl">Last visit</span>${last ? `<span class="mono">${esc(last.date)} · ${miles(last.mileage)} mi</span><span>${last.items.map(itemLine).join(' · ')}</span>` : `<span>${svc.unavailable ? (navigator.onLine ? 'Could not load visits - try again.' : 'No saved visits offline.') : 'No visits yet.'}</span>`}
         ${drafts.map(d => `<span class="notsent">Not sent: ${esc(d.body.date)} · ${miles(d.body.mileage)} mi. It goes out when you are back online.</span>`).join('')}</a>
       <div id="needs">${needsHtml(v)}</div>
@@ -572,6 +585,7 @@ function wireCar(v, id, live) {
 function wireNeeds(v, id) {
   wireStatus(() => redraw());
   document.querySelectorAll('#needs [data-drawer]').forEach(b => b.onclick = () => { drawerKey = b.dataset.drawer; openDrawer(v, id, drawerKey); });
+  document.querySelectorAll('#needs [data-goto]').forEach(b => b.onclick = () => { location.hash = b.dataset.goto; });
   const c = $('#wconfirm2'); if (c) c.onclick = () => api(`/vehicles/${id}/weight`, { method: 'POST', body: { action: 'confirm' } }).then(() => redraw()).catch(fail);
 }
 // ---------- The drawer (HANDOFF 19, D2): one component for the three value tiles, the Lift points, the caution, the recalls, the checks and Edit car ----------
@@ -677,7 +691,7 @@ async function openDrawer(v, id, key) {
   $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer;
   wireDrawer(v, id);
 }
-function closeDrawer() { drawerKey = null; const x = $('#drawerwrap'); if (x) x.remove(); }
+function closeDrawer() { drawerKey = null; partOpen = null; const x = $('#drawerwrap'); if (x) x.remove(); }
 function wireDrawer(v, id) {
   const on = (sel, fn) => { const e = $(sel); if (e) e.onclick = fn; };
   if ($('#weightbox')) wireWeight(v);
@@ -744,6 +758,132 @@ function wireDrawer(v, id) {
   document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => api('/vehicles/' + id, { method: 'PATCH', body: { grp: b.dataset.g } }).then(() => redraw()).catch(fail));
   on('#research', () => api('/jobs', { method: 'POST', body: { vehicle_id: +id, kind: 'research' } }).then(() => redraw()).catch(e => { $('#delmsg').textContent = e.message; }));
   on('#del', () => { $('#delmsg').innerHTML = `This deletes the car, its own values and its service log. Values for the model and year stay. <button class="primary" id="del2">Yes, delete</button>`; $('#del2').onclick = () => api('/vehicles/' + id, { method: 'DELETE' }).then(() => { closeDrawer(); location.hash = '#/'; }); });
+}
+// ---------- The Parts screen (HANDOFF 21, F4; boards F1 to F4): aftermarket filters, wipers, coolant and brake fluid spec of one car ----------
+// The research worker proposes, only Rick confirms. A part number stays "check against the car" until he confirms it. The tablet shows the table of
+// board F2, the phone the cards of board F4; a tap on a row opens the drawer of board F3 (fits, sources, OEM, history, Confirm - fits / Reject / Edit).
+// Offline the screen is the saved copy: read only (the buttons that write are .needsnet).
+let partOpen = null;    // the open part drawer: { car, item, choice }
+let partsCtx = null;    // the data of the screen that is drawn: { id, v, pj }
+const PART_SHORT = { oil_filter: 'Oil', engine_air_filter: 'Engine air', cabin_air_filter: 'Cabin air', wiper_driver: 'Driver', wiper_passenger: 'Passenger', wiper_rear: 'Rear', coolant: 'Coolant', brake_fluid: 'Brake fluid' };
+const PART_LONG = { oil_filter: 'Oil filter', engine_air_filter: 'Engine air filter', cabin_air_filter: 'Cabin air filter', wiper_driver: 'Driver wiper', wiper_passenger: 'Passenger wiper', wiper_rear: 'Rear wiper', coolant: 'Coolant', brake_fluid: 'Brake fluid' };
+const PART_GROUPS = [['Filters', ['oil_filter', 'engine_air_filter', 'cabin_air_filter']], ['Wipers · size · part number', ['wiper_driver', 'wiper_passenger', 'wiper_rear']], ['Fluids · spec', ['coolant', 'brake_fluid']]];
+const CH_ORDER = ['first', 'other', 'oem', 'spec'];
+const CH_LABEL = { first: 'First choice', other: 'Other choice', oem: 'OEM (cross-ref)', spec: 'Spec' };
+const isFluid = item => item === 'coolant' || item === 'brake_fluid';
+const isWiper = item => item.startsWith('wiper');
+const inch = n => `${+n}"`;
+const partNos = p => `${esc(p.part_no)}${p.conflict_no ? ` / ${esc(p.conflict_no)}` : ''}`;
+const partText = p => !p ? '' : p.choice === 'spec' ? esc(p.spec_text) : isWiper(p.item) ? `${p.size_in != null ? inch(p.size_in) : ''}${p.part_no ? ` · ${partNos(p)}` : ''}` : partNos(p);
+const brandSmall = p => p && p.brand ? `<small>${esc(p.brand)}</small> ` : '';   // a real space, so the brand and the number read apart (copy, screen reader)
+const partCell = p => p ? `<span class="pn">${brandSmall(p)}${partText(p)}</span>` : '<span class="na">—</span>';
+const itemRows = (parts, item) => CH_ORDER.map(c => parts.find(p => p.item === item && p.choice === c)).filter(Boolean);
+const itemStatus = rows => !rows.length ? '' : rows.some(p => p.status === 'proposed') ? 'proposed' : 'confirmed';
+const partStatus = rows => { const s = itemStatus(rows); return !s ? '<span class="pill Missing">Not found</span>' : pill(s) + (rows.some(p => p.check_car) ? ' <span class="chk">Check</span>' : ''); };
+const NOT_FOUND = 'Not found - look it up yourself';
+async function partsPage(id) {
+  const live = fresh();
+  const [v, pj] = await Promise.all([api(`/vehicles/${id}?peek=1`), api(`/vehicles/${id}/parts`)]);
+  if (!live()) return;
+  partsCtx = { id, v, pj };
+  redraw = () => partsPage(id);
+  crumb('', `<b>${esc(carName(v))}</b> <span class="trim">Parts</span>`);
+  $('#hnav').innerHTML = `<a class="btn t48" href="#/car/${id}">Car</a>`;
+  const parts = pj.parts, applies = new Set(pj.applies);
+  const job = (v.jobs || []).find(j => j.kind === 'parts'), jobOpen = !!job && (job.status === 'queued' || job.status === 'claimed');
+  const jobLine = !job ? '' : jobOpen ? `<span class="note pjob">${job.status === 'claimed' ? 'Searching for parts...' : 'Search queued. The research worker takes it within about 5 minutes.'}</span>`
+    : job.status === 'failed' ? `<span class="warn bad pjob">Parts search failed: ${esc(job.error)}</span>` : `<span class="note pjob">Last search: ${esc(String(job.result_summary || 'done').slice(0, 160))}</span>`;
+  const groups = PART_GROUPS.map(([t, items]) => [t, items.filter(i => applies.has(i))]).filter(([, items]) => items.length);
+  const info = () => '<span class="ibtn ib" aria-hidden="true">i</span>';   // a mark only: the whole row is the target (board F2)
+  const trow = item => {
+    const rows = itemRows(parts, item), by = c => rows.find(p => p.choice === c), fl = isFluid(item), wp = isWiper(item);
+    const mid = !rows.length ? `<div class="pnf"><span class="na">${NOT_FOUND}</span></div>`
+      : `<div>${partCell(fl ? by('spec') : by('first'))}</div><div>${fl ? '<span class="na">any brand to the spec</span>' : partCell(by('other'))}</div><div class="poem">${fl || wp ? '<span class="na">—</span>' : partCell(by('oem'))}</div>`;
+    return `<div class="prow" role="button" tabindex="0" data-item="${item}" aria-label="${esc(PART_LONG[item])}"><div class="it">${PART_SHORT[item]}</div>${mid}<div class="pst">${partStatus(rows)}${info()}</div></div>`;
+  };
+  const table = `<div class="ptable" role="table" aria-label="Parts of this car"><div class="phead"><div>Item</div><div>First choice</div><div>Other choice</div><div>OEM (cross-ref)</div><div>Status</div></div>
+    ${groups.map(([t, items]) => `<div class="pgrp">${esc(t)}</div>${items.map(trow).join('')}`).join('')}</div>`;
+  const card = (item, wide) => {
+    const rows = itemRows(parts, item), by = c => rows.find(p => p.choice === c), p0 = by('first') || by('spec');
+    const head = wide && p0 && isWiper(item) ? `${PART_SHORT[item]} ${p0.size_in != null ? inch(p0.size_in) : ''}` : PART_SHORT[item];
+    const line = !rows.length ? `<span class="na">${NOT_FOUND}</span>` : isFluid(item) ? `<span class="pn2">${esc(p0.spec_text)}</span>`
+      : `<span class="pn2">${[by('first'), by('other')].filter(Boolean).map(p => `${esc(p.brand)} ${isWiper(item) ? esc(p.part_no || (p.size_in != null ? inch(p.size_in) : '')) : partNos(p)}`).join(' · ')}</span>`;
+    return `<button type="button" class="${wide ? 'pcrow' : 'pcard'}" data-item="${item}"><span class="top"><b>${head}</b><span class="pst">${partStatus(rows)}</span></span>${line}</button>`;
+  };
+  const cards = groups.map(([t, items]) => `<h3 class="lbl pgrph">${esc(t.split(' · ')[0])}</h3>${items.length && (isWiper(items[0]) || isFluid(items[0])) ? `<div class="pcard multi">${items.map(i => card(i, true)).join('')}</div>` : items.map(i => card(i, false)).join('')}`).join('');
+  $('#view').innerHTML = `<div class="partsscreen" data-car="${id}"><div class="pbar"><span class="lbl">Aftermarket parts · tap a row for sources</span><span class="src">Filter numbers: check against the car until you confirm</span></div>
+    ${table}<div class="pcards">${cards}</div>
+    <div class="pfoot">${jobLine}<button type="button" class="ghost needsnet" id="pfind"${jobOpen ? ' disabled' : ''}>Find parts</button><span class="src offlinewhy">Searching needs a connection.</span></div></div>`;
+  const openItem = item => { const rows = itemRows(parts, item); partOpen = { car: +id, item, choice: rows[0] ? rows[0].choice : null }; renderPartDrawer(); };
+  document.querySelectorAll('[data-item]').forEach(e => { e.onclick = () => openItem(e.dataset.item); e.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openItem(e.dataset.item); } }; });
+  const find = $('#pfind');
+  if (find) find.onclick = () => { find.disabled = true; api(`/vehicles/${id}/parts-research`, { method: 'POST', body: {} }).then(() => partsPage(id)).catch(e => { find.disabled = false; $('#view').insertAdjacentHTML('beforeend', `<p class="err">${esc(e.message)}</p>`); }); };
+  if (partOpen && partOpen.car === +id) renderPartDrawer();   // an action in the drawer drew the screen again: the drawer stays open on the same item
+}
+async function renderPartDrawer() {
+  if (!partOpen || !partsCtx || String(partsCtx.id) !== String(partOpen.car)) return;
+  const { id, v, pj } = partsCtx, item = partOpen.item;
+  let w = $('#drawerwrap');
+  if (!w) { w = document.createElement('div'); w.id = 'drawerwrap'; w.className = 'drawerwrap'; w.innerHTML = '<div class="dimmer" id="dimmer"></div><aside class="drawer" id="drawer" role="dialog" aria-modal="true"></aside>'; document.body.appendChild(w); }
+  const rows = itemRows(pj.parts, item), sel = rows.find(p => p.choice === partOpen.choice) || rows[0];
+  partOpen.choice = sel ? sel.choice : null;
+  const head = `<div class="row dhead"><b class="lbl dtitle">${esc(PART_LONG[item])} · ${sel ? 'Sources' : 'Not found'}</b><button type="button" id="dclose" class="t48">Close</button></div>`;
+  let html;
+  if (!sel) {
+    // Nothing was found: the links are for Rick to open and read himself (LiftPad never reads these sites for you). The filter finders and RockAuto only.
+    const L = (await api(`/links?year=${v.year}&make=${encodeURIComponent(v.make)}&model=${encodeURIComponent(v.model)}&engine=${encodeURIComponent(v.engine || '')}&ev=${v.fuel === 'ev' ? 1 : 0}`).catch(() => [])).filter(l => l.tabs.includes('oil')).slice(0, 4);
+    if (!partOpen || partOpen.item !== item) return;   // closed, or another item opened, while the links loaded (local review finding 6)
+    html = `${head}<div class="dbig pbig">${NOT_FOUND}</div><p class="note">The research worker found no part with a source it could check for this item. Look it up yourself; LiftPad does not read these sites for you.</p>
+      ${L.length ? `<ul class="plinks">${L.map(l => `<li><a class="btn" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">${esc(l.label)}</a>${l.note ? `<span class="note">${esc(l.note)}</span>` : ''}</li>`).join('')}</ul>` : '<p class="note">No look-up links for this car.</p>'}`;
+  } else {
+    const hist = await api(`/parts/${sel.id}/history`).catch(() => []);
+    if (!partOpen || partOpen.item !== item) return;   // closed, or another item opened, while the history loaded
+    const srcs = String(sel.source || '').split(/;\s*/).filter(Boolean), oem = rows.find(p => p.choice === 'oem');
+    const srcHtml = s => /^https?:\/\//.test(s) ? `<a class="psrc" href="${esc(s)}" target="_blank" rel="noopener noreferrer">${esc(s)}</a>` : esc(s);
+    const choices = rows.length > 1 ? `<div class="pchoices">${rows.map(p => `<button type="button" class="pchoice" data-ch="${p.choice}" aria-pressed="${p === sel}"><small>${CH_LABEL[p.choice]}</small><span class="pn">${brandSmall(p)}${partText(p)}</span>${pill(p.status)}</button>`).join('')}</div>` : '';
+    html = `${head}<div class="dbig pbig">${sel.choice === 'spec' ? esc(sel.spec_text) : `${esc(sel.brand)} ${isWiper(item) ? partText(sel).replace(/^ · /, '') : partNos(sel)}`}</div>${choices}
+      <div class="pchips">${confPill(sel.confidence)}${pill(sel.status)}${sel.check_car ? '<span class="chk">Check against the car</span>' : ''}${sel.conflict_no ? '<span class="chk">Sources differ</span>' : ''}</div>
+      <dl><dt>Fits</dt><dd>${esc(`${v.year} ${v.make} ${v.model} ${sel.engine || v.engine || ''}`.trim())}</dd>
+        ${srcs.slice(0, 2).map((s, i) => `<dt>Source ${i + 1}</dt><dd class="src">${srcHtml(s)}</dd>`).join('') || '<dt>Source</dt><dd class="src">none</dd>'}
+        ${srcs.slice(2).length ? `<dt>Notes</dt><dd class="src">${srcs.slice(2).map(srcHtml).join('<br>')}</dd>` : ''}
+        ${sel.also_fits ? `<dt>Also fits</dt><dd class="src">${esc(sel.also_fits)}</dd>` : ''}${sel.conflict_no ? `<dt>Other number</dt><dd class="src">${esc(sel.conflict_no)} (a second source says this)</dd>` : ''}
+        ${isFluid(item) ? '' : `<dt>OEM</dt><dd class="src">${oem ? esc(`${oem.brand} ${oem.part_no} (cross-ref only)`) : 'none'}</dd>`}
+        <dt>History</dt><dd><ol class="src phist">${hist.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${esc(r.action)}</li>`).join('')}</ol></dd></dl>
+      <div id="peditbox"></div><p class="err" id="perr"></p><span class="src offlinewhy">Confirming, rejecting and editing need a connection.</span>
+      <div class="row dacts pacts" id="pacts">${sel.status === 'proposed' ? '<button type="button" class="ok needsnet" id="pconfirm">Confirm - fits</button>' : ''}<button type="button" class="needsnet" id="preject">Reject</button><button type="button" class="needsnet" id="pedit">Edit</button></div>`;
+  }
+  $('#drawer').setAttribute('aria-label', PART_LONG[item]);
+  $('#drawer').innerHTML = html;
+  $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer;
+  if (!sel) return;
+  const act = (path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
+  document.querySelectorAll('.pchoice').forEach(b => b.onclick = () => { partOpen.choice = b.dataset.ch; renderPartDrawer(); });
+  const c = $('#pconfirm'); if (c) c.onclick = () => act(`/parts/${sel.id}/confirm`);
+  $('#preject').onclick = () => act(`/parts/${sel.id}/reject`);
+  $('#pedit').onclick = () => {
+    const fl = isFluid(item), wp = isWiper(item), opt = x => `<option${sel.confidence === x ? ' selected' : ''}>${x}</option>`;
+    $('#peditbox').innerHTML = `<form class="form pform" id="peditform">
+      ${fl ? `<div class="field"><label for="pf_spec">Spec</label><input id="pf_spec" name="spec_text" value="${esc(sel.spec_text)}" required></div>` : ''}
+      ${wp ? `<div class="field"><label for="pf_size">Size, inches</label><input id="pf_size" name="size_in" inputmode="decimal" value="${sel.size_in ?? ''}" required></div>` : ''}
+      ${fl ? '' : `<div class="field"><label for="pf_no">Part number</label><input id="pf_no" name="part_no" value="${esc(sel.part_no)}"${wp ? '' : ' required'}></div>`}
+      ${fl || wp ? '' : `<div class="field"><label for="pf_also">Also fits</label><input id="pf_also" name="also_fits" value="${esc(sel.also_fits)}"></div>`}
+      <div class="field"><label for="pf_src">Source</label><input id="pf_src" name="source" value="${esc(sel.source)}"></div>
+      <div class="field"><label for="pf_conf">Confidence</label><select id="pf_conf" name="confidence">${(fl ? ['High', 'Medium', 'Low'] : ['Medium', 'Low']).map(opt).join('')}</select></div>
+      <div class="row"><button type="submit" class="primary needsnet">Save</button><button type="button" class="ghost" id="pcancel">Cancel</button></div></form>`;
+    $('#pacts').hidden = true;   // the form has its own Save and Cancel; the pinned buttons come back with Cancel
+    $('#pcancel').onclick = () => { $('#peditbox').innerHTML = ''; $('#pacts').hidden = false; };
+    $('#peditform').onsubmit = ev => {
+      ev.preventDefault();
+      const f = new FormData(ev.target), body = {};
+      f.forEach((val, k) => { body[k] = String(val); });
+      if ('size_in' in body) {   // local review finding 3: read the number from "18", "18 in", "18in" or "18""; anything else is refused and nothing is sent
+        const m = body.size_in.trim().match(/^(\d+(?:[.,]\d+)?)\s*(?:in(?:ch(?:es)?)?\.?|")?$/i);
+        if (!m) { $('#perr').textContent = 'The size must be a number of inches, for example 18'; return; }
+        body.size_in = Number(m[1].replace(',', '.'));
+      }
+      api(`/parts/${sel.id}`, { method: 'PATCH', body }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
+    };
+  };
 }
 // ---------- The Lift screen (HANDOFF 19, D3): the cautions, the points and the chart on one screen; everything else is behind Checks ----------
 const CHECKED_SHORT = { rick: 'chart checked by Rick', ai: 'chart AI-checked', no: 'chart not checked' };
@@ -1327,6 +1467,7 @@ async function route() {
     else if (/^#\/car\/\d+\/history$/.test(h)) await historyPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/log$/.test(h)) await logPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/lift$/.test(h)) await liftPage(h.split('/')[2]);
+    else if (/^#\/car\/\d+\/parts$/.test(h)) await partsPage(h.split('/')[2]);
     else if (/^#\/car\/\d+\/page$/.test(h)) await viewer(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb$/.test(h)) await jamb(h.split('/')[2]);
     else if (/^#\/car\/\d+\/jamb\/[0-9TZ-]+\.(jpg|png|webp)$/.test(h)) await jambRead(h.split('/')[2], h.split('/')[4]);

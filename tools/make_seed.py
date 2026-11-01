@@ -3,8 +3,8 @@
 Run:     python3 tools/make_seed.py PRIVATE_DIR
 Reads:   PRIVATE_DIR/ali-index.csv (2019), PRIVATE_DIR/ali-index-2026.csv (2026), PRIVATE_DIR/classics.csv, PRIVATE_DIR/my-cars.csv,
          PRIVATE_DIR/apps.csv (each is optional; a missing file is skipped and reported)
-Writes:  db/seed-public.sql        makes list + 1 sample app + 2 example cars. Safe for git. Example cars must
-                                   not look like a lift-guide chart code (two letters, dash, digit).
+Writes:  db/seed-public.sql        makes list + 1 sample app + 2 example cars + made-up parts for the first one (HANDOFF 21).
+                                   Safe for git. Example cars must not look like a lift-guide chart code (two letters, dash, digit).
          PRIVATE_DIR/seed-private.sql   makes + lift-guide index + classics + your cars.
                                        Never put this file in git.
 Both seeds are for a NEW, empty database only, after tools/migrate.sh (tools/d1_load.sh does
@@ -53,6 +53,39 @@ EXAMPLE_CARS = [
     (1965, 'Ford', 'Mustang', 'Example car - replace with yours', [
         ('lift', 'Points', 'Example only. Write where the lift pads go.', 'Low', 'Example', 'Not a real value', 0),
         ('torque', 'Torque', 'Example only. Copy the value from the shop manual.', 'Low', 'Example', 'Not a real value', 0)])]
+
+
+# HANDOFF 21 (F6): the public seed gets ONE made-up car with made-up parts (the first example car, the Civic). Every part number starts with 99 (after at most
+# two letters), which no catalog uses: the export gate (tools/export_public.py) refuses a parts row in the seed whose number does not, and refuses any
+# part number of a real car anywhere in the export. The sources are example.com. The private seed has no parts: real parts come from the research
+# worker into the live database only.
+# item, choice, brand, part_no, also_fits, size_in, spec_text, status, confidence, source, check_car (confirmed rows: check_car 0)
+EX_SRC_A, EX_SRC_B = 'https://www.example.com/us/test-a', 'https://www.example.com/us/test-b'
+EXAMPLE_PARTS = [
+    ('oil_filter', 'first', 'WIX', '99001', '99001XP', None, '', 'proposed', 'Medium', EX_SRC_A + '; ' + EX_SRC_B, 1),
+    ('oil_filter', 'other', 'Purolator', 'L99001', '', None, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('oil_filter', 'oem', 'Honda', '99100-EXA-A99', '', None, '', 'proposed', 'Low', 'Owner manual Example p.1-2', 1),
+    ('engine_air_filter', 'first', 'WIX', '99002', '', None, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('engine_air_filter', 'other', 'Purolator', 'A99002', '', None, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('cabin_air_filter', 'first', 'WIX', '99003', '', None, '', 'confirmed', 'Medium', EX_SRC_A + '; ' + EX_SRC_B, 0),
+    ('wiper_driver', 'first', 'Bosch', '99024A', '', 24, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('wiper_driver', 'other', 'Rain-X', '9950799', '', 24, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('wiper_passenger', 'first', 'Bosch', '', '', 18, '', 'proposed', 'Low', EX_SRC_A, 1),
+    ('coolant', 'spec', '', '', '', None, 'Type 2 blue (made-up spec)', 'confirmed', 'High', 'Owner manual Example p.1-2', 0)]
+EXAMPLE_PARTS_ENGINE = '2.0L'
+
+
+def parts_lines(vehicle_id, rows, engine):
+    """INSERT lines for the parts of one example car, each with its history row (last_insert_rowid). Made-up data only."""
+    t = lambda v: "'" + str(v or '').replace("'", "''") + "'"
+    now = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    out = []
+    for item, choice, brand, no, also, size, spec, status, conf, src, chk in rows:
+        done = status == 'confirmed'
+        out.append("INSERT INTO parts(vehicle_id,item,choice,brand,part_no,also_fits,conflict_no,size_in,spec_text,engine,status,confidence,source,check_car,created_at,updated_at,confirmed_at,confirmed_by) "
+                   f"VALUES({vehicle_id},{t(item)},{t(choice)},{t(brand)},{t(no)},{t(also)},'',{'NULL' if size is None else size},{t(spec)},{t(engine)},{t(status)},{t(conf)},{t(src)},{chk},{now},{now},{now if done else 'NULL'},{t('seed') if done else 'NULL'});")
+        out.append(f"INSERT INTO parts_history(part_id,action,old_json,new_json,at,device) VALUES(last_insert_rowid(),'insert',NULL,'{{\"example\":true}}',{now},'seed');")
+    return out
 
 
 def read_csv(path):
@@ -140,7 +173,7 @@ def main():
     classics = [f"INSERT INTO classics(make,model,year_from,year_to,model_years,years_src) VALUES({q(r['make'])},{q(r['model'])},{q(r['year_from']) if r['year_from'] is not None else 'NULL'},{q(r['year_to']) if r['year_to'] is not None else 'NULL'},{r['model_years']},{q(r['years_src'])});" for r in c]
     make_lines = [f"INSERT INTO makes(name,aliases,nhtsa_name) VALUES({q(n)},{q(m['aliases'])},{q(m['nhtsa_name'])});" for n, m in sorted(makes.items())]
 
-    public = make_lines + app_lines() + apps_lines(SAMPLE_APPS) + car_lines(EXAMPLE_CARS)
+    public = make_lines + app_lines() + apps_lines(SAMPLE_APPS) + car_lines(EXAMPLE_CARS) + parts_lines(1, EXAMPLE_PARTS, EXAMPLE_PARTS_ENGINE)
     private = (guide + classics + make_lines + app_lines() + apps_lines(read_csv(os.path.join(priv, 'apps.csv')))
                + car_lines(my_cars(read_csv(os.path.join(priv, 'my-cars.csv')))))
     with open(os.path.join(DB, 'seed-public.sql'), 'w', encoding='utf-8') as f:
