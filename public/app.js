@@ -773,7 +773,7 @@ const CH_LABEL = { first: 'First choice', other: 'Other choice', oem: 'OEM (cros
 const isFluid = item => item === 'coolant' || item === 'brake_fluid';
 const isWiper = item => item.startsWith('wiper');
 const inch = n => `${+n}"`;
-const partNos = p => `${esc(p.part_no)}${p.conflict_no ? ` / ${esc(p.conflict_no)}` : ''}`;
+const partNos = p => `${esc(p.part_no)}${p.conflict_no && p.status === 'proposed' ? ` / ${esc(p.conflict_no)}` : ''}`;   // a confirmed row shows the number Rick chose, never "A / B"
 const partText = p => !p ? '' : p.choice === 'spec' ? esc(p.spec_text) : isWiper(p.item) ? `${p.size_in != null ? inch(p.size_in) : ''}${p.part_no ? ` · ${partNos(p)}` : ''}` : partNos(p);
 const brandSmall = p => p && p.brand ? `<small>${esc(p.brand)}</small> ` : '';   // a real space, so the brand and the number read apart (copy, screen reader)
 const partCell = p => p ? `<span class="pn">${brandSmall(p)}${partText(p)}</span>` : '<span class="na">—</span>';
@@ -842,11 +842,11 @@ async function renderPartDrawer() {
     const srcHtml = s => /^https?:\/\//.test(s) ? `<a class="psrc" href="${esc(s)}" target="_blank" rel="noopener noreferrer">${esc(s)}</a>` : esc(s);
     const choices = rows.length > 1 ? `<div class="pchoices">${rows.map(p => `<button type="button" class="pchoice" data-ch="${p.choice}" aria-pressed="${p === sel}"><small>${CH_LABEL[p.choice]}</small><span class="pn">${brandSmall(p)}${partText(p)}</span>${pill(p.status)}</button>`).join('')}</div>` : '';
     html = `${head}<div class="dbig pbig">${sel.choice === 'spec' ? esc(sel.spec_text) : `${esc(sel.brand)} ${isWiper(item) ? partText(sel).replace(/^ · /, '') : partNos(sel)}`}</div>${choices}
-      <div class="pchips">${confPill(sel.confidence)}${pill(sel.status)}${sel.check_car ? '<span class="chk">Check against the car</span>' : ''}${sel.conflict_no ? '<span class="chk">Sources differ</span>' : ''}</div>
+      <div class="pchips">${confPill(sel.confidence)}${pill(sel.status)}${sel.check_car ? '<span class="chk">Check against the car</span>' : ''}${sel.conflict_no && sel.status === 'proposed' ? '<span class="chk">Sources differ</span>' : ''}</div>
       <dl><dt>Fits</dt><dd>${esc(`${v.year} ${v.make} ${v.model} ${sel.engine || v.engine || ''}`.trim())}</dd>
         ${srcs.slice(0, 2).map((s, i) => `<dt>Source ${i + 1}</dt><dd class="src">${srcHtml(s)}</dd>`).join('') || '<dt>Source</dt><dd class="src">none</dd>'}
         ${srcs.slice(2).length ? `<dt>Notes</dt><dd class="src">${srcs.slice(2).map(srcHtml).join('<br>')}</dd>` : ''}
-        ${sel.also_fits ? `<dt>Also fits</dt><dd class="src">${esc(sel.also_fits)}</dd>` : ''}${sel.conflict_no ? `<dt>Other number</dt><dd class="src">${esc(sel.conflict_no)} (a second source says this)</dd>` : ''}
+        ${sel.also_fits ? `<dt>Also fits</dt><dd class="src">${esc(sel.also_fits)}</dd>` : ''}${sel.conflict_no && sel.status === 'proposed' ? `<dt>Other number</dt><dd class="src">${esc(sel.conflict_no)} (a second source says this)<br><button type="button" class="needsnet" id="puse">Use ${esc(sel.conflict_no)} instead</button></dd>` : ''}
         ${isFluid(item) ? '' : `<dt>OEM</dt><dd class="src">${oem ? esc(`${oem.brand} ${oem.part_no} (cross-ref only)`) : 'none'}</dd>`}
         <dt>History</dt><dd><ol class="src phist">${hist.map(r => `<li>${when(r.at)} · ${esc(r.device)} · ${esc(r.action)}</li>`).join('')}</ol></dd></dl>
       <div id="peditbox"></div><p class="err" id="perr"></p><span class="src offlinewhy">Confirming, rejecting and editing need a connection.</span>
@@ -859,6 +859,7 @@ async function renderPartDrawer() {
   const act = (path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
   document.querySelectorAll('.pchoice').forEach(b => b.onclick = () => { partOpen.choice = b.dataset.ch; renderPartDrawer(); });
   const c = $('#pconfirm'); if (c) c.onclick = () => act(`/parts/${sel.id}/confirm`);
+  const u = $('#puse'); if (u) u.onclick = () => act(`/parts/${sel.id}/use-other`);   // swaps the two numbers; the row stays proposed and Low
   $('#preject').onclick = () => act(`/parts/${sel.id}/reject`);
   $('#pedit').onclick = () => {
     const fl = isFluid(item), wp = isWiper(item), opt = x => `<option${sel.confidence === x ? ' selected' : ''}>${x}</option>`;
@@ -867,6 +868,7 @@ async function renderPartDrawer() {
       ${wp ? `<div class="field"><label for="pf_size">Size, inches</label><input id="pf_size" name="size_in" inputmode="decimal" value="${sel.size_in ?? ''}" required></div>` : ''}
       ${fl ? '' : `<div class="field"><label for="pf_no">Part number</label><input id="pf_no" name="part_no" value="${esc(sel.part_no)}"${wp ? '' : ' required'}></div>`}
       ${fl || wp ? '' : `<div class="field"><label for="pf_also">Also fits</label><input id="pf_also" name="also_fits" value="${esc(sel.also_fits)}"></div>`}
+      ${!fl && sel.conflict_no ? `<div class="field"><label for="pf_other">Other number (empty it to resolve the conflict)</label><input id="pf_other" name="conflict_no" value="${esc(sel.conflict_no)}"></div>` : ''}
       <div class="field"><label for="pf_src">Source</label><input id="pf_src" name="source" value="${esc(sel.source)}"></div>
       <div class="field"><label for="pf_conf">Confidence</label><select id="pf_conf" name="confidence">${(fl ? ['High', 'Medium', 'Low'] : ['Medium', 'Low']).map(opt).join('')}</select></div>
       <div class="row"><button type="submit" class="primary needsnet">Save</button><button type="button" class="ghost" id="pcancel">Cancel</button></div></form>`;

@@ -1557,6 +1557,33 @@ if (health.schema >= '0014' && hasProc) {
       const s = await mkCar(); const r = await research(s.d.id, []); if (r.r.s !== 200) b.push('a SELFTEST car could not queue and close a parts job: ' + r.r.s);   // research() queues, claims and closes its own job at once
       ok(!b.length, b.join('; ')); return 'no seed path';
     });
+    await t('F2 conflict (Rick 2026-11-01): Confirm - fits resolves a conflict (the other number is cleared, history keeps it, the source says who chose); "use the other number" swaps the two (history row, still proposed and Low) and the swapped row can be confirmed; Edit can clear the other number and the Low rule holds only while one is set', async () => {
+      const b = [], c = await mkCar(), id = c.d.id;
+      const r = (await research(id, [P({ part_no: '99011', conflict_no: '99012', confidence: 'Low' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', conflict_no: 'PL99013', confidence: 'Low' }),
+        P({ item: 'cabin_air_filter', part_no: '99021', conflict_no: '99022', confidence: 'Low' })])).r;
+      if (r.d.proposed !== 3) b.push('setup ' + JSON.stringify(r.d));
+      const d0 = await partsOf(id), a = find(d0, 'oil_filter', 'first'), s = find(d0, 'oil_filter', 'other'), e = find(d0, 'cabin_air_filter', 'first');
+      if (!a || a.conflict_no !== '99012' || a.confidence !== 'Low') b.push('the conflict row was not stored ' + JSON.stringify(a));
+      // 1. Confirm resolves the conflict in favour of the number shown first
+      const cf = await call(`/api/parts/${a.id}/confirm`, { method: 'POST', body: {} });
+      if (cf.s !== 200 || cf.d.part.status !== 'confirmed' || cf.d.part.conflict_no !== '' || cf.d.part.part_no !== '99011') b.push('confirm ' + cf.s + JSON.stringify(cf.d).slice(0, 200));
+      else if (!/Rick confirmed 99011; 99012 was the other source's number/.test(cf.d.part.source)) b.push('the source text does not say who chose: ' + cf.d.part.source);
+      const h = (await call(`/api/parts/${a.id}/history`)).d, hc = h[h.length - 1];
+      if (!hc || hc.action !== 'confirm' || !/"conflict_no":"99012"/.test(hc.old_json) || !/"conflict_no":""/.test(hc.new_json)) b.push('history keeps the old other number: ' + JSON.stringify(hc).slice(0, 200));
+      // 2. use the other number: a swap, still proposed and Low, with a history row; then Confirm works on it
+      const sw = await call(`/api/parts/${s.id}/use-other`, { method: 'POST', body: {} });
+      if (sw.s !== 200 || sw.d.part.part_no !== 'PL99013' || sw.d.part.conflict_no !== 'PL99012' || sw.d.part.status !== 'proposed' || sw.d.part.confidence !== 'Low') b.push('swap ' + sw.s + JSON.stringify(sw.d).slice(0, 200));
+      const hs = (await call(`/api/parts/${s.id}/history`)).d, hl = hs[hs.length - 1];
+      if (!hl || hl.action !== 'update' || !/"part_no":"PL99012"/.test(hl.old_json) || !/"part_no":"PL99013"/.test(hl.new_json)) b.push('swap history ' + JSON.stringify(hl).slice(0, 200));
+      const cf2 = await call(`/api/parts/${s.id}/confirm`, { method: 'POST', body: {} });
+      if (cf2.s !== 200 || cf2.d.part.part_no !== 'PL99013' || cf2.d.part.conflict_no !== '' || cf2.d.part.status !== 'confirmed' || !/Rick confirmed PL99013; PL99012 was the other source's number/.test(cf2.d.part.source)) b.push('confirm after the swap ' + cf2.s + JSON.stringify(cf2.d).slice(0, 200));
+      // 3. Edit: the Low rule holds while an other number is set, and clearing it (in the same edit or alone) lifts it
+      const e1 = await call(`/api/parts/${e.id}`, { method: 'PATCH', body: { confidence: 'Medium' } }); if (e1.s !== 400 || !/always Low/.test(JSON.stringify(e1.d))) b.push('Medium with a conflict number set: ' + e1.s);
+      const e2 = await call(`/api/parts/${e.id}`, { method: 'PATCH', body: { conflict_no: '', confidence: 'Medium' } }); if (e2.s !== 200 || e2.d.part.conflict_no !== '' || e2.d.part.confidence !== 'Medium') b.push('clear + Medium ' + e2.s + JSON.stringify(e2.d).slice(0, 160));
+      // use-other needs a proposed row with an other number
+      for (const [pid, why2] of [[e.id, 'no other number'], [a.id, 'a confirmed row'], [99999999, 'a missing part']]) { const x = await call(`/api/parts/${pid}/use-other`, { method: 'POST', body: {} }); if (x.s !== (pid === 99999999 ? 404 : 409)) b.push(`${why2}: ${x.s}`); }
+      ok(!b.length, b.join('; ')); return 'confirm, swap, edit';
+    });
     await t('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [{ item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, also_fits: '99022', confidence: 'High', source: SRC }])).r;
@@ -1579,7 +1606,7 @@ if (health.schema >= '0014' && hasProc) {
     });
     await t('F2: the processor token is refused (403) on every parts route and on deleting a car; nothing changes', async () => {
       const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first'), before = JSON.stringify(d0.parts);
-      for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}],
+      for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}/use-other`, 'POST', {}],
         [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE'], [`/api/parts/${o.id}/history`, 'GET'], [`/api/vehicles/${jp}`, 'DELETE']]) {
         const x = await call(p, { as: 'proc', method: m, body }); if (x.s !== 403) b.push(`${m} ${p}: ${x.s}`);
       }
@@ -1594,7 +1621,7 @@ if (health.schema >= '0014' && hasProc) {
       try {
         ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain' } })).s === 200, 'the trim change');   // a car that is not a SELFTEST car
         const before = JSON.stringify((await partsOf(id)).parts);
-        for (const [p, m, body] of [[`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE']]) {
+        for (const [p, m, body] of [[`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}/use-other`, 'POST', {}], [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE']]) {
           const x = await call(p, { method: m, body }); if (x.s !== 403) b.push(`tool ${m} ${p}: ${x.s}`);
         }
         if (JSON.stringify((await partsOf(id)).parts) !== before) b.push('a part changed');

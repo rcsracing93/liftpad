@@ -668,6 +668,11 @@ async function changePart(env, id, action, set, me) {
   }
   if (action === 'confirm' && old.status !== 'proposed') return bad(`This part is ${old.status}, not proposed`, 409);
   if (action === 'reject' && old.status === 'rejected') return bad('This part is already rejected', 409);
+  // Rick 2026-11-01: Confirm - fits resolves a conflict in favour of the number shown first. The other number is cleared (the history row keeps it in old_json) and the
+  // source text says who chose, so a confirmed row never shows "Sources differ".
+  if (action === 'confirm' && old.conflict_no) {
+    set = { ...set, conflict_no: '', source: `${old.source} | Rick confirmed ${old.part_no}; ${old.conflict_no} was the other source's number`.slice(0, 1000) };
+  }
   const nw = { ...old, ...set };
   if (action === 'confirm') Object.assign(nw, { status: 'confirmed', check_car: 0 });
   if (action === 'reject') nw.status = 'rejected';
@@ -1630,6 +1635,17 @@ const app = {
         if (me.processor) return bad('The processor cannot confirm or reject parts', 403);
         const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
         return changePart(env, +mm[1], mm[2], {}, me);
+      }
+      // Rick 2026-11-01: "Use <other number> instead" swaps the two numbers of a proposed row that has a conflict (one history row; the row stays proposed and Low),
+      // so Rick can confirm either number. Same gates as confirm: never the processor; the self-test token only on a SELFTEST car.
+      mm = p.match(/^\/api\/parts\/(\d+)\/use-other$/);
+      if (mm && m === 'POST') {
+        if (me.processor) return bad('The processor cannot change a part', 403);
+        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
+        const cur = await env.DB.prepare('SELECT * FROM parts WHERE id=?').bind(+mm[1]).first(); if (!cur) return bad('Part not found', 404);
+        if (cur.status !== 'proposed') return bad(`This part is ${cur.status}, not proposed`, 409);
+        if (!cur.conflict_no) return bad('This part has no other number', 409);
+        return changePart(env, +mm[1], 'update', { part_no: cur.conflict_no, conflict_no: cur.part_no }, me);
       }
       mm = p.match(/^\/api\/parts\/(\d+)\/history$/);
       if (mm && m === 'GET') {
