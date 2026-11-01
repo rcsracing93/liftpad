@@ -1594,20 +1594,15 @@ const app = {
         if (me.processor) return bad('Parts are not for the processor', 403);
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         const parts = await carParts(env, v.id);
-        // seed: true = this Worker lets the seed runner (tool token, body {"seed":true}) queue a parts search on a real car; the runner checks it before it queues anything
-        return json({ vehicle_id: v.id, fuel: v.fuel || '', applies: partsApply(v.fuel), parts, proposed: parts.filter(x => x.status === 'proposed').length, seed: true });
+        return json({ vehicle_id: v.id, fuel: v.fuel || '', applies: partsApply(v.fuel), parts, proposed: parts.filter(x => x.status === 'proposed').length });
       }
       mm = p.match(/^\/api\/vehicles\/(\d+)\/parts-research$/);
       if (mm && m === 'POST') {
         if (me.processor) return bad('The processor cannot start a parts search', 403);
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         // Opus pass F8, finding 7: a parts search costs money; the self-test token may queue one only on a SELFTEST car (autoResearch leaves the tool token out for the same reason).
-        // The one exception is the seed (Rick's "yes research parts", lp-run f-parts-seed): the runner sends {"seed":true} on purpose, one car at a time, in Rick's order. The
-        // research worker's own caps (5 parts jobs and 2 USD a day) still bound what is spent; a plain tool-token call without the flag stays 403.
-        if (me.tool && !/^SELFTEST/.test(v.trim || '')) {
-          const sb = await req.json().catch(() => ({}));
-          if (!sb || sb.seed !== true) return bad('The self-test token may start a parts search on a SELFTEST car only', 403);
-        }
+        // There is no exception and no flag in the body: Rick starts the searches of his cars himself, with Find parts (his own login).
+        if (me.tool && !/^SELFTEST/.test(v.trim || '')) return bad('The self-test token may start a parts search on a SELFTEST car only', 403);
         return queuePartsResearch(env, v, me);
       }
       mm = p.match(/^\/api\/parts\/(\d+)$/);

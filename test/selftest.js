@@ -1550,18 +1550,12 @@ if (health.schema >= '0014' && hasProc) {
       const t2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); if (t2.s !== 403) b.push('parts search: ' + t2.s);
       ok(!b.length, b.join('; ')); return '403, 403';
     });
-    await t('F2 seed: the tool token may queue a parts search on a real car only with {"seed":true} (the live seed of "yes research parts"); the answer of GET /parts says seed support; the test claims and closes its own job at once', async () => {
-      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Seed', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
-      if ((await partsOf(c.d.id)).seed !== true) b.push('GET /parts does not say seed: true');
-      for (const [body, why2] of [[{}, 'no flag'], [{ seed: 'yes' }, 'seed not true'], [{ seed: false }, 'seed false']]) { const x = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body }); if (x.s !== 403) b.push(`${why2}: ${x.s}`); }
-      const q = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: { seed: true } }); if (q.s !== 201 || !q.d.id) b.push('seed queue ' + q.s + JSON.stringify(q.d));
-      if (q.d && q.d.id) {
-        const q2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: { seed: true } }); if (!q2.d || q2.d.already !== true) b.push('a second seed call made a second job');
-        const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
-        if (!cl.d || cl.d.id !== q.d.id || JSON.stringify(Object.keys(cl.d.request || {}).sort()) !== JSON.stringify(['engine', 'fuel', 'make', 'model', 'trim', 'year'])) b.push('claim ' + JSON.stringify(cl.d).slice(0, 160));
-        else if ((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [] } })).s !== 200) b.push('the test job could not be closed');
-      }
-      ok(!b.length, b.join('; ')); return 'seed flag';
+    await t('F2 no seed bypass (Rick 2026-11-01): the tool token gets 403 on a parts search for a real car whatever the body says - {"seed":true} too - and GET /parts has no seed key; on a SELFTEST car it still queues', async () => {
+      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain NoSeed', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+      if ('seed' in await partsOf(c.d.id)) b.push('GET /parts has a seed key');
+      for (const [body, why2] of [[{}, 'empty body'], [{ seed: true }, 'seed true'], [{ seed: 'yes' }, 'seed yes'], [{ seed: false }, 'seed false']]) { const x = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body }); if (x.s !== 403) b.push(`${why2}: ${x.s}`); }
+      const s = await mkCar(); const r = await research(s.d.id, []); if (r.r.s !== 200) b.push('a SELFTEST car could not queue and close a parts job: ' + r.r.s);   // research() queues, claims and closes its own job at once
+      ok(!b.length, b.join('; ')); return 'no seed path';
     });
     await t('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
