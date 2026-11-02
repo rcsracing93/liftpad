@@ -1409,9 +1409,9 @@ if (health.schema >= '0013') {
 if (health.schema >= '0014' && hasProc) {
   const GOOD = '1FTFW1CT5DFC10312', made = [];
   const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
-  const US1 = 'https://www.rockauto.com/en/catalog/example,2020,sample+model,2.0l+l4,1000000,engine,oil+filter', US2 = 'https://www.oreillyauto.com/shop/b/oil-filters/selftest';
+  const US1 = 'https://www.quadratec.com/en/catalog/example,2020,sample+model,2.0l+l4,1000000,engine,oil+filter', US2 = 'https://www.oreillyauto.com/shop/b/oil-filters/selftest';
   const SRC = `${US1} and ${US2}`;
-  const P = (o = {}) => ({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99011', confidence: 'Medium', source: SRC, ...o });
+  const P = (o = {}) => ({ item: 'wiper_driver', choice: 'first', brand: 'Bosch', part_no: '99011', size_in: 24, confidence: 'Medium', source: SRC, ...o });   // wipers: the research job asks for wipers and fluids only
   const research = async (id, parts) => {
     const q = await call(`/api/vehicles/${id}/parts-research`, { method: 'POST', body: {} }); ok(q.s === 201 && q.d.id, 'queue ' + q.s + JSON.stringify(q.d));
     const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } }); ok(cl.d && cl.d.id === q.d.id, 'claim ' + JSON.stringify(cl.d));
@@ -1442,30 +1442,30 @@ if (health.schema >= '0014' && hasProc) {
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [] } })).s === 400, 'no parts list');
       const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P({ item: 'bogus' }), P()] } });
       ok(r.s === 200 && r.d.proposed === 1 && r.d.drops.length === 1 && /unknown item/.test(r.d.drops[0].reason), 'bad+good ' + r.s + JSON.stringify(r.d));
-      const d = await partsOf(jeep), o = find(d, 'oil_filter', 'first'); ok(o && o.part_no === '99011' && o.confidence === 'Medium' && o.status === 'proposed' && o.check_car === 1 && o.job_id === cl.d.id, JSON.stringify(o));
+      const d = await partsOf(jeep), o = find(d, 'wiper_driver', 'first'); ok(o && o.part_no === '99011' && o.confidence === 'Medium' && o.status === 'proposed' && o.check_car === 1 && o.job_id === cl.d.id, JSON.stringify(o));
       const job = (await carOf(jeep)).jobs.find(j => j.id === cl.d.id); ok(job && job.status === 'done' && /1 proposed part\(s\), 1 dropped/.test(job.result_summary), JSON.stringify(job));
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P()] } })).s === 409, 'a done job took a second result');
       return 'bad dropped, good stored';
     });
-    await t('F2: grading case - WIX 99011 / Purolator PL99012 / Mopar 9910130AB from US sources; the New Zealand page number 98001 is dropped as non-US and never stored', async () => {
+    await t('F2: grading case - Bosch 99011 / Rain-X PL99012 / passenger 9910130AB from US sources; the New Zealand page number 98001 is dropped as non-US and never stored', async () => {
       const c = await mkCar({ trim: 'SELFTEST B' }); jp = c.d.id;
-      const r = (await research(jp, [P({ source: 'https://www.wixfilters.com/en-nz/filters/98001' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' }),
-        P({ choice: 'oem', brand: 'Mopar', part_no: '9910130AB', also_fits: '09910130AA' }), P({ part_no: '99011', also_fits: '99011XP' })])).r;
+      const r = (await research(jp, [P({ source: 'https://www.wixfilters.com/en-nz/filters/98001' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012' }),
+        P({ item: 'wiper_passenger', part_no: '9910130AB', also_fits: '09910130AA' }), P({ part_no: '99011', also_fits: '99011XP' })])).r;
       ok(r.s === 200 && r.d.proposed === 3 && r.d.drops.length === 1 && /non-US source/.test(r.d.drops[0].reason), JSON.stringify(r.d));
       const d = await partsOf(jp), nos = d.parts.map(x => x.part_no).sort(); ok(JSON.stringify(nos) === JSON.stringify(['99011', '9910130AB', 'PL99012']), 'stored ' + nos);
-      ok(!JSON.stringify(d).includes('98001') && find(d, 'oil_filter', 'first').also_fits === '99011XP' && d.parts.every(x => x.confidence === 'Medium' && x.check_car === 1 && x.status === 'proposed'), JSON.stringify(d.parts));
+      ok(!JSON.stringify(d).includes('98001') && find(d, 'wiper_driver', 'first').also_fits === '99011XP' && d.parts.every(x => x.confidence === 'Medium' && x.check_car === 1 && x.status === 'proposed'), JSON.stringify(d.parts));
       return 'three stored, 98001 dropped';
     });
     await t('F2: every server check drops its item with a reason (no URL, memory only, High part number, wrong brand, non-US host, locale path, size, missing size, no number, High fluid from the web, conflict not Low, slot twice)', async () => {
       const c = await mkCar(), id = c.d.id;
       const r = (await research(id, [
-        P({ source: 'from my memory, WIX 99011' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', confidence: 'High' }), P({ item: 'cabin_air_filter', brand: 'Purolator' }),
-        P({ item: 'engine_air_filter', source: 'https://www.wixfilters.co.nz/x and ' + US1 }), P({ item: 'cabin_air_filter', choice: 'other', brand: 'Purolator', part_no: 'C35667', source: 'https://www.example.com/en-nz/a ' + US1 }),
+        P({ source: 'from my memory, WIX 99011' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', confidence: 'High' }), P({ item: 'wiper_passenger', brand: 'Rain-X' }),
+        P({ item: 'wiper_rear', source: 'https://www.wixfilters.co.nz/x and ' + US1 }), P({ item: 'wiper_passenger', choice: 'other', brand: 'Rain-X', part_no: 'C35667', source: 'https://www.example.com/en-nz/a ' + US1 }),
         { item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 40, confidence: 'Low', source: US1 }, { item: 'wiper_passenger', choice: 'first', brand: 'Bosch', confidence: 'Low', source: US1 },
-        P({ item: 'engine_air_filter', choice: 'other', brand: 'Purolator', part_no: '' }), { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'https://www.example.com/us/brake-fluid' },
-        P({ choice: 'oem', brand: 'Mopar', part_no: '9910130AB', conflict_no: '9910130AA' }), P({ item: 'cabin_air_filter', part_no: '99015' }), P({ item: 'cabin_air_filter', part_no: '99015XP' }),
-        P({ item: 'oil_filter', choice: 'first', part_no: 'bad!!no' }), { item: 'wiper_rear', choice: 'other', brand: 'Rain-X', size_in: 12, confidence: 'Low', source: US1 }])).r;
-      const want = [/no source/, /never High/, /must be WIX/, /non-US/, /non-US/, /8 to 32/, /size in inches/, /needs a part number/, /manual page/, /always Low/, /twice/, /not a part number/];
+        { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99016', confidence: 'Medium', source: SRC }, { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'https://www.example.com/us/brake-fluid' },
+        P({ item: 'wiper_rear', choice: 'other', brand: 'Rain-X', part_no: '9910130AB', conflict_no: '9910130AA' }), P({ item: 'wiper_passenger', part_no: '99015' }), P({ item: 'wiper_passenger', part_no: '99015XP' }),
+        P({ item: 'wiper_driver', choice: 'first', part_no: 'bad!!no' }), { item: 'wiper_rear', choice: 'other', brand: 'Rain-X', size_in: 12, confidence: 'Low', source: US1 }])).r;
+      const want = [/no source/, /never High/, /must be Bosch/, /non-US/, /non-US/, /8 to 32/, /size in inches/, /filters are entered by Rick/, /manual page/, /always Low/, /twice/, /not a part number/];
       ok(r.s === 200, 'status ' + r.s); const miss = want.filter(re => !why(r, re)); ok(!miss.length, 'no drop for ' + miss + ' in ' + JSON.stringify(r.d.drops));
       const wr = find(await partsOf(id), 'wiper_rear', 'other');
       ok(r.d.proposed === 2 && wr && wr.size_in === 12 && wr.part_no === '' && wr.brand === 'Rain-X', 'the size-only Rain-X wiper was not stored ' + JSON.stringify(r.d));
@@ -1476,52 +1476,63 @@ if (health.schema >= '0014' && hasProc) {
       const r = (await research(id, [{ item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'Owner manual p.312 (selftest)' },
         { item: 'coolant', choice: 'spec', spec_text: 'OAT, selftest spec', confidence: 'Medium', source: US1 }, P({ part_no: '99011', conflict_no: '98002', confidence: 'Low', source: US1 + ' says 99011; ' + US2 + ' says 98002' })])).r;
       ok(r.s === 200 && r.d.proposed === 3 && !r.d.drops.length, JSON.stringify(r.d));
-      const d = await partsOf(id), bf = find(d, 'brake_fluid', 'spec'), o = find(d, 'oil_filter', 'first');
+      const d = await partsOf(id), bf = find(d, 'brake_fluid', 'spec'), o = find(d, 'wiper_driver', 'first');
       ok(bf.confidence === 'High' && bf.part_no === '' && o.conflict_no === '98002' && o.confidence === 'Low' && o.part_no === '99011', JSON.stringify([bf, o]));
       return 'manual High fluid, conflict row';
     });
-    await t('F2: an electric car has no oil filter or engine air filter; its coolant needs a manual page', async () => {
+    await t('F2: an electric car: a filter in a result is dropped (filters are entered by Rick), its coolant needs a manual page, a wiper and a brake fluid are stored; the items that apply leave out the oil filter and the engine air filter', async () => {
       const c = await mkCar(), id = c.d.id; await call('/api/vehicles/' + id, { method: 'PATCH', body: { fuel: 'ev' } });
-      const r = (await research(id, [P(), P({ item: 'engine_air_filter', part_no: '99014' }), P({ item: 'cabin_air_filter', part_no: '99015' }),
+      const r = (await research(id, [P(), { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99014', confidence: 'Medium', source: SRC }, { item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99015', confidence: 'Medium', source: SRC },
         { item: 'coolant', choice: 'spec', spec_text: 'selftest', confidence: 'Medium', source: US1 }, { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'Medium', source: US1 }])).r;
-      ok(r.d.proposed === 2 && r.d.drops.length === 3 && r.d.drops.filter(x => /does not apply to an electric car/.test(x.reason)).length === 2 && r.d.drops.some(x => x.item === 'coolant/spec' && /manual page/.test(x.reason)), JSON.stringify(r.d));
+      ok(r.d.proposed === 2 && r.d.drops.length === 3 && r.d.drops.filter(x => /filters are entered by Rick/.test(x.reason)).length === 2 && r.d.drops.some(x => x.item === 'coolant/spec' && /manual page/.test(x.reason)), JSON.stringify(r.d));
       const d = await partsOf(id); ok(!d.applies.includes('oil_filter') && !d.applies.includes('engine_air_filter') && d.applies.includes('cabin_air_filter') && d.fuel === 'ev', JSON.stringify(d.applies));
       return 'EV items';
     });
+    await t('F2 filters (Rick 2026-11-01 addendum): a processor result with a filter - any filter, any choice - is dropped with "filters are entered by Rick" and nothing is stored; a wiper next to it is stored', async () => {
+      const c = await mkCar(), id = c.d.id;
+      const F = (item, choice, brand, no) => ({ item, choice, brand, part_no: no, confidence: 'Medium', source: SRC });
+      const r = (await research(id, [F('oil_filter', 'first', 'WIX', '99071'), F('oil_filter', 'other', 'Purolator', 'PL99071'), F('oil_filter', 'oem', 'Honda', '99071-EXA'), F('engine_air_filter', 'first', 'WIX', '99072'),
+        F('cabin_air_filter', 'first', 'WIX', '99073'), F('cabin_air_filter', 'bogus', 'WIX', '99074'), P({ item: 'wiper_rear', size_in: 12 })])).r;
+      ok(r.s === 200 && r.d.proposed === 1 && r.d.drops.length === 6 && r.d.drops.every(x => /filters are entered by Rick/.test(x.reason)), JSON.stringify(r.d));
+      const d = await partsOf(id); ok(d.parts.length === 1 && d.parts[0].item === 'wiper_rear' && !JSON.stringify(d).includes('9907'), JSON.stringify(d.parts));
+      return 'filters dropped';
+    });
     await t('F2: Rick confirms (check flag off, history row), a confirm is not repeated, a new search never overwrites a confirmed part and replaces a proposed one (with history), reject frees the slot', async () => {
-      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first'), ch = find(d0, 'oil_filter', 'other');
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first'), ch = find(d0, 'wiper_driver', 'other');
       const cf = await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} }); if (cf.s !== 200 || cf.d.part.status !== 'confirmed' || cf.d.part.check_car !== 0 || !cf.d.part.confirmed_at || !cf.d.part.confirmed_by) b.push('confirm ' + JSON.stringify(cf.d));
       if ((await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} })).s !== 409) b.push('a confirm was repeated');
-      const r = (await research(jp, [P({ part_no: '99999' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99999' })])).r;
+      const r = (await research(jp, [P({ part_no: '99999' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99999' })])).r;
       if (r.d.skipped !== 1 || r.d.proposed !== 1) b.push('re-search ' + JSON.stringify(r.d));
-      const d1 = await partsOf(jp); if (find(d1, 'oil_filter', 'first').part_no !== '99011' || find(d1, 'oil_filter', 'first').status !== 'confirmed') b.push('a confirmed part was overwritten');
-      const ch1 = find(d1, 'oil_filter', 'other'); if (ch1.id !== ch.id || ch1.part_no !== 'PL99999' || ch1.check_car !== 1) b.push('the proposed row was not replaced in place ' + JSON.stringify(ch1));
+      const d1 = await partsOf(jp); if (find(d1, 'wiper_driver', 'first').part_no !== '99011' || find(d1, 'wiper_driver', 'first').status !== 'confirmed') b.push('a confirmed part was overwritten');
+      const ch1 = find(d1, 'wiper_driver', 'other'); if (ch1.id !== ch.id || ch1.part_no !== 'PL99999' || ch1.check_car !== 1) b.push('the proposed row was not replaced in place ' + JSON.stringify(ch1));
       const h = (await call(`/api/parts/${ch.id}/history`)).d; if (JSON.stringify(h.map(x => x.action)) !== JSON.stringify(['insert', 'update']) || !/PL99012/.test(h[1].old_json) || !/PL99999/.test(h[1].new_json)) b.push('history ' + JSON.stringify(h.map(x => x.action)));
       const rj = await call(`/api/parts/${ch.id}/reject`, { method: 'POST', body: {} }); if (rj.s !== 200 || rj.d.part.status !== 'rejected') b.push('reject');
-      if (find(await partsOf(jp), 'oil_filter', 'other')) b.push('a rejected part is still listed');
-      const r2 = (await research(jp, [P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' })])).r; const n = find(await partsOf(jp), 'oil_filter', 'other');
+      if (find(await partsOf(jp), 'wiper_driver', 'other')) b.push('a rejected part is still listed');
+      const r2 = (await research(jp, [P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012' })])).r; const n = find(await partsOf(jp), 'wiper_driver', 'other');
       if (r2.d.proposed !== 1 || !n || n.id === ch.id || n.part_no !== 'PL99012') b.push('the freed slot did not take a new row ' + JSON.stringify(r2.d));
       const ho = (await call(`/api/parts/${o.id}/history`)).d; if (JSON.stringify(ho.map(x => x.action)) !== JSON.stringify(['insert', 'confirm'])) b.push('confirm history ' + JSON.stringify(ho.map(x => x.action)));
       ok(!b.length, b.join('; ')); return 'confirm, replace, reject';
     });
     await t('F2: Rick edits a part (shape, size, High and empty checks) with a history row, and deletes one (history row kept)', async () => {
-      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first');
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first');
       const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: 'wix 99011xp', source: 'Rick typed it' } }); if (e.s !== 200 || e.d.part.part_no !== 'WIX 99011XP' || e.d.part.source !== 'Rick typed it' || e.d.part.status !== 'confirmed') b.push('edit ' + e.s + JSON.stringify(e.d));
       for (const [body, why2] of [[{ part_no: 'bad!!no' }, 'shape'], [{ confidence: 'High' }, 'High on a number'], [{ confidence: 'Sure' }, 'confidence'], [{ size_in: 40 }, 'size 40'], [{ size_in: 'big' }, 'size text'], [{}, 'empty']]) {
         const x = await call(`/api/parts/${o.id}`, { method: 'PATCH', body }); if (x.s !== 400) b.push(`${why2}: ${x.s}`);
       }
       if ((await call('/api/parts/99999999', { method: 'PATCH', body: { part_no: '1234' } })).s !== 404) b.push('missing part');
       const ho = (await call(`/api/parts/${o.id}/history`)).d; if (ho.map(x => x.action).join() !== 'insert,confirm,update' || !/99011"/.test(ho[2].old_json) || !/WIX 99011XP/.test(ho[2].new_json)) b.push('edit history ' + ho.map(x => x.action));
-      const del = find(await partsOf(jp), 'oil_filter', 'other'); const dl = await call(`/api/parts/${del.id}`, { method: 'DELETE' }); if (dl.s !== 200) b.push('delete ' + dl.s);
-      if (find(await partsOf(jp), 'oil_filter', 'other')) b.push('deleted part still listed');
+      const del = find(await partsOf(jp), 'wiper_driver', 'other'); const dl = await call(`/api/parts/${del.id}`, { method: 'DELETE' }); if (dl.s !== 200) b.push('delete ' + dl.s);
+      if (find(await partsOf(jp), 'wiper_driver', 'other')) b.push('deleted part still listed');
       const hd = (await call(`/api/parts/${del.id}/history`)).d; if (hd[hd.length - 1].action !== 'delete' || !/PL99012/.test(hd[hd.length - 1].old_json)) b.push('delete history');
       ok(!b.length, b.join('; ')); return 'edit, delete, history';
     });
     await t('F2 review 3: Rick\'s edit keeps the per-item rules - a wiper keeps a size 8 to 32, a filter keeps its part number, a fluid keeps its spec text (400 otherwise, nothing changes)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
-      const r = (await research(id, [P(), { item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, confidence: 'Medium', source: SRC },
+      const r = (await research(id, [P(), { item: 'wiper_passenger', choice: 'first', brand: 'Bosch', size_in: 22, confidence: 'Medium', source: SRC },
         { item: 'coolant', choice: 'spec', brand: '', spec_text: 'test coolant spec', confidence: 'Medium', source: SRC }])).r; ok(r.d.proposed === 3, JSON.stringify(r.d));
-      const d0 = await partsOf(id), f = find(d0, 'oil_filter', 'first'), w = find(d0, 'wiper_driver', 'first'), fl = find(d0, 'coolant', 'spec'), before = JSON.stringify(d0.parts);
+      // research no longer carries filters (2026-11-01): the filter row comes from Rick's Add part
+      const fa = await call(`/api/vehicles/${id}/parts`, { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99021', source: 'WIX Filter Finder - checked by Rick' } }); ok(fa.s === 201, 'add ' + fa.s);
+      const d0 = await partsOf(id), f = find(d0, 'oil_filter', 'first'), w = find(d0, 'wiper_passenger', 'first'), fl = find(d0, 'coolant', 'spec'), before = JSON.stringify(d0.parts);
       for (const [pid, body, why2] of [[w.id, { size_in: null }, 'wiper size null'], [w.id, { size_in: '' }, 'wiper size empty'], [w.id, { size_in: '18in' }, 'wiper size text'], [f.id, { part_no: '' }, 'filter number cleared'], [fl.id, { spec_text: '' }, 'fluid spec cleared']]) {
         const x = await call(`/api/parts/${pid}`, { method: 'PATCH', body }); if (x.s !== 400) b.push(`${why2}: ${x.s}`);
       }
@@ -1531,8 +1542,8 @@ if (health.schema >= '0014' && hasProc) {
     });
     await t('F2 review 7: a .co address and a /catalog/ac-dc/ path are US sources; /en-nz/ and .co.nz are dropped as non-US', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
-      const r = (await research(id, [P({ source: 'https://www.partsgeek.co/catalog/x and ' + US1 }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', source: 'https://www.rockauto.com/en/catalog/ac-dc/x and ' + US1 }),
-        P({ item: 'cabin_air_filter', part_no: '99021', source: 'https://www.wixfilters.com/en-nz/f/1 and ' + US1 }), P({ item: 'engine_air_filter', part_no: '99031', source: 'https://www.wixfilters.co.nz/x and ' + US1 })])).r;
+      const r = (await research(id, [P({ source: 'https://www.partsgeek.co/catalog/x and ' + US1 }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', source: 'https://www.quadratec.com/en/catalog/ac-dc/x and ' + US1 }),
+        P({ item: 'wiper_passenger', part_no: '99021', source: 'https://www.wixfilters.com/en-nz/f/1 and ' + US1 }), P({ item: 'wiper_rear', part_no: '99031', source: 'https://www.wixfilters.co.nz/x and ' + US1 })])).r;
       if (r.d.proposed !== 2 || r.d.drops.length !== 2 || !r.d.drops.every(x => /non-US/.test(x.reason))) b.push(JSON.stringify(r.d));
       ok(!b.length, b.join('; ')); return 'short lists';
     });
@@ -1559,10 +1570,10 @@ if (health.schema >= '0014' && hasProc) {
     });
     await t('F2 conflict (Rick 2026-11-01): Confirm - fits resolves a conflict (the other number is cleared, history keeps it, the source says who chose); "use the other number" swaps the two (history row, still proposed and Low) and the swapped row can be confirmed; Edit can clear the other number and the Low rule holds only while one is set', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
-      const r = (await research(id, [P({ part_no: '99011', conflict_no: '99012', confidence: 'Low' }), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012', conflict_no: 'PL99013', confidence: 'Low' }),
-        P({ item: 'cabin_air_filter', part_no: '99021', conflict_no: '99022', confidence: 'Low' })])).r;
+      const r = (await research(id, [P({ part_no: '99011', conflict_no: '99012', confidence: 'Low' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', conflict_no: 'PL99013', confidence: 'Low' }),
+        P({ item: 'wiper_passenger', part_no: '99021', conflict_no: '99022', confidence: 'Low' })])).r;
       if (r.d.proposed !== 3) b.push('setup ' + JSON.stringify(r.d));
-      const d0 = await partsOf(id), a = find(d0, 'oil_filter', 'first'), s = find(d0, 'oil_filter', 'other'), e = find(d0, 'cabin_air_filter', 'first');
+      const d0 = await partsOf(id), a = find(d0, 'wiper_driver', 'first'), s = find(d0, 'wiper_driver', 'other'), e = find(d0, 'wiper_passenger', 'first');
       if (!a || a.conflict_no !== '99012' || a.confidence !== 'Low') b.push('the conflict row was not stored ' + JSON.stringify(a));
       // 1. Confirm resolves the conflict in favour of the number shown first
       const cf = await call(`/api/parts/${a.id}/confirm`, { method: 'POST', body: {} });
@@ -1584,6 +1595,46 @@ if (health.schema >= '0014' && hasProc) {
       for (const [pid, why2] of [[e.id, 'no other number'], [a.id, 'a confirmed row'], [99999999, 'a missing part']]) { const x = await call(`/api/parts/${pid}/use-other`, { method: 'POST', body: {} }); if (x.s !== (pid === 99999999 ? 404 : 409)) b.push(`${why2}: ${x.s}`); }
       ok(!b.length, b.join('; ')); return 'confirm, swap, edit';
     });
+    await t('F2 add part (Rick 2026-11-01): POST /api/vehicles/:id/parts saves a part Rick adds as CONFIRMED (check flag off, Medium, confirmed by the caller, one insert history row); an occupied slot is 409; the per-item checks (brand, number, size 8-32, spec, source, electric car) are 400; research never overwrites it', async () => {
+      const b = [], c = await mkCar(), id = c.d.id, SRCT = 'WIX Filter Finder - checked by Rick';
+      const add = (body, o = {}) => call(`/api/vehicles/${id}/parts`, { method: 'POST', body, ...o });
+      const a1 = await add({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: ' 99041xp ', source: SRCT });
+      const p1 = a1.d && a1.d.part;
+      if (a1.s !== 201 || !p1 || p1.status !== 'confirmed' || p1.check_car !== 0 || p1.confidence !== 'Medium' || p1.part_no !== '99041XP' || p1.brand !== 'WIX' || p1.source !== SRCT || !p1.confirmed_at || !p1.confirmed_by || p1.job_id !== null) b.push('add ' + a1.s + JSON.stringify(a1.d).slice(0, 300));
+      const h = p1 ? (await call(`/api/parts/${p1.id}/history`)).d : [];
+      if (h.length !== 1 || h[0].action !== 'insert' || h[0].old_json !== null || !/"part_no":"99041XP"/.test(h[0].new_json) || !/"status":"confirmed"/.test(h[0].new_json)) b.push('history ' + JSON.stringify(h).slice(0, 300));
+      const a2 = await add({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99042', source: SRCT }); if (a2.s !== 409 || !/Edit/.test(JSON.stringify(a2.d))) b.push('an occupied slot: ' + a2.s + JSON.stringify(a2.d).slice(0, 120));
+      // every kind of item
+      const w = await add({ item: 'wiper_rear', choice: 'first', brand: 'Bosch', size_in: 22, source: SRCT }); if (w.s !== 201 || w.d.part.size_in !== 22 || w.d.part.part_no !== '' || w.d.part.status !== 'confirmed') b.push('wiper ' + w.s + JSON.stringify(w.d).slice(0, 200));
+      // research does not overwrite an added part (research carries wipers and fluids only)
+      const rs = (await research(id, [P({ item: 'wiper_rear', size_in: 12, part_no: '99999' })])).r; const now = find(await partsOf(id), 'wiper_rear', 'first');
+      if (rs.d.skipped !== 1 || now.size_in !== 22 || now.part_no !== '' || now.status !== 'confirmed') b.push('research touched the added part: ' + JSON.stringify(rs.d) + now.size_in);
+      const wo = await add({ item: 'wiper_driver', choice: 'other', brand: 'Rain-X', part_no: '9950888', size_in: 24, source: SRCT }); if (wo.s !== 201 || wo.d.part.part_no !== '9950888') b.push('wiper with a number ' + wo.s);
+      const fl = await add({ item: 'coolant', choice: 'spec', spec_text: 'Type 2 selftest spec', source: SRCT }); if (fl.s !== 201 || fl.d.part.spec_text !== 'Type 2 selftest spec' || fl.d.part.confidence !== 'Medium' || fl.d.part.brand !== '') b.push('fluid ' + fl.s + JSON.stringify(fl.d).slice(0, 200));
+      const oe = await add({ item: 'cabin_air_filter', choice: 'oem', brand: 'Honda', part_no: '99100-EXA-A99', source: 'owner manual p. 3' }); if (oe.s !== 201 || oe.d.part.brand !== 'Honda') b.push('oem ' + oe.s + JSON.stringify(oe.d).slice(0, 200));
+      // 400s
+      const bad = [[{ item: 'oil_filter', choice: 'other', brand: 'WIX', part_no: '99043', source: SRCT }, 'wrong brand for other'], [{ item: 'oil_filter', choice: 'other', brand: 'Purolator', part_no: 'bad!!no', source: SRCT }, 'number shape'],
+        [{ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '', source: SRCT }, 'filter without a number'], [{ item: 'wiper_passenger', choice: 'first', brand: 'Bosch', size_in: 40, source: SRCT }, 'size 40'],
+        [{ item: 'wiper_passenger', choice: 'first', brand: 'Bosch', size_in: 'abc', source: SRCT }, 'size text'], [{ item: 'wiper_passenger', choice: 'first', brand: 'Bosch', source: SRCT }, 'wiper without a size'],
+        [{ item: 'brake_fluid', choice: 'spec', spec_text: '', source: SRCT }, 'fluid without a spec'], [{ item: 'oil_filter', choice: 'oem', brand: '', part_no: '99044', source: SRCT }, 'OEM without a maker'],
+        [{ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99045', source: '' }, 'no source'], [{ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99045', source: '   ' }, 'blank source'],
+        [{ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99045', source: 'x'.repeat(1001) }, 'source too long'], [{ item: 'bogus', choice: 'first', brand: 'WIX', part_no: '99046', source: SRCT }, 'unknown item'],
+        [{ item: 'coolant', choice: 'first', spec_text: 'x', source: SRCT }, 'choice not for a fluid'], [{ item: 'coolant', choice: 'spec', spec_text: 'x', part_no: '99047', source: SRCT }, 'a fluid with a number']];
+      for (const [body, why2] of bad) { const x = await add(body); if (x.s !== 400) b.push(`${why2}: ${x.s}`); }
+      if ((await partsOf(id)).parts.length !== 5) b.push('a refused add stored a part: ' + (await partsOf(id)).parts.length);
+      // an electric car has no oil filter
+      const ev = await mkCar(), eid = ev.d.id; await call('/api/vehicles/' + eid, { method: 'PATCH', body: { fuel: 'ev' } });
+      const e1 = await call(`/api/vehicles/${eid}/parts`, { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99048', source: SRCT } }); if (e1.s !== 400) b.push('ev oil filter ' + e1.s);
+      // gates: the processor never; the self-test token only on a SELFTEST car; a missing car is 404
+      const pr = await add({ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99049', source: SRCT }, { as: 'proc' }); if (pr.s !== 403) b.push('processor ' + pr.s);
+      const real = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Add', grp: 'visitor' } }); made.push(real.d.id);
+      const rl = await call(`/api/vehicles/${real.d.id}/parts`, { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99050', source: SRCT } }); if (rl.s !== 403) b.push('tool token on a real car ' + rl.s);
+      if ((await call('/api/vehicles/99999999/parts', { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99051', source: SRCT } })).s !== 404) b.push('missing car');
+      // a rejected slot is free again
+      const rj = await call(`/api/parts/${p1.id}/reject`, { method: 'POST', body: {} }); const a3 = await add({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99052', source: SRCT });
+      if (rj.s !== 200 || a3.s !== 201 || a3.d.part.part_no !== '99052') b.push('a rejected slot did not take a new part: ' + a3.s);
+      ok(!b.length, b.join('; ')); return 'add part';
+    });
     await t('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [{ item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, also_fits: '99022', confidence: 'High', source: SRC }])).r;
@@ -1594,19 +1645,19 @@ if (health.schema >= '0014' && hasProc) {
     });
     await t('F2 review 5: Find parts does not overwrite a proposed row that Rick edited; a different number goes to conflict_no (Low) with a note; the skip is counted as edited by Rick', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
-      await research(id, [P()]); const o = find(await partsOf(id), 'oil_filter', 'first');
+      await research(id, [P()]); const o = find(await partsOf(id), 'wiper_driver', 'first');
       const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: '99011XP' } }); if (e.s !== 200 || e.d.part.status !== 'proposed') b.push('edit ' + e.s);
       const r = (await research(id, [P({ part_no: '99077' })])).r;
       if (r.d.skipped !== 1 || r.d.skipped_edited !== 1 || r.d.proposed !== 0) b.push('counts ' + JSON.stringify(r.d));
-      const n = find(await partsOf(id), 'oil_filter', 'first');
+      const n = find(await partsOf(id), 'wiper_driver', 'first');
       if (n.part_no !== '99011XP' || n.conflict_no !== '99077' || n.confidence !== 'Low' || !/Find parts later found 99077/.test(n.source) || n.check_car !== 1) b.push('row ' + JSON.stringify(n));
       const r2 = (await research(id, [P({ part_no: '99077' })])).r; if (r2.d.skipped_edited !== 1) b.push('second search ' + JSON.stringify(r2.d));
-      const r3 = (await research(id, [P({ part_no: '99011XP' })])).r; const n3 = find(await partsOf(id), 'oil_filter', 'first'); if (r3.d.skipped_edited !== 1 || n3.part_no !== '99011XP') b.push('same number ' + JSON.stringify(r3.d));
+      const r3 = (await research(id, [P({ part_no: '99011XP' })])).r; const n3 = find(await partsOf(id), 'wiper_driver', 'first'); if (r3.d.skipped_edited !== 1 || n3.part_no !== '99011XP') b.push('same number ' + JSON.stringify(r3.d));
       ok(!b.length, b.join('; ')); return 'edited row kept, conflict shown';
     });
     await t('F2: the processor token is refused (403) on every parts route and on deleting a car; nothing changes', async () => {
-      const b = [], d0 = await partsOf(jp), o = find(d0, 'oil_filter', 'first'), before = JSON.stringify(d0.parts);
-      for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}/use-other`, 'POST', {}],
+      const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first'), before = JSON.stringify(d0.parts);
+      for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts`, 'POST', { item: 'wiper_passenger', choice: 'other', brand: 'Rain-X', part_no: '99060', source: 'x' }], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}/use-other`, 'POST', {}],
         [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE'], [`/api/parts/${o.id}/history`, 'GET'], [`/api/vehicles/${jp}`, 'DELETE']]) {
         const x = await call(p, { as: 'proc', method: m, body }); if (x.s !== 403) b.push(`${m} ${p}: ${x.s}`);
       }
@@ -1616,8 +1667,8 @@ if (health.schema >= '0014' && hasProc) {
     });
     await t('F2: the self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (403 on any other car, nothing changes); Rick\'s login may', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
-      const r = (await research(id, [P(), P({ choice: 'other', brand: 'Purolator', part_no: 'PL99012' })])).r; ok(r.d.proposed === 2, JSON.stringify(r.d));
-      const d0 = await partsOf(id), o = find(d0, 'oil_filter', 'first'), ch = find(d0, 'oil_filter', 'other');
+      const r = (await research(id, [P(), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012' })])).r; ok(r.d.proposed === 2, JSON.stringify(r.d));
+      const d0 = await partsOf(id), o = find(d0, 'wiper_driver', 'first'), ch = find(d0, 'wiper_driver', 'other');
       try {
         ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain' } })).s === 200, 'the trim change');   // a car that is not a SELFTEST car
         const before = JSON.stringify((await partsOf(id)).parts);
@@ -1632,7 +1683,7 @@ if (health.schema >= '0014' && hasProc) {
           if ((await call(`/api/parts/${o.id}`, { as: 'phone', method: 'DELETE' })).s !== 200) b.push('Rick delete');
         }
       } finally { await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST B' } }); }
-      const back = await call(`/api/parts/${(find(await partsOf(id), 'oil_filter', 'first') || { id: 0 }).id}/confirm`, { method: 'POST', body: {} });
+      const back = await call(`/api/parts/${(find(await partsOf(id), 'wiper_driver', 'first') || { id: 0 }).id}/confirm`, { method: 'POST', body: {} });
       if (!LOCAL && back.s !== 200) b.push('on a SELFTEST car the tool token was refused: ' + back.s);
       ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
     });

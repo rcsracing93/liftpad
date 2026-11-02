@@ -781,6 +781,11 @@ const itemRows = (parts, item) => CH_ORDER.map(c => parts.find(p => p.item === i
 const itemStatus = rows => !rows.length ? '' : rows.some(p => p.status === 'proposed') ? 'proposed' : 'confirmed';
 const partStatus = rows => { const s = itemStatus(rows); return !s ? '<span class="pill Missing">Not found</span>' : pill(s) + (rows.some(p => p.check_car) ? ' <span class="chk">Check</span>' : ''); };
 const NOT_FOUND = 'Not found - look it up yourself';
+// Add part (FIX 2026-11-01): Rick saves a part he checked himself, from a source he names; it is saved CONFIRMED. The size is read the same way as in the Edit form.
+const DEFAULT_SRC = 'WIX Filter Finder - checked by Rick';
+const NAMED_BRAND = { filter: { first: 'WIX', other: 'Purolator' }, wiper: { first: 'Bosch', other: 'Rain-X' } };
+const kindOf = item => isFluid(item) ? 'fluid' : isWiper(item) ? 'wiper' : 'filter';
+const parseInches = s => { const m = String(s).trim().match(/^(\d+(?:[.,]\d+)?)\s*(?:in(?:ch(?:es)?)?\.?|")?$/i); return m ? Number(m[1].replace(',', '.')) : null; };
 async function partsPage(id) {
   const live = fresh();
   const [v, pj] = await Promise.all([api(`/vehicles/${id}?peek=1`), api(`/vehicles/${id}/parts`)]);
@@ -811,20 +816,55 @@ async function partsPage(id) {
     return `<button type="button" class="${wide ? 'pcrow' : 'pcard'}" data-item="${item}"><span class="top"><b>${head}</b><span class="pst">${partStatus(rows)}</span></span>${line}</button>`;
   };
   const cards = groups.map(([t, items]) => `<h3 class="lbl pgrph">${esc(t.split(' · ')[0])}</h3>${items.length && (isWiper(items[0]) || isFluid(items[0])) ? `<div class="pcard multi">${items.map(i => card(i, true)).join('')}</div>` : items.map(i => card(i, false)).join('')}`).join('');
-  $('#view').innerHTML = `<div class="partsscreen" data-car="${id}"><div class="pbar"><span class="lbl">Aftermarket parts · tap a row for sources</span><span class="src">Filter numbers: check against the car until you confirm</span></div>
+  $('#view').innerHTML = `<div class="partsscreen" data-car="${id}"><div class="pbar"><span class="lbl">Aftermarket parts · tap a row for sources</span><span class="src">Filters: add them from the WIX Filter Finder (Add part)</span></div>
     ${table}<div class="pcards">${cards}</div>
-    <div class="pfoot">${jobLine}<button type="button" class="ghost needsnet" id="pfind"${jobOpen ? ' disabled' : ''}>Find parts</button><span class="src offlinewhy">Searching needs a connection.</span></div></div>`;
+    <div class="pfoot">${jobLine}<button type="button" class="ghost needsnet" id="pfind"${jobOpen ? ' disabled' : ''}>Find wipers and fluids</button><button type="button" class="ghost needsnet" id="padd">Add part</button><span class="src offlinewhy">Searching and adding need a connection.</span></div></div>`;
   const openItem = item => { const rows = itemRows(parts, item); partOpen = { car: +id, item, choice: rows[0] ? rows[0].choice : null }; renderPartDrawer(); };
   document.querySelectorAll('[data-item]').forEach(e => { e.onclick = () => openItem(e.dataset.item); e.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openItem(e.dataset.item); } }; });
   const find = $('#pfind');
   if (find) find.onclick = () => { find.disabled = true; api(`/vehicles/${id}/parts-research`, { method: 'POST', body: {} }).then(() => partsPage(id)).catch(e => { find.disabled = false; $('#view').insertAdjacentHTML('beforeend', `<p class="err">${esc(e.message)}</p>`); }); };
+  const addBtn = $('#padd'); if (addBtn) addBtn.onclick = () => { partOpen = { car: +id, item: null, choice: null, add: true, vals: {} }; renderPartDrawer(); };
   if (partOpen && partOpen.car === +id) renderPartDrawer();   // an action in the drawer drew the screen again: the drawer stays open on the same item
+}
+// The "Add part" form, in the same drawer: item, choice, brand (fixed for first / other, the maker for OEM), number, size (wipers), spec (fluids), source. Save / Cancel are pinned.
+function renderAddPart() {
+  const { id, pj } = partsCtx, st = partOpen, vals = st.vals || (st.vals = {});
+  const items = PART_GROUPS.flatMap(g => g[1]).filter(i => pj.applies.includes(i));
+  if (!items.includes(st.item)) st.item = items.find(i => !itemRows(pj.parts, i).length) || items[0];
+  const kind = kindOf(st.item), chs = kind === 'filter' ? ['first', 'other', 'oem'] : kind === 'wiper' ? ['first', 'other'] : ['spec'];
+  if (!chs.includes(st.choice)) st.choice = chs.find(c => !itemRows(pj.parts, st.item).some(p => p.choice === c)) || chs[0];
+  const named = (NAMED_BRAND[kind] || {})[st.choice];
+  const fld = (lbl, idn, inner) => `<div class="field"><label for="${idn}">${lbl}</label>${inner}</div>`;
+  const form = `<form class="form pform" id="paddform" novalidate>
+    ${fld('Item', 'pa_item', `<select id="pa_item" name="item">${items.map(i => `<option value="${i}"${i === st.item ? ' selected' : ''}>${esc(PART_LONG[i])}</option>`).join('')}</select>`)}
+    ${kind === 'fluid' ? '' : fld('Choice', 'pa_choice', `<select id="pa_choice" name="choice">${chs.map(c => `<option value="${c}"${c === st.choice ? ' selected' : ''}>${CH_LABEL[c]}</option>`).join('')}</select>`)}
+    ${kind === 'fluid' ? '' : named ? fld('Brand', 'pa_brand', `<input id="pa_brand" name="brand" value="${esc(named)}" readonly>`) : fld('Maker', 'pa_brand', `<input id="pa_brand" name="brand" value="${esc(vals.brand || '')}" maxlength="30" autocomplete="off">`)}
+    ${kind === 'fluid' ? fld('Spec', 'pa_spec', `<input id="pa_spec" name="spec_text" value="${esc(vals.spec_text || '')}" maxlength="200" autocomplete="off">`) : fld(kind === 'wiper' ? 'Part number (optional)' : 'Part number', 'pa_no', `<input id="pa_no" name="part_no" value="${esc(vals.part_no || '')}" maxlength="24" autocomplete="off">`)}
+    ${kind === 'wiper' ? fld('Size, inches', 'pa_size', `<input id="pa_size" name="size_in" inputmode="decimal" value="${esc(vals.size_in || '')}" autocomplete="off">`) : ''}
+    ${fld('Source (where you checked it)', 'pa_src', `<input id="pa_src" name="source" value="${esc(vals.source ?? DEFAULT_SRC)}" maxlength="1000">`)}
+  </form>`;
+  $('#drawer').setAttribute('aria-label', 'Add part');
+  $('#drawer').innerHTML = `<div class="row dhead"><b class="lbl dtitle">Add part</b><button type="button" id="dclose" class="t48">Close</button></div>${form}<p class="err" id="perr"></p>
+    <div class="row dacts pacts" id="pacts"><button type="submit" form="paddform" class="primary needsnet" id="padsave">Save part</button><button type="button" class="ghost" id="padcancel">Cancel</button></div>`;
+  $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer; $('#padcancel').onclick = closeDrawer;
+  document.querySelectorAll('#paddform input:not([readonly])').forEach(i => { i.oninput = () => { vals[i.name] = i.value; }; });
+  $('#pa_item').onchange = e => { st.item = e.target.value; st.choice = null; renderAddPart(); };
+  const pc = $('#pa_choice'); if (pc) pc.onchange = e => { st.choice = e.target.value; renderAddPart(); };
+  $('#paddform').onsubmit = ev => {
+    ev.preventDefault();
+    const body = { item: st.item, choice: kind === 'fluid' ? 'spec' : st.choice, source: $('#pa_src').value.trim() };
+    if (kind !== 'fluid') body.brand = $('#pa_brand').value.trim();
+    if (kind === 'fluid') body.spec_text = $('#pa_spec').value.trim(); else body.part_no = $('#pa_no').value.trim();
+    if (kind === 'wiper') { const sz = parseInches($('#pa_size').value); if (sz === null) { $('#perr').textContent = 'The size must be a number of inches, for example 18'; return; } body.size_in = sz; }
+    api(`/vehicles/${id}/parts`, { method: 'POST', body }).then(() => { partOpen = { car: +id, item: st.item, choice: body.choice }; return partsPage(id); }).catch(e => { $('#perr').textContent = e.message; });
+  };
 }
 async function renderPartDrawer() {
   if (!partOpen || !partsCtx || String(partsCtx.id) !== String(partOpen.car)) return;
   const { id, v, pj } = partsCtx, item = partOpen.item;
   let w = $('#drawerwrap');
   if (!w) { w = document.createElement('div'); w.id = 'drawerwrap'; w.className = 'drawerwrap'; w.innerHTML = '<div class="dimmer" id="dimmer"></div><aside class="drawer" id="drawer" role="dialog" aria-modal="true"></aside>'; document.body.appendChild(w); }
+  if (partOpen.add) return renderAddPart();
   const rows = itemRows(pj.parts, item), sel = rows.find(p => p.choice === partOpen.choice) || rows[0];
   partOpen.choice = sel ? sel.choice : null;
   const head = `<div class="row dhead"><b class="lbl dtitle">${esc(PART_LONG[item])} · ${sel ? 'Sources' : 'Not found'}</b><button type="button" id="dclose" class="t48">Close</button></div>`;
@@ -834,7 +874,8 @@ async function renderPartDrawer() {
     const L = (await api(`/links?year=${v.year}&make=${encodeURIComponent(v.make)}&model=${encodeURIComponent(v.model)}&engine=${encodeURIComponent(v.engine || '')}&ev=${v.fuel === 'ev' ? 1 : 0}`).catch(() => [])).filter(l => l.tabs.includes('oil')).slice(0, 4);
     if (!partOpen || partOpen.item !== item) return;   // closed, or another item opened, while the links loaded (local review finding 6)
     html = `${head}<div class="dbig pbig">${NOT_FOUND}</div><p class="note">The research worker found no part with a source it could check for this item. Look it up yourself; LiftPad does not read these sites for you.</p>
-      ${L.length ? `<ul class="plinks">${L.map(l => `<li><a class="btn" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">${esc(l.label)}</a>${l.note ? `<span class="note">${esc(l.note)}</span>` : ''}</li>`).join('')}</ul>` : '<p class="note">No look-up links for this car.</p>'}`;
+      ${L.length ? `<ul class="plinks">${L.map(l => `<li><a class="btn" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">${esc(l.label)}</a>${l.note ? `<span class="note">${esc(l.note)}</span>` : ''}</li>`).join('')}</ul>` : '<p class="note">No look-up links for this car.</p>'}
+      <div class="row dacts pacts" id="pacts"><button type="button" class="primary needsnet" id="padd2">Add part</button></div>`;
   } else {
     const hist = await api(`/parts/${sel.id}/history`).catch(() => []);
     if (!partOpen || partOpen.item !== item) return;   // closed, or another item opened, while the history loaded
@@ -855,8 +896,8 @@ async function renderPartDrawer() {
   $('#drawer').setAttribute('aria-label', PART_LONG[item]);
   $('#drawer').innerHTML = html;
   $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer;
-  if (!sel) return;
-  const act = (path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
+  if (!sel) { const a2 = $('#padd2'); if (a2) a2.onclick = () => { partOpen = { car: +id, item, choice: null, add: true, vals: {} }; renderPartDrawer(); }; return; }
+  const act =(path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
   document.querySelectorAll('.pchoice').forEach(b => b.onclick = () => { partOpen.choice = b.dataset.ch; renderPartDrawer(); });
   const c = $('#pconfirm'); if (c) c.onclick = () => act(`/parts/${sel.id}/confirm`);
   const u = $('#puse'); if (u) u.onclick = () => act(`/parts/${sel.id}/use-other`);   // swaps the two numbers; the row stays proposed and Low
@@ -879,9 +920,9 @@ async function renderPartDrawer() {
       const f = new FormData(ev.target), body = {};
       f.forEach((val, k) => { body[k] = String(val); });
       if ('size_in' in body) {   // local review finding 3: read the number from "18", "18 in", "18in" or "18""; anything else is refused and nothing is sent
-        const m = body.size_in.trim().match(/^(\d+(?:[.,]\d+)?)\s*(?:in(?:ch(?:es)?)?\.?|")?$/i);
-        if (!m) { $('#perr').textContent = 'The size must be a number of inches, for example 18'; return; }
-        body.size_in = Number(m[1].replace(',', '.'));
+        const sz = parseInches(body.size_in);
+        if (sz === null) { $('#perr').textContent = 'The size must be a number of inches, for example 18'; return; }
+        body.size_in = sz;
       }
       api(`/parts/${sel.id}`, { method: 'PATCH', body }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
     };

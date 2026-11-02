@@ -565,6 +565,9 @@ function checkPart(x, fuel) {
   if (!x || typeof x !== 'object') return { err: 'not an object' };
   const item = String(x.item || ''), choice = String(x.choice || ''), kind = PART_KIND[item];
   if (!kind) return { err: `unknown item "${item}"` };
+  // Rick 2026-11-01 (addendum): the research job asks for wipers and fluids only. Filters (oil, engine air, cabin and their OEM rows) are entered by Rick with Add part, from the US
+  // WIX Filter Finder; a filter in a processor result is dropped. (Filter rows that earlier jobs proposed stay as they are.)
+  if (kind === 'filter') return { err: 'filters are entered by Rick' };
   if (!PART_CHOICES[kind].includes(choice)) return { err: `choice "${choice}" is not allowed for ${item}` };
   if (fuel === 'ev' && (item === 'oil_filter' || item === 'engine_air_filter')) return { err: 'does not apply to an electric car' };
   if (!CONF.includes(x.confidence)) return { err: 'confidence must be High, Medium or Low' };
@@ -600,6 +603,49 @@ const partJson = r => JSON.stringify(Object.fromEntries(PART_COLS.map(c => [c, r
 const partsApply = fuel => PART_ITEMS.filter(i => !(fuel === 'ev' && (i === 'oil_filter' || i === 'engine_air_filter')));
 async function carParts(env, vid) {
   return (await env.DB.prepare("SELECT id, vehicle_id, item, choice, brand, part_no, also_fits, conflict_no, size_in, spec_text, engine, status, confidence, source, check_car, job_id, created_at, updated_at, confirmed_at, confirmed_by FROM parts WHERE vehicle_id=? AND status <> 'rejected' ORDER BY id").bind(vid).all()).results;
+}
+// Rick adds a part himself (FIX 2026-11-01, "Add part"): the research worker no longer reads the catalog site that blocks ClaudeBot, so a slot that research cannot fill is filled by
+// Rick from a source he checked (default text "WIX Filter Finder - checked by Rick"; a URL is allowed, not required). The part is saved CONFIRMED (check_car 0, confidence Medium - a part
+// number is never High), confirmed by the caller's device, with one 'insert' history row. Same per-item rules as a research result: the item applies to the car's fuel, the brand per
+// choice (WIX / Purolator, Bosch / Rain-X, any maker for the OEM row), the number shape, a wiper size of 8 to 32 inches, a fluid's spec text. A slot that holds a live row is 409 (use Edit).
+async function addPart(env, v, b, me) {
+  b = b && typeof b === 'object' ? b : {};
+  const item = String(b.item || ''), choice = String(b.choice || ''), kind = PART_KIND[item];
+  if (!kind) return bad(`Unknown item "${item}"`);
+  if (!PART_CHOICES[kind].includes(choice)) return bad(`The choice "${choice}" is not allowed for ${item}`);
+  if (v.fuel === 'ev' && (item === 'oil_filter' || item === 'engine_air_filter')) return bad('That item does not apply to an electric car');
+  const source = String(b.source ?? '').trim();
+  if (!source) return bad('Write where you checked it (the source)');
+  if (source.length > 1000 || /[\u0000-\u001f]/.test(source)) return bad('The source has at most 1000 characters and no control characters');
+  const row = { item, choice, brand: '', part_no: String(b.part_no ?? '').trim().toUpperCase().replace(/\s+/g, ' '), also_fits: '', conflict_no: '', size_in: null, spec_text: '',
+    engine: String(v.engine || '').trim().slice(0, 80), confidence: 'Medium', source };
+  if (kind === 'fluid') {
+    row.spec_text = String(b.spec_text ?? '').trim();
+    if (!row.spec_text) return bad('A fluid needs its spec text');
+    if (row.part_no) return bad('A fluid has no part number');
+  } else {
+    const named = (PART_BRANDS[kind] || {})[choice], given = String(b.brand ?? '').trim();
+    if (named) { if (given && brandKey(given) !== brandKey(named[0])) return bad(`The ${choice} choice for ${item} must be ${named[0]}`); row.brand = named[0]; }
+    else { if (!OEM_BRAND_RE.test(given)) return bad('The OEM cross-reference needs the maker name'); row.brand = given; }
+    if (kind === 'filter' && !row.part_no) return bad('A filter needs a part number');
+    if (kind === 'wiper') {
+      const sz = b.size_in === undefined || b.size_in === null || b.size_in === '' ? NaN : Number(b.size_in);
+      if (!Number.isFinite(sz)) return bad('A wiper needs its size in inches');
+      row.size_in = sz;
+    }
+  }
+  const err = partFieldsErr(row) || partItemErr(row); if (err) return bad(err);
+  const taken = await env.DB.prepare("SELECT id FROM parts WHERE vehicle_id=? AND item=? AND choice=? AND status <> 'rejected'").bind(v.id, item, choice).first();
+  if (taken) return bad('This slot already has a part: use Edit', 409);
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO parts(vehicle_id, item, choice, brand, part_no, also_fits, conflict_no, size_in, spec_text, engine, status, confidence, source, check_car, job_id, created_at, updated_at, confirmed_at, confirmed_by) VALUES(?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,0,NULL,?,?,?,?)")
+        .bind(v.id, item, choice, row.brand, row.part_no, '', '', row.size_in, row.spec_text, row.engine, row.confidence, row.source, me.now, me.now, me.now, me.device),
+      env.DB.prepare("INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT id, 'insert', NULL, " + PART_JSON + ", ?, ? FROM parts WHERE vehicle_id=? AND item=? AND choice=? AND status <> 'rejected'").bind(me.now, me.device, v.id, item, choice)]);
+  } catch (e) {
+    return bad('This slot already has a part: use Edit', 409);   // the unique slot index: a second add that raced this one
+  }
+  return json({ ok: true, part: await env.DB.prepare("SELECT * FROM parts WHERE vehicle_id=? AND item=? AND choice=? AND status <> 'rejected'").bind(v.id, item, choice).first() }, 201);
 }
 async function partsResult(env, j, b, me) {
   const items = Array.isArray(b.parts) ? b.parts : null;
@@ -1600,6 +1646,12 @@ const app = {
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         const parts = await carParts(env, v.id);
         return json({ vehicle_id: v.id, fuel: v.fuel || '', applies: partsApply(v.fuel), parts, proposed: parts.filter(x => x.status === 'proposed').length });
+      }
+      if (mm && m === 'POST') {   // Rick adds a part himself (addPart): never the processor; the self-test token only on a SELFTEST car, like confirm
+        if (me.processor) return bad('The processor cannot add a part', 403);
+        const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
+        if (me.tool && !/^SELFTEST/.test(v.trim || '')) return bad('The self-test token may add a part on a SELFTEST car only', 403);
+        return addPart(env, v, await req.json().catch(() => ({})), me);
       }
       mm = p.match(/^\/api\/vehicles\/(\d+)\/parts-research$/);
       if (mm && m === 'POST') {
