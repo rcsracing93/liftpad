@@ -3,7 +3,7 @@
 // is not handled here at all, and a failed /api/ fetch gets its saved JSON copy or a JSON error.
 // HANDOFF 19 (D6): each saved copy carries the time it was saved (x-liftpad-saved), so the app can say "data saved 2 days ago".
 // A car page is saved as /api/vehicles/<id>?peek=1 by the background fetch on Home; the same page without peek (the car screen) falls back to it.
-const C = 'liftpad-v8';   // HANDOFF 21 (F4): the Parts screen (its answers /api/vehicles/<id>/parts and /api/parts/<id>/history are saved like any /api/ GET); v7 = HANDOFF 20 (E1): fonts-ui.css joins the shell (Barlow, Barlow Semi Condensed and JetBrains Mono, self-hosted)
+const C = 'liftpad-v10';   // HANDOFF 22 (G7): the Parts job line shows the search time and hides an old failed search; v9 = (G2): the Lift tile and screen say "No lift data loaded" when no guide is loaded; v8 = HANDOFF 21 (F4): the Parts screen (its answers /api/vehicles/<id>/parts and /api/parts/<id>/history are saved like any /api/ GET); v7 = HANDOFF 20 (E1): fonts-ui.css joins the shell (Barlow, Barlow Semi Condensed and JetBrains Mono, self-hosted)
 const SHELL = ['/', '/index.html', '/app.js', '/app.css', '/manifest.webmanifest', '/icon.svg', '/fonts.css', '/fonts-ui.css'];
 const offline = async (hit) => { const h = new Headers(hit.headers); h.set('x-liftpad-cache', 'offline'); return new Response(await hit.blob(), { status: hit.status, headers: h }); };
 const keep = async (r, res) => { const h = new Headers(res.headers); h.set('x-liftpad-saved', String(Date.now())); const c = await caches.open(C); await c.put(r, new Response(await res.blob(), { status: res.status, headers: h })); };

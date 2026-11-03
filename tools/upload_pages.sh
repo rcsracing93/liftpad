@@ -5,7 +5,7 @@
 # Env: LP_R2_BUCKET (default liftpad-private); WRANGLER (default "npx wrangler");
 #      LP_R2_LOCAL=1 puts into the local R2 of `wrangler dev` (.wrangler/state);
 #      without it the upload goes to Cloudflare and is refused unless LP_R2_REMOTE_APPROVED=1
-#      (Rick approves it). wrangler 3.114 has no --remote flag: no --local means Cloudflare.
+#      (you approve it). wrangler 3.114 has no --remote flag: no --local means Cloudflare.
 # Checks first that every 'ok' row of ali-pages.csv has its file with the listed size; then one
 #      put per page with content type image/jpeg. Stops at the first failed put.
 # Changes: R2 objects under ali/<edition>/ only. Never deletes.
@@ -17,7 +17,7 @@ DIR=${1:-}
 B=${LP_R2_BUCKET:-liftpad-private}
 W=${WRANGLER:-npx wrangler}
 if [ "${LP_R2_LOCAL:-}" = 1 ]; then WHERE=--local; else
-  [ "${LP_R2_REMOTE_APPROVED:-}" = 1 ] || { echo "upload_pages: an upload to Cloudflare R2 needs LP_R2_REMOTE_APPROVED=1 (Rick's approval)" >&2; exit 2; }
+  [ "${LP_R2_REMOTE_APPROVED:-}" = 1 ] || { echo "upload_pages: an upload to Cloudflare R2 needs LP_R2_REMOTE_APPROVED=1 (your approval)" >&2; exit 2; }
   WHERE=""
 fi
 CR=$(printf '\r')

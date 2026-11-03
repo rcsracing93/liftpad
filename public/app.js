@@ -1,6 +1,8 @@
 // LiftPad front end. Hash routes: #/  #/add  #/car/<id>  #/car/<id>/page (page viewer)  #/confirm  #/apps
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// Edition label for a guide page: the made-up guide (edition 'sample') is "Sample guide"; a real edition is "ALI <edition>".
+const edLabel = ed => ed === 'sample' ? 'Sample guide' : 'ALI ' + ed;
 // Device label (decision 7): picked once per browser, sent with every call, used in the history.
 const store = { get(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode: ask again next time */ } } };
 let device = store.get('lp-device');
@@ -39,7 +41,7 @@ const carName = c => `${ownerOf(c)}${c.year} ${c.make} ${c.model}`;
 const when = t => t ? String(t).slice(0, 16).replace('T', ' ') : '';
 const boxStyle = b => `left:${b.x * 100}%;top:${b.y * 100}%;width:${b.w * 100}%;height:${b.h * 100}%`;
 // Oil tab inputs (Handoff 3 decision 7). Each value is saved as text: "0W-20 · dexos1", "4.4 qt",
-// "Wix 57356". A quantity is shown in both units, with the words "with filter".
+// "Wix 99001". A quantity is shown in both units, with the words "with filter".
 const GRADES = ['0W-8', '0W-16', '0W-20', '0W-30', '0W-40', '5W-20', '5W-30', '5W-40', '10W-30', '10W-40', '15W-40', '20W-50'];
 const BRANDS = ['Wix', 'Fram', 'K&N', 'Mobil 1', 'Purolator', 'OEM'];
 const QT_L = 0.946353;
@@ -386,7 +388,7 @@ const adaptersBlock = (n, foot, hideCar) => {
   if (!n) return { stop: false, html: `<div class="adapters unchecked" data-verified="no">${lead}<div>LiftPad has no adapter notes for this chart.</div>${end}</div>` };
   return { stop, html: `<div class="adapters${lv === 'no' ? ' unchecked' : ''}${stop ? ' stop' : ''}" data-verified="${lv}" data-kit="${stop ? 'stop' : 'note'}">
     ${stop ? '<div class="stopline"><b>Do not use a 2-post.</b> The chart says so. Read its words below.</div>' : ''}${lead}
-    <div><b>Adapters (from the guide):</b> ${esc(n.adapters || 'no adapter callout on the chart')}</div>
+    <div><b>Adapters (from the guide):</b> ${esc(n.adapters || 'none noted')}</div>
     ${n.height_note ? `<div><b>Height:</b> ${esc(n.height_note)}</div>` : ''}
     <div><b>Your kit:</b> ${esc(n.kit_mark || 'height not given')}</div>
     ${n.cautions ? `<div class="chartq"><b>From the chart:</b> ${esc(n.cautions)}</div>` : ''}
@@ -498,6 +500,8 @@ function tileData(v) {
   };
   const lift = () => {
     const a = v.ali, pts = pickVal(v, 'Points');
+    // HANDOFF 22 (G2): no guide loaded at all (a fresh install): say so, no red "missing" marks. Points the owner typed still show.
+    if (v.ali_loaded === false) return { big: '<span class="nolift">No lift data loaded</span>', small: pts ? `<span class="clamp2">${esc(pts.value)}</span>` : 'see docs/LOAD-YOUR-GUIDE.md', badges: pts ? badgesOf(pts) : '' };
     const big = a ? esc(a.chart) : missing('chart');
     const small = pts ? `<span class="clamp2">${esc(pts.value)}</span>` : missing('points');
     return { big, small, badges: pts || a ? (a && a.status !== 'ok' ? missing('page') : '') + (pts ? badgesOf(pts) : '') : badgesOf(null) };
@@ -658,7 +662,7 @@ async function drawerBody(v, id, key) {
   }
   if (key === 'recalls') return head('Recalls', `<div class="recalldrawer">${recallInner(v)}</div>`);
   if (key === 'caution' || key === 'checks') {
-    const ad = v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { html: '<p class="note">No ALI chart for this car in the lift guide.</p>' };
+    const ad = v.ali ? adaptersBlock(v.chart_notes, v.chart_notes_footer, v.hide_chart_cautions) : { html: v.ali_loaded === false ? '<p class="note">No lift data loaded. See docs/LOAD-YOUR-GUIDE.md.</p>' : '<p class="note">No ALI chart for this car in the lift guide.</p>' };
     const cl = key === 'caution' ? cautionsOf(v) : [];
     return head(DRAWER_TITLE[key], `${cl.length ? `<dl>${cl.map(s => `<dt>${s.warn === 2 ? 'Do not lift yet' : 'Caution'} - ${esc(s.field)}</dt>${valueDd(s)}`).join('')}</dl>` : ''}${ad.html}<div class="weightbox" id="weightbox">${weightInner(v)}</div>`);
   }
@@ -796,8 +800,11 @@ async function partsPage(id) {
   $('#hnav').innerHTML = `<a class="btn t48" href="#/car/${id}">Car</a>`;
   const parts = pj.parts, applies = new Set(pj.applies);
   const job = (v.jobs || []).find(j => j.kind === 'parts'), jobOpen = !!job && (job.status === 'queued' || job.status === 'claimed');
+  // TODO 43: a failed search is old news once a part was added or changed after it (Add part, Edit, Confirm): the red box is hidden then.
+  const newerParts = !!job && job.status === 'failed' && parts.some(p => p.status !== 'rejected' && String(p.updated_at || p.created_at || '') > String(job.updated_at || ''));
   const jobLine = !job ? '' : jobOpen ? `<span class="note pjob">${job.status === 'claimed' ? 'Searching for parts...' : 'Search queued. The research worker takes it within about 5 minutes.'}</span>`
-    : job.status === 'failed' ? `<span class="warn bad pjob">Parts search failed: ${esc(job.error)}</span>` : `<span class="note pjob">Last search: ${esc(String(job.result_summary || 'done').slice(0, 160))}</span>`;
+    : job.status === 'failed' ? (newerParts ? '' : `<span class="warn bad pjob">Parts search failed (${esc(when(job.updated_at))}): ${esc(job.error)}</span>`)
+    : `<span class="note pjob">Last search (${esc(when(job.updated_at))}): ${esc(String(job.result_summary || 'done').slice(0, 160))}</span>`;
   const groups = PART_GROUPS.map(([t, items]) => [t, items.filter(i => applies.has(i))]).filter(([, items]) => items.length);
   const info = () => '<span class="ibtn ib" aria-hidden="true">i</span>';   // a mark only: the whole row is the target (board F2)
   const trow = item => {
@@ -897,7 +904,7 @@ async function renderPartDrawer() {
   $('#drawer').innerHTML = html;
   $('#dclose').onclick = closeDrawer; $('#dimmer').onclick = closeDrawer;
   if (!sel) { const a2 = $('#padd2'); if (a2) a2.onclick = () => { partOpen = { car: +id, item, choice: null, add: true, vals: {} }; renderPartDrawer(); }; return; }
-  const act =(path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
+  const act = (path, body) => api(path, { method: 'POST', body: body || {} }).then(() => partsPage(id)).catch(e => { $('#perr').textContent = e.message; });
   document.querySelectorAll('.pchoice').forEach(b => b.onclick = () => { partOpen.choice = b.dataset.ch; renderPartDrawer(); });
   const c = $('#pconfirm'); if (c) c.onclick = () => act(`/parts/${sel.id}/confirm`);
   const u = $('#puse'); if (u) u.onclick = () => act(`/parts/${sel.id}/use-other`);   // swaps the two numbers; the row stays proposed and Low
@@ -944,12 +951,14 @@ async function liftPage(id) {
     <span class="badges">${badgesOf(s)}</span><button class="ibtn t48" data-drawer="caution" aria-label="Source and chart checks">i</button></div><div class="cautfull">${esc(s.value)}</div></div>`;
   const pads = ((v.chart_notes_footer || '').match(/(\d+(?:\.\d+)?-\d+(?:\.\d+)?)\s*in\b/i) || [])[1];
   const adapters = n ? (!n.adapters || /^no adapter/i.test(n.adapters) ? 'none' : n.adapters) : 'no notes';
-  const chartLine = a ? `<span class="lbl">Chart</span><span class="val v28">${esc(a.chart)}</span>${a.status !== 'ok' ? missing('page') : a.d !== 0 ? confPill('Medium') : confPill('High')}<span class="src">adapters: ${esc(adapters)}${pads ? ` · pads ${esc(pads)} in` : ''}</span>` : `<span class="lbl">Chart</span>${missing('chart')}`;
+  const noGuide = v.ali_loaded === false;   // HANDOFF 22 (G2): a fresh install has no lift guide
+  const chartLine = noGuide ? `<span class="lbl">Chart</span><span class="val v28 nolift">No lift data loaded</span>` : a ? `<span class="lbl">Chart</span><span class="val v28">${esc(a.chart)}</span>${a.status !== 'ok' ? missing('page') : a.d !== 0 ? confPill('Medium') : confPill('High')}<span class="src">adapters: ${esc(adapters)}${pads ? ` · pads ${esc(pads)} in` : ''}</span>` : `<span class="lbl">Chart</span>${missing('chart')}`;
   const level = n && CHECKED_SHORT[n.verified] ? n.verified : 'no';
   const curb = v.curb ? `Curb weight ${lbPlain(v.curb.lb)} lb ${pill(v.curb.status === 'confirmed' ? 'confirmed' : 'proposed')}` : 'Curb weight not known yet';
   const mismatch = a && a.d !== 0 ? `<div class="warn">ALI chart ${esc(a.chart)} covers ${a.year_from}-${a.year_to}, not ${v.year}. Check it is the same body before you use it. (guide p.${a.guide_page})</div>` : '';
-  const chartView = a && a.img ? `<div class="chartbox"><div class="row charthead"><b>${esc(a.chart)}${a.box ? ' · zoomed' : ''} · guide p.${a.guide_page}</b><span class="src">ALI ${esc(a.edition)} · ${a.year_from}-${a.year_to}</span></div>
-      <div class="vstage lzstage" id="lzstage"><div class="vpage" id="lzpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="ALI ${esc(a.edition)} guide page ${a.guide_page}${a.box ? ', chart ' + esc(a.chart) + ' zoomed' : ''}" draggable="false"></div></div>
+  const chartView = noGuide ? `<div class="panel emptylift" id="emptylift"><b>No lift data loaded</b><p class="note">This install has no lift-point guide. LiftPad ships the tools, not the guide. To load your own copy, follow <span class="mono">docs/LOAD-YOUR-GUIDE.md</span>. Until then, type the lift points for this car into the Points value.</p></div>`
+    : a && a.img ? `<div class="chartbox"><div class="row charthead"><b>${esc(a.chart)}${a.box ? ' · zoomed' : ''} · guide p.${a.guide_page}</b><span class="src">${esc(edLabel(a.edition))} · ${a.year_from}-${a.year_to}</span></div>
+      <div class="vstage lzstage" id="lzstage"><div class="vpage" id="lzpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="${esc(edLabel(a.edition))} guide page ${a.guide_page}${a.box ? ', chart ' + esc(a.chart) + ' zoomed' : ''}" draggable="false"></div></div>
       <span class="src">Pinch to zoom here.</span></div><a class="btn big amber" href="#/car/${id}/page">Whole page p.${a.guide_page} full screen</a>`
     : a && a.status === 'missing_from_scan' ? `<div class="warn bad">The page for chart ${esc(a.chart)} (guide p.${a.guide_page}) is missing from the ${esc(a.edition)} scan. Use a paper guide.</div>`
     : `<div class="warn bad">No ALI chart for this car in the lift guide.</div>`;
@@ -1213,9 +1222,9 @@ async function viewer(id) {
   const fine = matchMedia('(pointer: fine)').matches;
   $('#view').innerHTML = `<div class="viewer" id="vw" role="dialog" aria-label="ALI page viewer">
     <div class="vbar"><a class="btn primary" href="#/car/${v.id}/lift">Close</a>
-      <span class="vtitle">Use chart ${esc(a.chart)}</span><span class="vsub">ALI ${esc(a.edition)} · guide p.${a.guide_page} · ${a.year_from}-${a.year_to}</span>
+      <span class="vtitle">Use chart ${esc(a.chart)}</span><span class="vsub">${esc(edLabel(a.edition))} · guide p.${a.guide_page} · ${a.year_from}-${a.year_to}</span>
       <span class="vtools" id="vtools"></span></div>
-    <div class="vstage" id="stage"><div class="vpage" id="vpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="ALI ${esc(a.edition)} guide page ${a.guide_page}" draggable="false"><span class="pbox" id="vbox" hidden></span><span class="pdraw" id="vdraw" hidden></span></div>
+    <div class="vstage" id="stage"><div class="vpage" id="vpage" style="width:${a.w}px;height:${a.h}px"><img src="${esc(a.img)}" alt="${esc(edLabel(a.edition))} guide page ${a.guide_page}" draggable="false"><span class="pbox" id="vbox" hidden></span><span class="pdraw" id="vdraw" hidden></span></div>
       <p class="vhint" id="vhint">Pinch to zoom · drag to move · double-tap to zoom on a spot</p></div></div>`;
   const stage = $('#stage'), pg = $('#vpage'), W = a.w, H = a.h;
   let s = 1, x = 0, y = 0, box = a.box, mode = 'view', draft = null, err = '';

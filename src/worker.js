@@ -86,7 +86,8 @@ async function who(req, env) {
   // Ultrareview 2 #1: a request that carries an Access token the Worker cannot verify (bad signature, expired, unknown key, or the
   // Access settings missing) is refused, not treated as an ordinary caller: the processor limits must fail closed.
   const badJwt = !!req.headers.get('cf-access-jwt-assertion') && !c;
-  return { email: c && c.email || '', token, processor, tool, device, badJwt, now: now.toISOString(), nowMs: now.getTime() };
+  // selftest = the self-test tool token and NOT the processor (the processor is also "tool"; it has its own route list, PROC_ROUTES, and reads real cars). Review G #9: the SELFTEST-car rules apply to this one.
+  return { email: c && c.email || '', token, processor, tool, selftest: tool && !processor, device, badJwt, now: now.toISOString(), nowMs: now.getTime() };
 }
 
 // ---------- Makes and models (unchanged rules) ----------
@@ -162,7 +163,7 @@ async function setBox(env, b, me) {
   if (!row) return bad('No such chart on that page in that edition', 404);
   await env.DB.prepare(`INSERT INTO ali_chart_boxes(edition, chart, pdf_page, x, y, w, h, set_at, set_by) VALUES(?,?,?,?,?,?,?,?,?)
     ON CONFLICT(edition, chart) DO UPDATE SET pdf_page=excluded.pdf_page, x=excluded.x, y=excluded.y, w=excluded.w, h=excluded.h, set_at=excluded.set_at, set_by=excluded.set_by`)
-    .bind(String(b.edition), String(b.chart), parseInt(b.pdf_page, 10), x, y, w, h, me.now, me.device).run();
+    .bind(String(b.edition), String(b.chart), parseInt(b.pdf_page, 10), x, y, w, h, me.now, me.tool ? TOOL_BOX_BY : me.device).run();
   return json({ ok: true, box: { x, y, w, h } });
 }
 
@@ -283,12 +284,15 @@ async function vehicle(env, id, me, touch) {
   if (!v) return null;
   if (touch) { await env.DB.prepare('UPDATE vehicles SET last_seen=? WHERE id=?').bind(me.now, id).run(); v.last_seen = me.now; }
   v.values = await carValues(env, v, false);
+  if (me.selftest) v.values = v.values.filter(x => x.scope === 'car');   // Review G 1c: the tool token reads the car's own values, never Rick's model values (the tool never makes a model value)
   v.typical = await typical(env, v.make, v.year, v.values);
   // HANDOFF 15, "the door card wins": a confirmed car-scope tire value from a placard hides the model-scope values of the SAME field
   // (ultrareview F9; they stay in the database and in history; the flag lets the app and the tests see them).
   const placard = placardFields(v.values);
   v.values.forEach(x => { x.range_flag = rangeFlag(x, v.typical.range); x.hidden_by_placard = x.tab === 'tires' && x.scope === 'model' && placard.has(x.field_id); });
   v.ali = await nearestChart(env, v.make, v.model, v.year);
+  // HANDOFF 22 (G2): is a lift guide loaded at all? A fresh install has none: the app says so and points to docs/LOAD-YOUR-GUIDE.md, instead of "no chart for this car".
+  v.ali_loaded = !!v.ali || !!(await env.DB.prepare('SELECT 1 FROM ali_index LIMIT 1').first());   // Review G #10: the query only when no chart matched
   v.chart_notes = v.ali ? await chartNotes(env, v.ali.edition, v.ali.chart) : null;
   // HANDOFF 15: the per-car switch hides the chart's caution text (the car's own caution stays; the chart image still shows it).
   if (v.chart_notes && v.hide_chart_cautions) v.chart_notes = { ...v.chart_notes, cautions: null, cautions_hidden: true };
@@ -392,10 +396,12 @@ async function addValue(env, v, b, me) {
   const tq = isTorque(tab, name) ? ftlbOf(b) : {};
   if (tq.err) return bad(tq.err);
   const scope = b.scope === 'car' ? 'car' : 'model';
+  // Review G #1: the tool token adds CAR-scope values only (a model-scope value would apply to Rick's real cars of that make and model), and only as proposed.
+  if (me.selftest && scope !== 'car') return bad('The self-test token may add car-scope values only. A model-wide value is Rick\'s to add and confirm.', 403);
   const yf = scope === 'model' ? parseInt(b.year_from ?? v.year, 10) : null, yt = scope === 'model' ? parseInt(b.year_to ?? v.year, 10) : null;
   if (scope === 'model' && (!yearOk(yf) || !yearOk(yt) || yf > yt)) return bad('Year range is not valid');
   // A browser entry by Rick is confirmed only when he asks for it; the processor can only propose.
-  const status = !me.processor && b.status === 'confirmed' ? 'confirmed' : 'proposed';
+  const status = !me.processor && !me.tool && b.status === 'confirmed' ? 'confirmed' : 'proposed';   // the tool token: proposed only (confirm goes through the confirm route)
   await env.DB.batch(insertValueStmts(env, { field_id: f.id, scope, make: scope === 'model' ? v.make : null, model: scope === 'model' ? v.model : null,
     year_from: yf, year_to: yt, vehicle_id: scope === 'car' ? v.id : null, value: String(b.value).trim(), confidence: b.confidence,
     source: b.source, note: b.note, warn, status, engine: b.engine ? String(b.engine).trim().slice(0, 80) : null, ...tq }, me));
@@ -484,6 +490,8 @@ async function jobResult(env, id, b, me) {
   if (j.kind === 'parts') return partsResult(env, j, b, me);
   const rq = JSON.parse(j.request), vals = Array.isArray(b.values) ? b.values : null;
   if (!vals) return bad('Need values: a list of {tab, field, value, confidence, source}');
+  // Review G 1a, second line of defence: a research result is stored as MODEL-scope values, so it is never stored for a job whose car is a SELFTEST car (its make and model are a real car's).
+  if (isSelftestTrim(rq.trim)) return bad('Research for a SELFTEST car is not stored (it would land on a real make and model).', 400);
   const stmts = []; let skipped = 0;
   for (const x of vals) {
     if (!x || !String(x.value || '').trim() || !CONF.includes(x.confidence) || !String(x.source || '').trim()) return bad('Each value needs field, value, confidence and source');
@@ -731,10 +739,104 @@ async function changePart(env, id, action, set, me) {
 }
 // Rick 2026-10-31: only Rick confirms. The self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (so the live
 // self-test can grade the routes); on any other car it is refused (403). Rick's own login is never gated here. A missing part falls through to 404.
-async function toolPartGate(env, partId, me) {
+// (Review G #9: the per-route gates are gone. toolRouteGate below is the one place; every route the tool token reaches passes it first.)
+// HANDOFF 22 G1 (TODO 39): the same rule for VALUES. The self-test tool token may confirm, reject, edit or delete a value only when it belongs to a SELFTEST car.
+// A car-scope value belongs to its car. A model-scope value belongs to a make, model and years: it is refused when ANY car that is not a SELFTEST car has that
+// make, model and year (so it can never touch the value of a real car), and otherwise allowed when a SELFTEST car has them or the tool token itself entered it
+// (a leftover of an earlier run whose temp car is gone). Rick's own login is never gated here. A missing value falls through to 404.
+// Review G #1, #2 (Rick/Cowork 2026-11-02): the tool token creates, changes or reads CAR-scope values on a SELFTEST car only. A MODEL-scope value applies to every car of a
+// make, model and years, now and later, so the tool token never creates one (addValue refuses it) and never changes or reads one (below). No "no real car matches" allowance:
+// the token can make a SELFTEST car itself, so that allowance let it change Rick's model values. Model-scope logic is tested with Rick's login in local mode.
+const TOOL_VALUE_MSG = 'The self-test token may decide values on a SELFTEST car only. Only Rick confirms a value.';
+// Review G #7: ONE meaning of "a SELFTEST trim": the trimmed text starts with SELFTEST, capitals as written (so 'selftest' is a real car). The create route stores the trimmed
+// trim; SQL uses GLOB 'SELFTEST*' on that stored value (LIKE ignores case). Never test a trim any other way.
+const isSelftestTrim = t => /^SELFTEST/.test(String(t ?? '').trim());
+async function isSelftestCar(env, id) {   // true / false, or null when there is no such car (the route answers 404)
+  const r = await env.DB.prepare('SELECT trim FROM vehicles WHERE id=?').bind(id).first();
+  return r ? isSelftestTrim(r.trim) : null;
+}
+// HANDOFF 22 G1b: ONE gate for the tool token on every route that changes a car or what hangs on it (edit, delete, values, visits, photos, photo read, research, facts).
+// The self-test token touches a SELFTEST car only (its trim starts with SELFTEST); on any other car it is refused (403) and nothing changes. A missing car falls through
+// to the route's own 404. Rick's login is never gated. Parts, values, VIN proposals and the curb weight have their own gates above (same rule).
+const TOOL_CAR_MSG = 'The self-test token may change a SELFTEST car only. Only Rick changes a real car.';
+// Review G #9: ONE central gate for the tool token, run in handle() before any route. A route that names a car (directly, or through a value, part, visit, VIN proposal or
+// photo) is allowed only when isSelftestCar says yes. A route the tool may use without a car is on TOOL_NO_CAR (an explicit short list). Everything else, and every NEW
+// route, is refused for the tool token by default (there is no TOOL_ROUTES list any more; the self-test grades the routes it uses and the 403 on the rest).
+// The tool token is the SELFTEST token only: the live browser checks (ops/review_phase_*.js, lp-f-live-check) work on SELFTEST cars they make and delete (Review G 1e).
+const TOOL_NO_CAR = [   // [method or '*', pattern]. No car data is read or changed through these.
+  ['GET', /^\/api\/health$/], ['GET', /^\/api\/whoami$/], ['GET', /^\/api\/(makes|models|vin|fe|tabs|links)$/], ['GET', /^\/api\/service-items$/],
+  ['GET', /^\/api\/ali\/pages$/], ['*', /^\/api\/ali\/[0-9a-z-]{1,20}\/p\d{3}\.jpg$/], ['PUT', /^\/api\/ali\/boxes$/], ['DELETE', /^\/api\/ali\/boxes$/],   // boxes: boxGate in the route
+  ['POST', /^\/api\/chart-checks$/],   // the route allows the tool on the temp edition 'selftest' only
+  ['DELETE', /^\/api\/jobs\/selftest$/], ['GET', /^\/api\/vehicles$/], ['POST', /^\/api\/vehicles$/],   // the self-test sweep lists cars; create is checked below (SELFTEST trim only)
+  ['GET', /^\/api\/needs-confirming$/], ['GET', /^\/api\/apps$/], ['GET', /^\/api\/trims$/]];
+const TOOL_MSG = 'The self-test token may use a SELFTEST car only. Only Rick changes or reads a real car.';
+// The car a tool request names, or null when it names none, or false when it is a route with a car we cannot resolve (refused). Missing record -> 'none' (the route's own 404).
+async function toolRouteCar(env, req, p, m, url) {
+  let x;
+  if ((x = p.match(/^\/api\/vehicles\/(\d+)(\/|$)/))) return +x[1];
+  if ((x = p.match(/^\/api\/photos\/(\d+)\//))) return +x[1];
+  const one = async (sql, id) => { const r = await env.DB.prepare(sql).bind(id).first(); return r ? r.v : 'none'; };
+  if ((x = p.match(/^\/api\/parts\/(\d+)(\/|$)/))) return one('SELECT vehicle_id v FROM parts WHERE id=?', +x[1]);
+  if ((x = p.match(/^\/api\/service\/(\d+)(\/|$)/))) return one('SELECT vehicle_id v FROM service_entries WHERE id=?', +x[1]);
+  if ((x = p.match(/^\/api\/vin-proposals\/(\d+)(\/|$)/))) return one('SELECT vehicle_id v FROM photo_reads WHERE id=?', +x[1]);
+  if ((x = p.match(/^\/api\/values\/(\d+)(\/|$)/))) {   // a MODEL-scope value is refused for the tool whatever the cars are (v = false)
+    const r = await env.DB.prepare('SELECT scope, vehicle_id FROM vals WHERE id=?').bind(+x[1]).first();
+    return !r ? 'none' : r.scope === 'car' && r.vehicle_id ? r.vehicle_id : false;
+  }
+  if (p === '/api/service' || p === '/api/service-log.csv') { const c = parseInt(url.searchParams.get('car'), 10); return c || false; }   // no car = every car: refused
+  if (p === '/api/jobs' && m === 'POST') { const b = await req.clone().json().catch(() => ({})); return parseInt(b.vehicle_id, 10) || false; }
+  return null;
+}
+async function toolRouteGate(env, req, p, m, url, me) {
+  if (!me.selftest) return null;   // the processor is limited by PROC_ROUTES instead
+  const car = await toolRouteCar(env, req, p, m, url);
+  if (car === 'none') return null;   // the record is not there: the route answers 404 and touches nothing
+  if (car === false) return bad(TOOL_MSG, 403);
+  if (car !== null) {
+    const st = await isSelftestCar(env, car);
+    if (st === null) return null;   // no such car: the route's own 404
+    if (!st) {
+      // The one exception (Opus pass F8): a car that WAS a SELFTEST car (its trim log in notes says so), turned real by the tests, may be set back to a SELFTEST trim, by the trim alone.
+      if (m === 'PATCH' && p === '/api/vehicles/' + car) {
+        const b = await req.clone().json().catch(() => ({})), v = await env.DB.prepare('SELECT notes FROM vehicles WHERE id=?').bind(car).first();
+        if ('trim' in b && !('grp' in b) && !('vin' in b) && isSelftestTrim(b.trim) && /trim "SELFTEST/.test((v && v.notes) || '')) return null;
+      }
+      return bad(TOOL_MSG, 403);
+    }
+    return null;
+  }
+  if (TOOL_NO_CAR.some(([tm, re]) => (tm === '*' || tm === m || (tm === 'GET' && m === 'HEAD')) && re.test(p))) {
+    if (p === '/api/vehicles' && m === 'POST') {   // create: a SELFTEST trim only (the stored value is the trimmed one: the route trims it)
+      const b = await req.clone().json().catch(() => ({}));
+      if (!isSelftestTrim(b.trim)) return bad('The self-test token may make a SELFTEST car only (trim starts with SELFTEST)', 403);
+    }
+    return null;
+  }
+  return bad(TOOL_MSG, 403);
+}
+// Review G 1a (Rick/Cowork 2026-11-02): research lands as MODEL-scope values, and a SELFTEST car has a real make, model and year. So the tool token queues no research of any kind,
+// even on a SELFTEST car: POST /api/jobs, a parts search, and a change to Frequent (it queues a workup job). Rick's login does; the research cases of the self-test run local only.
+const TOOL_RESEARCH_MSG = 'The self-test token may not queue research (it would land on a real make and model). Only Rick starts research.';
+async function toolResearchGate(req, p, m, me) {
+  if (!me.selftest) return null;
+  if (m === 'POST' && (p === '/api/jobs' || /^\/api\/vehicles\/\d+\/parts-research$/.test(p))) return bad(TOOL_RESEARCH_MSG, 403);
+  if (m === 'PATCH' && /^\/api\/vehicles\/\d+$/.test(p)) { const b = await req.clone().json().catch(() => ({})); if (b && b.grp === 'frequent') return bad(TOOL_RESEARCH_MSG, 403); }
+  return null;
+}
+// Review G 1b: ids are reused after a delete (no AUTOINCREMENT in G), but history rows stay. The tool token reads the history of a row only from the moment that row was made,
+// so a reused id never shows the old_json of Rick's deleted row. A row that is gone shows the tool nothing. Rick's login reads all of it.
+async function historyFloor(env, me, sql, id) {
+  if (!me.selftest) return { all: true };
+  const r = await env.DB.prepare(sql).bind(id).first();
+  return r && r.t ? { all: false, since: String(r.t) } : { all: false, none: true };
+}
+// A chart box is Rick's drawing. The tool token may draw a box on a chart that has none, and move or remove only a box it drew itself. The Worker marks the tool's boxes
+// itself (set_by = TOOL_BOX_BY, decided by the token, never by the x-lp-device header, which a caller can write).
+const TOOL_BOX_BY = 'tool:selftest';
+async function boxGate(env, edition, chart, me) {
   if (!me.tool) return null;
-  const r = await env.DB.prepare('SELECT v.trim FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.id=?').bind(partId).first();
-  return r && !/^SELFTEST/.test(r.trim || '') ? bad('The self-test token may decide parts on a SELFTEST car only. Only Rick confirms a part.', 403) : null;
+  const r = await env.DB.prepare('SELECT set_by FROM ali_chart_boxes WHERE edition=? AND chart=?').bind(edition, chart).first();
+  return r && r.set_by !== TOOL_BOX_BY ? bad('The self-test token may move or remove only a chart box it drew itself. Rick draws the boxes.', 403) : null;
 }
 async function queuePartsResearch(env, v, me) {
   const open = await env.DB.prepare("SELECT id FROM jobs WHERE kind='parts' AND target=? AND status IN ('queued','claimed')").bind('car:' + v.id).first();
@@ -788,7 +890,7 @@ async function feMatch(env, year, make, model, dec) {
 async function trimNames(env, year, make, model) {
   const out = [], seen = new Set();
   const add = (name, source) => { const k = fold(name); if (name && !seen.has(k)) { seen.add(k); out.push({ name, source }); } };
-  const mine = await env.DB.prepare("SELECT DISTINCT trim FROM vehicles WHERE make=? AND model=? AND year=? AND trim<>'' AND trim NOT LIKE 'SELFTEST%' ORDER BY trim").bind(make, model, year).all();
+  const mine = await env.DB.prepare("SELECT DISTINCT trim FROM vehicles WHERE make=? AND model=? AND year=? AND trim<>'' AND trim(trim) NOT GLOB 'SELFTEST*' ORDER BY trim").bind(make, model, year).all();
   mine.results.forEach(r => add(r.trim, 'LiftPad'));
   try {
     const nm = (await env.DB.prepare('SELECT nhtsa_name FROM makes WHERE name=?').bind(make).first() || {}).nhtsa_name || make;
@@ -878,6 +980,7 @@ async function refreshFacts(env, v, me) {
 }
 // Rick types or confirms the weight. { action: 'confirm', lb?, front_pct? } keeps the proposed numbers or replaces them with his; { action: 'clear' } removes it.
 async function curbDecision(env, v, b, me) {
+  // (the tool token reaches this only on a SELFTEST car: toolRouteGate)
   if (b.action === 'clear') {
     await env.DB.prepare('UPDATE vehicles SET curb_lb=NULL, curb_front_pct=NULL, curb_source=NULL, curb_status=NULL, curb_at=NULL WHERE id=?').bind(v.id).run();
     return json({ ok: true, curb: null });
@@ -982,7 +1085,7 @@ async function adminStatus(env, me, url, withLog) {
     return { name: String(name).slice(0, 40), level: OPS_LEVELS.includes(level) ? level : 'amber', reason: scrubText(reason).slice(0, 200), data: data || (Object.keys(rest).length ? rest : undefined) };
   }) : [];
   if (health && !items.length) items = [{ name: 'n100_report', level: health.level, reason: `The health report came without its lines (too large or damaged). ${health.text}`.slice(0, 200) }];
-  if (!health) items = [{ name: 'n100_report', level: 'red', reason: 'No health report has arrived from the N100 yet.' }];
+  if (!health) items = [{ name: 'n100_report', level: 'info', reason: 'No report from the always-on box yet. This is normal when you run LiftPad without it.' }];   // G7: grey, not a problem
   else if (hAge > 1) items.unshift({ name: 'n100_report', level: hAge > 3 ? 'red' : 'amber', reason: `The N100 health report is ${hAge.toFixed(1)} hours old. The collector may have stopped.` });
   const cost = items.find(i => i.name === 'research_cost');
   const costOut = cost ? { today_usd: cost.data && cost.data.today_usd, month_usd: cost.data && cost.data.month_usd, daily_cap_usd: cost.data && cost.data.daily_cap_usd } : null;
@@ -991,7 +1094,7 @@ async function adminStatus(env, me, url, withLog) {
   const pItem = items.find(i => i.name === 'research_parts'), pd = pItem && pItem.data;
   const partsOut = pd ? { level: pItem.level, reason: pItem.reason, jobs: Number(pd.jobs) || 0, posted: Number(pd.posted) || 0, dropped: Number(pd.dropped) || 0, failed: Number(pd.failed) || 0, daily_cap: Number(pd.daily_cap) || 0,
     reasons: pd.reasons && typeof pd.reasons === 'object' ? Object.fromEntries(Object.entries(pd.reasons).slice(0, 6).map(([k, n]) => [String(k).slice(0, 60), Number(n) || 0])) : {} } : null;
-  const workerRuns = { level: worstOf([runItem ? runItem.level : 'amber', cost ? cost.level : 'green', pItem ? pItem.level : 'green']), reason: runItem ? runItem.reason : 'No research worker line in the health report.',
+  const workerRuns = { level: !health ? 'info' : worstOf([runItem ? runItem.level : 'amber', cost ? cost.level : 'green', pItem ? pItem.level : 'green']), reason: runItem ? runItem.reason : !health ? 'No report from the always-on box yet, so no research worker line.' : 'No research worker line in the health report.',
     last_run: run ? { ts: run.ts, level: run.level, text: run.text, data: run.data } : null, cost: costOut, parts: partsOut };
   // Results: what research and door-card reads proposed (the work is in Needs confirming).
   const prop = await env.DB.prepare("SELECT (SELECT count(*) FROM vals WHERE status='proposed') v, (SELECT count(*) FROM photo_reads WHERE status='proposed') p").first();
@@ -1256,6 +1359,7 @@ const app = {
       if (me.badJwt) return bad('The Access token could not be verified', 403);
       if (me.tool) { acc.on = true; env = { ...env, DB: meterDb(env.DB, acc) }; }
       if (me.processor &&!PROC_ROUTES.some(([pm, re]) => pm === m && re.test(p))) return bad('Not for the processor', 403);
+      { const tg = await toolResearchGate(req, p, m, me) || await toolRouteGate(env, req, p, m, url, me); if (tg) return tg; }   // Review G #9: the one gate for the tool token, before any route
       // Ultrareview F11 (Rick 2026-10-27, D1 read quota): the 15-minute ping reads only the newest migration id (the primary-key index:
       // about 1 row). The counts (about 3,600 rows read) only with ?full=1 and a tool token, once a day. rows_read is D1's own figure.
       if (p === '/api/health') {
@@ -1283,9 +1387,10 @@ const app = {
       // HANDOFF 13: "I checked this chart" and "Undo". Only Rick's own Access login (an email, no service token) may do it.
       // The self-test tool token may do it only on the temp edition 'selftest', which it creates and removes itself.
       if (p === '/api/chart-checks' && m === 'POST') return chartCheck(env, await req.json(), me);
-      if (p === '/api/ali/boxes' && m === 'PUT') return setBox(env, await req.json(), me);
+      if (p === '/api/ali/boxes' && m === 'PUT') { const b = await req.json(); return (await boxGate(env, String(b.edition || ''), String(b.chart || ''), me)) || setBox(env, b, me); }
       if (p === '/api/ali/boxes' && m === 'DELETE') {
         if (me.processor) return bad('The processor cannot change chart boxes', 403);
+        { const bg = await boxGate(env, url.searchParams.get('edition') || '', url.searchParams.get('chart') || '', me); if (bg) return bg; }
         await env.DB.prepare('DELETE FROM ali_chart_boxes WHERE edition=? AND chart=?').bind(url.searchParams.get('edition') || '', url.searchParams.get('chart') || '').run();
         return json({ ok: true });
       }
@@ -1340,6 +1445,8 @@ const app = {
       if (p === '/api/trims' && m === 'GET') {
         const year = parseInt(url.searchParams.get('year'), 10), make = url.searchParams.get('make') || '', model = url.searchParams.get('model') || '';
         if (!make || !model || !yearOk(year)) return bad('Need year, make and model');
+        // Review G 1c: the tool token sees SELFTEST trims only (the real list shows the trims of Rick's own cars).
+        if (me.selftest) return json({ trims: (await env.DB.prepare("SELECT DISTINCT trim FROM vehicles WHERE make=? AND model=? AND year=? AND trim(trim) GLOB 'SELFTEST*' ORDER BY trim").bind(make, model, year).all()).results.map(r => ({ name: r.trim, source: 'LiftPad' })) });
         return json({ trims: await trimNames(env, year, make, model) });
       }
       if (p === '/api/tabs' && m === 'GET') return json(await tabsFields(env));
@@ -1371,7 +1478,10 @@ const app = {
         return json(await serviceEntries(env, w.join(' AND '), bnd));
       }
       let sm = p.match(/^\/api\/service\/(\d+)\/history$/);
-      if (sm && m === 'GET') return json((await env.DB.prepare('SELECT id, entry_id, action, before_json, after_json, at, who FROM service_log_history WHERE entry_id=? ORDER BY id').bind(+sm[1]).all()).results);
+      if (sm && m === 'GET') {
+        const fl = await historyFloor(env, me, 'SELECT created_at t FROM service_entries WHERE id=?', +sm[1]); if (fl.none) return json([]);
+        return json((await env.DB.prepare(`SELECT id, entry_id, action, before_json, after_json, at, who FROM service_log_history WHERE entry_id=?${fl.all ? '' : ' AND at >= ?'} ORDER BY id`).bind(...(fl.all ? [+sm[1]] : [+sm[1], fl.since])).all()).results);
+      }
       sm = p.match(/^\/api\/service\/(\d+)$/);
       if (sm && (m === 'PATCH' || m === 'DELETE')) return changeVisit(env, +sm[1], m, m === 'PATCH' ? await req.json() : {}, me);
       sm = p.match(/^\/api\/vehicles\/(\d+)\/service$/);
@@ -1387,7 +1497,8 @@ const app = {
         return addVisit(env, v, await req.json(), me);
       }
       if (p === '/api/needs-confirming' && m === 'GET') {
-        const { results } = await env.DB.prepare(`${VAL_SELECT} WHERE x.status='proposed' ORDER BY x.make, x.model, x.year_from, t.sort, f.sort, x.id`).all();
+        // Rick/Cowork 2026-11-02: the tool token sees the proposed values of SELFTEST cars only (car-scope on a SELFTEST car); never a real car's or a model value.
+        const { results } = await env.DB.prepare(`${VAL_SELECT} WHERE x.status='proposed'${me.selftest ?" AND x.scope='car' AND x.vehicle_id IN (SELECT id FROM vehicles WHERE trim(trim) GLOB 'SELFTEST*')" : ''} ORDER BY x.make, x.model, x.year_from, t.sort, f.sort, x.id`).all();
         // A proposed torque outside the usual range of the thread is flagged here too (decision 9).
         const seen = new Map();
         for (const x of results) {
@@ -1410,9 +1521,9 @@ const app = {
         // HANDOFF 17: VIN proposals read from a photo (never for the processor: it must not see a VIN) and the missing-data badges per car.
         if (me.processor) return json({ count: results.length, values: results });
         const vp = (await env.DB.prepare(`SELECT r.id, r.vehicle_id, r.photo, r.vin, r.vin_ok, r.created_at, v.year, v.make, v.model, v.vin saved FROM photo_reads r JOIN vehicles v ON v.id = r.vehicle_id
-          WHERE r.status='proposed' ORDER BY r.id`).all()).results.map(({ saved, ...r }) => ({ ...r, car: `${r.year} ${r.make} ${r.model}`, saved_state: !saved ? 'none' : saved === r.vin ? 'matches' : 'differs' }));
+          WHERE r.status='proposed'${me.selftest ?" AND trim(v.trim) GLOB 'SELFTEST*'" : ''} ORDER BY r.id`).all()).results.map(({ saved, ...r }) => ({ ...r, car: `${r.year} ${r.make} ${r.model}`, saved_state: !saved ? 'none' : saved === r.vin ? 'matches' : 'differs' }));
         const placard = await badgeMap(env);
-        const badges = (await env.DB.prepare("SELECT id, year, make, model, vin FROM vehicles ORDER BY make, model, year").all()).results
+        const badges = (await env.DB.prepare(`SELECT id, year, make, model, vin FROM vehicles${me.selftest ?" WHERE trim(trim) GLOB 'SELFTEST*'" : ''} ORDER BY make, model, year`).all()).results
           .map(c => ({ vehicle_id: c.id, car: `${c.year} ${c.make} ${c.model}`, no_vin: !c.vin, no_doorcard: !placard.has(c.id) })).filter(c => c.no_vin || c.no_doorcard);
         return json({ count: results.length, values: results, vin_proposals: vp, badges });
       }
@@ -1427,12 +1538,13 @@ const app = {
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=2 AND ${CAR_VALS}) nblock,
           (SELECT count(*) FROM vals x WHERE x.status<>'rejected' AND x.warn=1 AND ${CAR_VALS}) ncaution
           FROM vehicles v ORDER BY CASE v.grp WHEN 'mine' THEN 0 WHEN 'frequent' THEN 1 ELSE 2 END, v.make, v.model, v.year`).all()).results
+          .filter(v => !me.selftest || isSelftestTrim(v.trim))   // Rick/Cowork 2026-11-02: the tool token lists SELFTEST cars only (the sweep still finds its leftovers)
           .map(v => ({ ...v, no_vin: !!v.no_vin, no_doorcard: !placard.has(v.id), hidden: hidden(v, me.nowMs), mine: v.grp === 'mine' ? 1 : 0 }));
         const tcs = await tagCounts(env, all);   // HANDOFF 17: the values tagged with an engine that matches the car's engine
         all.forEach(v => { const t = tcs.get(v.id); v.nvals += t.nvals; v.nproposed += t.nproposed; v.nblock += t.nblock; v.ncaution += t.ncaution; });
         // HANDOFF 15: the owner's name is never sent to the processor (and so never to a model): the key is removed, not blanked.
         if (me.processor) all.forEach(v => forMe(v, me));
-        else {   // suggestion 11: the last visit of each car, one line on its Home card
+        else if (!me.selftest) {   // suggestion 11: the last visit of each car, one line on its Home card (not read for the tool token)
           const seenCar = new Set(), last = new Map();
           for (const e of await serviceEntries(env, '', [])) if (!seenCar.has(e.vehicle_id)) { seenCar.add(e.vehicle_id); last.set(e.vehicle_id, { date: e.date, mileage: e.mileage, items: e.items.map(i => i.name) }); }
           all.forEach(v => { v.last_service = last.get(v.id) || null; });
@@ -1442,6 +1554,7 @@ const app = {
       if (p === '/api/vehicles' && m === 'POST') {
         const b = await req.json(); const year = parseInt(b.year, 10);
         if (!b.make || !b.model || !yearOk(year)) return bad('Need year, make and model');
+        b.trim = String(b.trim ?? '').trim();   // Review G #7: the stored trim is the trimmed one (the tool gate checked the same text)
         b.make = await canonMake(env, b.make);   // ultrareview 2 #9
         const grp = GROUPS.includes(b.grp) ? b.grp : (b.mine === true ? 'mine' : 'visitor');
         // HANDOFF 17 (B2, B7): variant, engine, fe_id and fuel from the Add car lists; a VIN must pass the check digit unless Rick says not_us.
@@ -1488,7 +1601,7 @@ const app = {
           if (trim === (v.trim || '')) return json({ ok: true, trim, changed: false });
           // Opus pass F8, finding 7: the self-test token may decide parts only on a SELFTEST car, so it must not be able to turn a real car into one. It may set a
           // SELFTEST trim only on a car that is one now or was one before (its own trim log in notes says so).
-          if (me.tool && /^SELFTEST/.test(trim) && !/^SELFTEST/.test(v.trim || '') && !/trim "SELFTEST/.test(v.notes || '')) return bad('The self-test token may not turn a car into a SELFTEST car', 403);
+          if (me.tool && isSelftestTrim(trim) && !isSelftestTrim(v.trim) && !/trim "SELFTEST/.test(v.notes || '')) return bad('The self-test token may not turn a car into a SELFTEST car', 403);
           const line = `${me.now.slice(0, 10)} trim "${v.trim || ''}" -> "${trim}" (${me.device})`;
           await env.DB.prepare("UPDATE vehicles SET trim=?, notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || char(10) || ? END WHERE id=?").bind(trim, line, line, v.id).run();
           const research_job = await autoResearch(env, { ...v, trim }, me);
@@ -1528,16 +1641,16 @@ const app = {
         // HANDOFF 21 (F2): the car's parts go with it, each with a history row (parts_history has no foreign key and stays).
         // Opus pass F8, finding 4: an open parts job of this car is closed with the car (it would be paid for a car that is gone, and the id can be given to the next car)
         await env.DB.batch([env.DB.prepare("UPDATE jobs SET status='failed', lease_until=NULL, error='the car was deleted', updated_at=? WHERE kind='parts' AND target=? AND status IN ('queued','claimed')").bind(me.now, 'car:' + +mm[1]),
-          env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT p.id, ?, ' + partJsonSql('p.') + ', NULL, ?, ? FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND v.trim NOT LIKE \'SELFTEST%\'').bind('delete', me.now, me.device, +mm[1]),
+          env.DB.prepare('INSERT INTO parts_history(part_id, action, old_json, new_json, at, device) SELECT p.id, ?, ' + partJsonSql('p.') + ', NULL, ?, ? FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND COALESCE(trim(v.trim), \'\') NOT GLOB \'SELFTEST*\'').bind('delete', me.now, me.device, +mm[1]),
           // A self-test car leaves nothing behind: its parts history goes with it (like its service-log history).
-          env.DB.prepare("DELETE FROM parts_history WHERE part_id IN (SELECT p.id FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
+          env.DB.prepare("DELETE FROM parts_history WHERE part_id IN (SELECT p.id FROM parts p JOIN vehicles v ON v.id = p.vehicle_id WHERE p.vehicle_id=? AND trim(v.trim) GLOB 'SELFTEST*')").bind(+mm[1]),
           env.DB.prepare('DELETE FROM parts WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM specs WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM photo_reads WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM car_facts WHERE vehicle_id=?').bind(+mm[1]),   // HANDOFF 18: the cached recalls go with the car
-          env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim NOT LIKE 'SELFTEST%'").bind(me.now, me.device, +mm[1]),
+          env.DB.prepare("INSERT INTO service_log_history(entry_id, action, before_json, after_json, at, who) SELECT e.id, 'delete', '{\"deleted_with_car\":true}', NULL, ?, ? FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND COALESCE(trim(v.trim), '') NOT GLOB 'SELFTEST*'").bind(me.now, me.device, +mm[1]),
           // A self-test car (trim starts with SELFTEST) leaves nothing behind: its visits and their history rows go (Rick 2026-10-27).
-          env.DB.prepare("DELETE FROM service_log_history WHERE entry_id IN (SELECT e.id FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND v.trim LIKE 'SELFTEST%')").bind(+mm[1]),
+          env.DB.prepare("DELETE FROM service_log_history WHERE entry_id IN (SELECT e.id FROM service_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE e.vehicle_id=? AND trim(v.trim) GLOB 'SELFTEST*')").bind(+mm[1]),
           env.DB.prepare('DELETE FROM service_entry_items WHERE entry_id IN (SELECT id FROM service_entries WHERE vehicle_id=?)').bind(+mm[1]),
           env.DB.prepare('DELETE FROM service_entries WHERE vehicle_id=?').bind(+mm[1]),
           env.DB.prepare('DELETE FROM vehicles WHERE id=?').bind(+mm[1])]);
@@ -1637,7 +1750,10 @@ const app = {
         return changeValue(env, +mm[1], mm[2], st === 'confirmed' ? { status: st, confirmed_at: me.now, confirmed_by: me.device } : { status: st }, me);
       }
       mm = p.match(/^\/api\/values\/(\d+)\/history$/);
-      if (mm && m === 'GET') return json((await env.DB.prepare('SELECT * FROM history WHERE value_id=? ORDER BY id').bind(+mm[1]).all()).results);
+      if (mm && m === 'GET') {
+        const fl = await historyFloor(env, me, 'SELECT entered_at t FROM vals WHERE id=?', +mm[1]); if (fl.none) return json([]);
+        return json((await env.DB.prepare(`SELECT * FROM history WHERE value_id=?${fl.all ? '' : ' AND at >= ?'} ORDER BY id`).bind(...(fl.all ? [+mm[1]] : [+mm[1], fl.since])).all()).results);
+      }
       // HANDOFF 21 (F2): parts. None of these routes is on the processor list (the allowlist answers 403 first); each also refuses the processor itself.
       // The processor posts parts only through its job result (kind parts).
       mm = p.match(/^\/api\/vehicles\/(\d+)\/parts$/);
@@ -1650,7 +1766,6 @@ const app = {
       if (mm && m === 'POST') {   // Rick adds a part himself (addPart): never the processor; the self-test token only on a SELFTEST car, like confirm
         if (me.processor) return bad('The processor cannot add a part', 403);
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
-        if (me.tool && !/^SELFTEST/.test(v.trim || '')) return bad('The self-test token may add a part on a SELFTEST car only', 403);
         return addPart(env, v, await req.json().catch(() => ({})), me);
       }
       mm = p.match(/^\/api\/vehicles\/(\d+)\/parts-research$/);
@@ -1659,13 +1774,11 @@ const app = {
         const v = await vehicleRow(env, +mm[1]); if (!v) return bad('Car not found', 404);
         // Opus pass F8, finding 7: a parts search costs money; the self-test token may queue one only on a SELFTEST car (autoResearch leaves the tool token out for the same reason).
         // There is no exception and no flag in the body: Rick starts the searches of his cars himself, with Find parts (his own login).
-        if (me.tool && !/^SELFTEST/.test(v.trim || '')) return bad('The self-test token may start a parts search on a SELFTEST car only', 403);
         return queuePartsResearch(env, v, me);
       }
       mm = p.match(/^\/api\/parts\/(\d+)$/);
       if (mm && m === 'PATCH') {
         if (me.processor) return bad('The processor cannot change a part', 403);
-        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
         const b = await req.json().catch(() => ({})), set = {};
         for (const k of ['brand', 'part_no', 'also_fits', 'conflict_no', 'spec_text', 'source']) if (k in b) set[k] = String(b[k] ?? '').trim();
         for (const k of ['part_no', 'also_fits', 'conflict_no']) if (k in set) set[k] = set[k].toUpperCase().replace(/\s+/g, ' ');
@@ -1678,14 +1791,12 @@ const app = {
       }
       if (mm && m === 'DELETE') {
         if (me.processor) return bad('The processor cannot delete a part', 403);
-        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
         return changePart(env, +mm[1], 'delete', {}, me);
       }
       mm = p.match(/^\/api\/parts\/(\d+)\/(confirm|reject)$/);
       if (mm && m === 'POST') {
         // Only Rick confirms or rejects a part: a processor call can never do either.
         if (me.processor) return bad('The processor cannot confirm or reject parts', 403);
-        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
         return changePart(env, +mm[1], mm[2], {}, me);
       }
       // Rick 2026-11-01: "Use <other number> instead" swaps the two numbers of a proposed row that has a conflict (one history row; the row stays proposed and Low),
@@ -1693,7 +1804,6 @@ const app = {
       mm = p.match(/^\/api\/parts\/(\d+)\/use-other$/);
       if (mm && m === 'POST') {
         if (me.processor) return bad('The processor cannot change a part', 403);
-        const gate = await toolPartGate(env, +mm[1], me); if (gate) return gate;
         const cur = await env.DB.prepare('SELECT * FROM parts WHERE id=?').bind(+mm[1]).first(); if (!cur) return bad('Part not found', 404);
         if (cur.status !== 'proposed') return bad(`This part is ${cur.status}, not proposed`, 409);
         if (!cur.conflict_no) return bad('This part has no other number', 409);
@@ -1702,7 +1812,8 @@ const app = {
       mm = p.match(/^\/api\/parts\/(\d+)\/history$/);
       if (mm && m === 'GET') {
         if (me.processor) return bad('Parts are not for the processor', 403);
-        return json((await env.DB.prepare('SELECT * FROM parts_history WHERE part_id=? ORDER BY id').bind(+mm[1]).all()).results);
+        const fl = await historyFloor(env, me, 'SELECT created_at t FROM parts WHERE id=?', +mm[1]); if (fl.none) return json([]);
+        return json((await env.DB.prepare(`SELECT * FROM parts_history WHERE part_id=?${fl.all ? '' : ' AND at >= ?'} ORDER BY id`).bind(...(fl.all ? [+mm[1]] : [+mm[1], fl.since])).all()).results);
       }
       if (p === '/api/jobs' && m === 'POST') {
         const b = await req.json(); const v = await vehicleRow(env, parseInt(b.vehicle_id, 10));

@@ -355,6 +355,10 @@ body.offline .carscreen{--netH:36px}
 .pointspanel .badges{margin-left:auto}
 .v28{font:600 28px/1.25 var(--mono)}
 .chartline{gap:14px;flex:none}
+/* HANDOFF 22 (G2): no lift guide loaded at all: a quiet note, not an error box */
+.nolift{color:var(--muted,#8a8f98);font-weight:600}
+.emptylift{flex:0 1 auto;max-width:34rem}
+.emptylift .note{margin:6px 0 0}
 .grow{flex:1 1 auto}
 .t64{min-height:64px}
 .chartbox{background:#ece9e2;border-radius:10px;color:#333;padding:10px;display:flex;flex-direction:column;gap:6px;flex:1 1 auto;min-height:0}

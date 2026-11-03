@@ -12,6 +12,7 @@ both). A database with data is never reseeded: restore it from a backup (README)
 """
 import csv
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +131,8 @@ def load(priv):
     """The rows the input CSVs stand for, as dicts. Shared by this script and tools/import.py,
     so the seed and the import read the CSVs the same way.
     Returns (makes, guide, classics): makes {name: {aliases, nhtsa_name}}; guide and classics lists."""
+    if not os.path.isdir(priv):
+        sys.exit(f'Stop: the private folder {priv} does not exist. Make it (or fix the path) and put your CSV files in it, then run this again.')
     makes = {}
 
     def addmake(n, alias='', nh=''):
@@ -138,7 +141,13 @@ def load(priv):
 
     guide = []
     # One index file per ALI edition; a row's edition column (if any) wins over the file's default.
-    for fname, default_ed in ALI_INDEX_FILES:
+    files = list(ALI_INDEX_FILES)
+    # Any other ali-index-<edition>.csv adds that edition (docs/LOAD-YOUR-GUIDE.md, "Add a newer edition").
+    for fn in sorted(os.listdir(priv)):
+        m = re.fullmatch(r'ali-index-([A-Za-z0-9-]+)\.csv', fn)
+        if m and fn not in [f for f, _ in files]:
+            files.append((fn, m.group(1)))
+    for fname, default_ed in files:
         for r in read_csv(os.path.join(priv, fname)):
             mk = MAKEMAP.get(r['make'], r['make'])
             rows = [mk]
@@ -165,7 +174,7 @@ def load(priv):
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(sys.argv[1]):
+    if len(sys.argv) != 2:
         sys.exit('usage: python3 tools/make_seed.py PRIVATE_DIR')
     priv = sys.argv[1]
     makes, g, c = load(priv)

@@ -104,8 +104,25 @@ const hdr = as => {
 const getRetry = async (url, init) => { for (let i = 0; ; i++) { try { return await fetch(url, init); } catch (e) { if (i >= 2) throw e; await new Promise(z => setTimeout(z, 1500)); } } };
 // HANDOFF 17 (B0): D1's rows_written (meta, indexes included) for every request of the tool token; the Worker sends it in x-lp-rows-written.
 const ROWS = { n: 0, seen: 0 };
+// G review 1: the tool token may add car-scope proposed values only; model-wide values and deciding them are Rick's. The older value cases below make and
+// decide MODEL values, so in LOCAL mode (the phone login exists) they go through Rick's login (RICK_VALS true) until the G1 section (line "HANDOFF 22 G1")
+// turns it off: those cases test the tool token itself. In LIVE mode there is no Rick login, so the model-value cases are skipped (see MODEL_VAL_CASES).
+let RICK_VALS = LOCAL;
+// A case that renames a SELFTEST car to a "real" trim cannot restore it with the tool token (403): LOCAL only, or the live run would strand a car.
+const tl = (name, fn) => LOCAL ? t(name, fn) : skip(name, 'local only: the case renames the car away from SELFTEST and restores it with Rick\'s login');
+// The cases that need MODEL-wide values (shared by every car of a model) run LOCAL only: in LIVE mode the tool token adds car-scope values only (G review 1).
+const tmodel = (name, fn) => LOCAL ? t(name, fn) : skip(name, 'local only: it needs model-wide values, which only Rick\'s login can add');
+// LIVE mode: the older cases' value adds (scope model or none) are sent as car-scope on their SELFTEST car, until the G1 section turns this off.
+let CARSCOPE = !LOCAL;
+const RK = LOCAL ? { as: 'phone' } : {};   // a state read that must also work on a car that is no longer a SELFTEST car (LOCAL only; live has no such car)
+// G review 1a: the tool token cannot queue research (POST /api/jobs, POST .../parts-research, PATCH grp 'frequent' = a workup job): 403. Those cases are LOCAL only
+// (tr) and the three call shapes go through Rick's login there for the whole run (not RICK_VALS-dependent). as:'tool' means really the tool token.
+const tr = (name, fn) => LOCAL ? t(name, fn) : skip(name, 'local only: the tool token cannot queue research (review G 1a); Rick\'s login does');
+const queueOp = (p, o) => LOCAL && !o.as && (((o.method || 'GET') === 'POST' && (p === '/api/jobs' || /^\/api\/vehicles\/\d+\/parts-research$/.test(p))) || (o.method === 'PATCH' && /^\/api\/vehicles\/\d+$/.test(p) && o.body && o.body.grp === 'frequent'));
+const rickOp = (p, o) => !o.as && (queueOp(p, o) || (RICK_VALS && (/^\/api\/values\//.test(p) || /^\/api\/needs-confirming/.test(p) || ((o.method || 'GET') === 'POST' && /^\/api\/vehicles\/\d+\/values$/.test(p)) || ((o.method || 'GET') === 'GET' && /^\/api\/vehicles\/\d+(\?|$)/.test(p)))));   // G review 1c: the tool's car read shows car-scope values only, so while RICK_VALS is on the older cases read the car (model values included) with Rick's login
 const call = async (p, o = {}) => {
-  const h = hdr(o.as || 'tool'); if (o.now) h['x-lp-now'] = o.now;
+  const h = hdr(o.as || (rickOp(p, o) ? 'phone' : 'tool')); if (o.now) h['x-lp-now'] = o.now;
+  if (CARSCOPE && !o.as && o.method === 'POST' && o.body && /^\/api\/vehicles\/\d+\/values$/.test(p) && (o.body.scope === undefined || o.body.scope === 'model')) o = { ...o, body: { ...o.body, scope: 'car', status: undefined } };
   const init = { method: o.method || 'GET', headers: h, body: o.body ? JSON.stringify(o.body) : undefined };
   // A DELETE is retried too (2026-10-27, live run 3): it can run twice safely, and a lost delete left a temp car on live.
   // A PUT is retried too (live run 4): the only PUT is the chart box, which writes the same row again.
@@ -116,6 +133,12 @@ const call = async (p, o = {}) => {
 const plus = (ms) => new Date(Date.now() + ms).toISOString();
 const MIN = 60e3, DAY = 864e5;
 const hasProc = LOCAL || (process.env.LP_PROC_ID && process.env.LP_PROC_SECRET);
+// G review 1a (LOCAL only): the Worker stores no research result for a job made on a SELFTEST car, so a case that posts a result and expects it to land queues its job
+// while the car has a plain trim (the job keeps the request it was made with: the trim in it), then puts the trim back with Rick's login. The queue call itself goes through Rick's login (queueOp).
+const rq = async (id, p, body) => { const cp = `/api/vehicles/${id}`, trim = (await call(cp + '?peek=1')).d.trim;
+  ok((await call(cp, { method: 'PATCH', body: { trim: 'Plain Q' }, ...RK })).s === 200, 'rq: the trim change');
+  try { return await call(p, { method: 'POST', body }); } finally { await call(cp, { method: 'PATCH', body: { trim }, ...RK }).catch(() => null); } };
+const rjob = body => rq(body.vehicle_id, '/api/jobs', body);
 
 const PRIV = process.env.LP_PRIVATE_TESTS;
 if (PRIV && !existsSync(PRIV)) { console.error('LP_PRIVATE_TESTS file not found: ' + PRIV); process.exit(2); }
@@ -196,7 +219,7 @@ await t('make "ame" -> AMC (alias)', async () => { const { d } = await call('/ap
 await t('make "citroen" -> Citroën', async () => { const { d } = await call('/api/makes?q=citroen'); ok(d.some(m => m.name === 'Citroën'), JSON.stringify(d)); });
 await t('make "ram" -> Ram first', async () => { const { d } = await call('/api/makes?q=ram'); ok(d[0]?.name === 'Ram', JSON.stringify(d)); });
 await t('empty query lists my makes first', async () => {
-  const mine = new Set((await call('/api/vehicles')).d.filter(c => c.mine).map(c => c.make)); const k = Math.min(mine.size, 3); if (!k) return 'no cars marked mine - nothing to order';
+  const mine = new Set((await call('/api/vehicles', { as: 'phone' })).d.filter(c => c.mine).map(c => c.make)); const k = Math.min(mine.size, 3); if (!k) return 'no cars marked mine - nothing to order';
   const { d } = await call('/api/makes?q='); ok(d.slice(0, k).every(m => m.mine), JSON.stringify(d.slice(0, k + 1))); return `first ${k} are mine`;
 });
 const CL = 'no classics rows in this database';
@@ -234,6 +257,19 @@ await t('app page has the Apps button in the header', async () => {
 const pages = (await call('/api/ali/pages')).d || [];
 const okPages = Array.isArray(pages) ? pages.filter(x => x.status === 'ok') : [];
 const pageUrl = x => `/api/ali/${x.edition}/p${String(x.pdf_page).padStart(3, '0')}.jpg`;
+// Rick's decision (2026-11-02): chart pages are graded on a SELFTEST car of a REAL model, never on Rick's cars. A 2021 Jeep Grand Cherokee gets its chart
+// from the index. The tool token can read only SELFTEST cars, so this works the same live and local. `chartCar` is the car's view (null: no guide / no chart).
+let chartCar = null, chartCarId = null;
+if (okPages.length) {
+  // The first model whose chart the index has: the real guide has the Grand Cherokee; the public seed's made-up guide has a Honda Civic (sample page).
+  for (const [year, make, model] of [[2021, 'Jeep', 'Grand Cherokee'], [2018, 'Honda', 'Civic']]) {
+    const r = await postCar({ year, make, model, trim: 'SELFTEST CHART PAGE', grp: 'visitor' });
+    if (!(r.s === 201 && r.d && r.d.id)) continue;
+    cleanup.push(['xcar', r.d.id]); const v = (await call(`/api/vehicles/${r.d.id}?peek=1`)).d;
+    if (v && v.ali && v.ali.d === 0) { chartCar = v; chartCarId = r.d.id; break; }
+    await call('/api/vehicles/' + r.d.id, { method: 'DELETE' });
+  }
+}
 if (okPages.length) {
   await t('every listed page image is in R2 with the listed size (HEAD)', async () => {
     const bad2 = [];
@@ -251,10 +287,8 @@ if (okPages.length) {
     ok(b.length === x.bytes && b[0] === 0xFF && b[1] === 0xD8, `length ${b.length}, starts ${b[0]} ${b[1]}`);
   });
   await t('a car with a chart page gets its image address, newest edition first', async () => {
-    const cars = (await call('/api/vehicles')).d; let n = 0;
-    for (const c of cars) {
-      if (/^SELFTEST/.test(c.trim || '')) continue;   // a temp car of another check (its model may be written in other case on purpose)
-      const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (!v.ali || v.ali.d !== 0) continue;
+    ok(chartCar, 'the SELFTEST 2021 Jeep Grand Cherokee has no chart from the index'); let n = 0;
+    for (const v of [chartCar]) {
       const pg = okPages.find(x => x.edition === v.ali.edition && x.pdf_page === v.ali.pdf_page);
       ok(v.ali.img === (pg ? pageUrl(pg) : null), `${v.make} ${v.model}: img ${v.ali.img}, page ${JSON.stringify(pg)}`);
       const ch = ((await call(`/api/models?make=${encodeURIComponent(v.make)}&year=${v.year}&nhtsa=0`)).d.find(m => m.label === v.model) || {}).charts || [];
@@ -267,9 +301,8 @@ if (okPages.length) {
   // lookup ignores case. Two temp visitor cars (UPPER and lower case model) must get the same chart as a
   // car that has one. Each temp car is deleted again, also when a check fails.
   await t('chart lookup ignores case: the model in UPPER or lower case gets the same chart', async () => {
-    let src = null;
-    for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && v.ali.d === 0) { src = v; break; } }
-    ok(src, 'no car with a chart to copy');
+    const src = chartCar;
+    ok(src, 'no SELFTEST car with a chart to copy');
     let id = null; const bad2 = [];
     try {
       for (const model of [src.model.toUpperCase(), src.model.toLowerCase()]) {
@@ -285,8 +318,7 @@ if (okPages.length) {
   });
   // Chart boxes (decision 6). A box Rick drew is never changed: the write checks run only on a
   // chart with no box, and remove their box again.
-  let boxCar = null;
-  for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && v.ali.img) { boxCar = v; break; } }
+  const boxCar = chartCar && chartCar.ali.img ? chartCar : null;
   if (boxCar && !boxCar.ali.box) {
     const A = boxCar.ali, key = { edition: A.edition, chart: A.chart, pdf_page: A.pdf_page };
     await t('chart box: drawn once, shown on the car, cleared again', async () => {
@@ -304,13 +336,27 @@ if (okPages.length) {
     const out = (await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.8, y: 0.1, w: 0.4, h: 0.3 } })).s;
     const none = (await call('/api/ali/boxes', { method: 'PUT', body: { ...key, chart: 'NO-SUCH', x: 0.1, y: 0.1, w: 0.2, h: 0.2 } })).s;
     const proc = hasProc ? (await call('/api/ali/boxes', { as: 'proc', method: 'PUT', body: { ...key, x: 0.1, y: 0.1, w: 0.2, h: 0.2 } })).s : 403;
-    ok(out === 400 && none === 404 && proc === 403, `outside the page ${out}, unknown chart ${none}, processor ${proc}`);
+    // G1b: on a chart that has a box Rick drew, the self-test token is refused first (403, the box stays); the 400 for a box outside the page shows on a chart with no box.
+    const rickBox = !!(boxCar && boxCar.ali.box);
+    const boxAfter = rickBox ? JSON.stringify((await call(`/api/vehicles/${boxCar.id}?peek=1`)).d.ali.box) : null;
+    ok((out === (rickBox ? 403 : 400)) && none === 404 && proc === 403 && (!rickBox || boxAfter === JSON.stringify(boxCar.ali.box)), `outside the page ${out}${rickBox ? ' (a box of Rick: 403 expected, box kept)' : ''}, unknown chart ${none}, processor ${proc}`);
   });
 } else ['every listed page image is in R2 with the listed size (HEAD)', 'a page image is a JPEG with a private cache header and the listed size', 'a car with a chart page gets its image address, newest edition first',
   'chart lookup ignores case: the model in UPPER or lower case gets the same chart', 'chart box: drawn once, shown on the car, cleared again', 'a bad chart box is refused; the processor cannot draw one'].forEach(n => skip(n, 'no page images in ali_pages'));
+// HANDOFF 22 (G2): the app needs to tell "no guide loaded at all" (a fresh install: say so, point to the doc) from "this car has no chart" (a guide is loaded). The Worker says it on every car.
+await t('G2: every car says whether a lift guide is loaded (ali_loaded = the guide has index rows); with no guide the car has no chart', async () => {
+  const list = (await call('/api/vehicles', { as: 'phone' })).d; ok(Array.isArray(list) && list.length >= 1, 'no cars');
+  const loaded = health.a > 0;
+  for (const c of list.slice(0, 3)) {
+    const v = (await call(`/api/vehicles/${c.id}?peek=1`, { as: 'phone' })).d;
+    ok(v.ali_loaded === loaded, `car ${c.id}: ali_loaded ${JSON.stringify(v.ali_loaded)}, guide rows ${health.a}`);
+    if (!loaded) ok(v.ali === null && v.chart_notes === null, `car ${c.id}: chart without a guide`);
+  }
+  return loaded ? `guide loaded (${health.a} index rows)` : 'no guide loaded';
+});
 await t('a bad page address is refused, a missing page is 404', async () => {
   const a = await fetch(BASE + '/api/ali/2019/p1.jpg', { headers: hdr('tool') }); const b = await fetch(BASE + '/api/ali/2019/p999.jpg', { headers: hdr('tool') });
-  ok(a.status === 400 && b.status === 404, `p1.jpg ${a.status}, p999.jpg ${b.status}`);
+  ok((a.status === 400 || a.status === 403) && b.status === 404, `p1.jpg ${a.status}, p999.jpg ${b.status}`);
 });
 // ---------- Oil tab (Handoff 3 step 3, decision 7) ----------
 await t('the Oil tab has Oil type, Quantity (qt) and Filter', async () => {
@@ -361,7 +407,8 @@ await t('lookup links: the built K&N and RockAuto addresses for the 5 sample car
   ok(!bad2.length, bad2.join('; '));
   return '5 cars, 10 K&N/RockAuto addresses, Ford manual 2013+ only, 7 addresses from Rick\'s check, patterns first';
 });
-if (priv) await priv.default({ t, call, ok });
+// The private checks read Rick's own cars: the tool token cannot (G1), so LOCAL mode hands them Rick's login. LIVE mode cannot run them on real cars.
+if (priv) await priv.default({ t, call: LOCAL ? (p, o = {}) => call(p, { as: 'phone', ...o }) : call, ok });
 
 // ---------- identity (decision 6, 7) ----------
 await t('whoami: self-test token is a tool, not the processor', async () => { const { d } = await call('/api/whoami'); ok(d.tool === true && d.processor === false, JSON.stringify(d)); });
@@ -376,8 +423,7 @@ if (LOCAL) {
 // A car with a chart carries chart_notes: null (no row for the chart) or the five fields. The processor never gets it.
 // A database before migration 0007 has no chart_notes key to check: skipped.
 {
-  let noteCar = null;
-  for (const c of (await call('/api/vehicles')).d) { const v = (await call(`/api/vehicles/${c.id}?peek=1`)).d; if (v.ali && 'chart_notes' in v) { noteCar = v; break; } }
+  const noteCar = chartCar && 'chart_notes' in chartCar ? chartCar : null;   // the SELFTEST Grand Cherokee (see chartCar above)
   if (noteCar) {
     await t('adapter notes: the car record has chart_notes with its five fields, verified is no, ai or rick', async () => {
       const n = noteCar.chart_notes; if (n === null) return 'no notes row for this chart (null)';
@@ -399,7 +445,7 @@ await t('add a visitor car (temp)', async () => {
 await t('a new value is proposed, with one insert history row', async () => {
   const r = await call(`/api/vehicles/${car}/values`, { method: 'POST', body: { tab: 'torque', field: 'Torque', value: '75 ft-lb', ftlb_lo: 75, confidence: 'Low', source: 'selftest' } });
   ok(r.s === 201, 'add ' + r.s + ' ' + JSON.stringify(r.d)); const v = r.d.values.find(x => x.source === 'selftest' && x.field === 'Torque');
-  ok(v && v.status === 'proposed' && v.scope === 'model' && v.year_from === 1973 && v.entered_by === 'selftest', JSON.stringify(v)); valId = v.id; cleanup.push(['val', valId]);
+  ok(v && v.status === 'proposed' && v.scope === (LOCAL ? 'model' : 'car') && (!LOCAL || v.year_from === 1973) && v.entered_by === 'selftest', JSON.stringify(v)); valId = v.id; cleanup.push(['val', valId]);
   const h = (await call(`/api/values/${valId}/history`)).d; ok(h.length === 1 && h[0].action === 'insert' && h[0].new_status === 'proposed' && h[0].device === 'selftest', JSON.stringify(h));
 });
 await t('the processor cannot confirm a value', async () => { if (!hasProc) return 'no processor token'; const { s } = await call(`/api/values/${valId}/confirm`, { as: 'proc', method: 'POST', body: {} }); ok(s === 403, 'status ' + s); });
@@ -582,15 +628,16 @@ if (health.defaults > 0 && health.ranges > 0) {
     const hi = r.d.values.find(x => x.value === '500 ft-lb'); cleanup.push(['val', hi.id]);
     const mid = r.d.values.find(x => x.id === valId);
     ok(hi.range_flag === 'outside' && mid && mid.range_flag === 'inside', `500: ${hi.range_flag}, ${mid && mid.value}: ${mid && mid.range_flag}`);
-    const n = (await call('/api/needs-confirming')).d.values.find(x => x.id === hi.id); ok(n && n.range_flag === 'outside', JSON.stringify(n));
+    // Needs confirming flags the range on model-wide values only; the tool's car-scope value (LIVE) is flagged on the car (above), not in that list.
+    if (LOCAL) { const n = (await call('/api/needs-confirming')).d.values.find(x => x.id === hi.id); ok(n && n.range_flag === 'outside', JSON.stringify(n)); }
   });
 } else ['the car gets the typical value for its make and the range for that thread', 'a torque outside the thread range is flagged, one inside is not (car and needs-confirming)'].forEach(n => skip(n, 'no make_defaults or thread_ranges rows'));
 await t('needs-confirming counts proposed values', async () => { const { d } = await call('/api/needs-confirming'); ok(typeof d.count === 'number' && d.values.every(x => x.status === 'proposed'), JSON.stringify(d).slice(0, 200)); return `${d.count} proposed`; });
 
 // ---------- research queue (decision 6) ----------
 let job, job2;
-await t('queue a research job: request holds only make, model, year, trim, fields', async () => {
-  const r = await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'tires', field: 'Size' }] } }); ok(r.s === 201, 'queue ' + r.s); job = r.d.id;
+await tr('queue a research job: request holds only make, model, year, trim, fields', async () => {
+  const r = await rjob({ vehicle_id: car, kind: 'research', fields: [{ tab: 'tires', field: 'Size' }] }); ok(r.s === 201, 'queue ' + r.s); job = r.d.id;
 });
 await t('processor route refused without the processor token', async () => {
   ok((await call('/api/jobs/claim', { method: 'POST', body: { only_id: job } })).s === 403, 'self-test token was allowed to claim');
@@ -600,7 +647,7 @@ await t('processor route refused without the processor token', async () => {
   }
   return 'self-test token: 403';
 });
-if (hasProc) {
+if (hasProc && LOCAL) {   // G review 1a: LOCAL only (the tool token cannot queue the job)
   let lease;
   await t('claim: 10-minute lease, request is private', async () => {
     const { s, d } = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: job } }); ok(s === 200 && d.id === job, JSON.stringify(d));
@@ -646,7 +693,7 @@ if (hasProc) {
   });
   // HANDOFF 13 (Rick): the server refuses High on a safety field from the processor unless the source cites a page ("p.").
   await t('result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise', async () => {
-    const job3 = (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } })).d.id;
+    const job3 = (await rjob({ vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] })).d.id;
     ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: job3 } })).d.id === job3, 'claim');
     const mk = (conf, source) => ({ values: [{ tab: 'torque', field: 'Torque', value: '75 ft-lb (102 Nm)', ftlb_lo: 75, ftlb_src: 'printed', confidence: conf, source }] });
     const bad1 = await call(`/api/jobs/${job3}/result`, { as: 'proc', method: 'POST', body: mk('High', 'selftest research, no page') });
@@ -656,7 +703,7 @@ if (hasProc) {
     ok(web.s === 400, 'High with a URL that only looks like a page: ' + web.s);
     const low = await call(`/api/jobs/${job3}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Socket', value: '19 mm (selftest)', confidence: 'High', source: 'selftest research, no page' }] } });
     ok(low.s === 200, 'High on a field that is not a safety field: ' + low.s + ' ' + JSON.stringify(low.d));
-    const j4 = (await call('/api/jobs', { method: 'POST', body: { vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } })).d.id;
+    const j4 = (await rjob({ vehicle_id: car, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] })).d.id;
     ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j4 } })).d.id === j4, 'claim 4');
     const good = await call(`/api/jobs/${j4}/result`, { as: 'proc', method: 'POST', body: mk('High', 'Owner manual p.7-16 (selftest)') });
     // HANDOFF 15: the result is accepted (200). It is posted, or skipped when the model year already has a confirmed Torque value (the test car's own).
@@ -667,8 +714,7 @@ if (hasProc) {
 } else ['claim: 10-minute lease, request is private', 'a claimed job is not handed out again while its lease runs', 'lease expiry: after 10 minutes (test clock) the job is claimed again',
   'lease renew (HANDOFF 13): extends a valid lease, refused after expiry, refused for the self-test tool',
   'result: values come back proposed, with history, job done', 'a result for a job that is not claimed is refused', 'fail: a claimed job can be marked failed',
-  'result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise'].forEach(n => skip(n, 'no processor token given'));
-
+  'result: High on a safety field needs a source with a page (p.); the whole result is refused otherwise'].forEach(n => skip(n, hasProc ? 'local only: the tool token cannot queue research (review G 1a); Rick\'s login does' : 'no processor token given'));
 // ---------- groups and visitor hiding (decisions 4, 5) ----------
 await t('opening a car sets last_seen; a visitor hides after 30 days (test clock)', async () => {
   const t0 = new Date().toISOString();
@@ -679,14 +725,18 @@ await t('opening a car sets last_seen; a visitor hides after 30 days (test clock
 });
 // Only with a processor token: without one the job cannot be closed, stays open, and the next run gets no new job (review copy, 2026-10-27).
 if (!hasProc) skip('Frequent queues a workup job for the missing fields', 'no processor token: the job could not be closed again');
-else await t('Frequent queues a workup job for the missing fields', async () => {
+else await tr('Frequent queues a workup job for the missing fields', async () => {
+  // an open research or workup job of the same model (left by an earlier case) blocks a new workup job: close those first (processor token; the failed test jobs are removed by the sweep)
+  for (const j of ((await call(`/api/vehicles/${car}?peek=1`)).d.jobs || []).filter(x => ['research', 'workup'].includes(x.kind) && ['queued', 'claimed'].includes(x.status))) {
+    await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j.id } }); await call(`/api/jobs/${j.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } });
+  }
   const r = await call(`/api/vehicles/${car}`, { method: 'PATCH', body: { grp: 'frequent' } }); ok(r.s === 200 && r.d.workup_job, JSON.stringify(r.d));
   const w = (await call(`/api/vehicles/${car}?peek=1`)).d; ok(w.grp === 'frequent' && w.jobs.some(j => j.id === r.d.workup_job && j.kind === 'workup'), JSON.stringify(w.jobs));
   if (hasProc) { ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: r.d.workup_job } })).d.id === r.d.workup_job, 'claim workup');
     ok((await call(`/api/jobs/${r.d.workup_job}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } })).s === 200, 'close workup'); }
 });
 if (!hasProc) skip('a frequent car is never hidden', 'no processor token: the car is not made Frequent (see above)');
-else await t('a frequent car is never hidden', async () => { const c = (await call('/api/vehicles', { now: plus(400 * DAY) })).d.find(x => x.id === car); ok(c && !c.hidden, 'hidden'); });
+else await tr('a frequent car is never hidden', async () => { const c = (await call('/api/vehicles', { now: plus(400 * DAY) })).d.find(x => x.id === car); ok(c && !c.hidden, 'hidden'); });
 
 // ---------- HANDOFF 15: ft-lb numbers, door card wins, owner, fuel, service log ----------
 // One temp car (1973 AMC Hornet Svc), removed at the end with its own values and visits. Model-scope test values are removed by id.
@@ -735,16 +785,17 @@ if (health.schema >= '0009') {
       const mp = await mkVal({ tab: 'tires', field: 'Pressure', value: '30 psi (model)', confidence: 'Low', source: 'manual', scope: 'model' }); const mpv = mp.d && mp.d.values.find(x => x.value === '30 psi (model)'); if (mpv) mv.push(mpv.id);
       const cp = await mkVal({ tab: 'tires', field: 'Pressure', value: '35 psi (door)', confidence: 'High', source: 'Door placard photo', scope: 'car', status: 'confirmed' });
       const dv = (await call(`/api/vehicles/${tc}?peek=1`)).d.values.filter(x => x.tab === 'tires');
-      chk(dv.find(x => x.value === '30 psi (model)')?.hidden_by_placard === true && dv.find(x => x.value === '35 psi (door)')?.hidden_by_placard === false, 'door card wins flags: ' + JSON.stringify(dv.map(x => [x.value, x.hidden_by_placard])));
+      // LIVE: the tool token has no model-wide value to hide (car-scope only), so the model checks here and below are LOCAL only.
+      chk(!LOCAL || (dv.find(x => x.value === '30 psi (model)')?.hidden_by_placard === true && dv.find(x => x.value === '35 psi (door)')?.hidden_by_placard === false), 'door card wins flags: ' + JSON.stringify(dv.map(x => [x.value, x.hidden_by_placard])));
       // Ultrareview F9: a model value of another tire field (Size) is not hidden by the door-card Pressure.
       const ms = await mkVal({ tab: 'tires', field: 'Size', value: 'E78-14 (model)', confidence: 'Low', source: 'manual', scope: 'model' }); const msv = ms.d && ms.d.values && ms.d.values.find(x => x.value === 'E78-14 (model)'); if (msv) mv.push(msv.id);
       urChk('f9', msv && msv.hidden_by_placard === false, 'model Size hidden by the door-card Pressure: ' + (msv && msv.hidden_by_placard));
-      urChk('f9', dv.find(x => x.value === '30 psi (model)')?.hidden_by_placard === true, 'model Pressure not hidden');
+      urChk('f9', !LOCAL || dv.find(x => x.value === '30 psi (model)')?.hidden_by_placard === true, 'model Pressure not hidden');
       // Ultrareview 2 #3: a Size confirmed through the door-jamb screen (its source text) now hides the model Size.
       await mkVal({ tab: 'tires', field: 'Size', value: 'E78-14 (door)', confidence: 'High', source: 'Door-jamb label photo, 2026-10-27', scope: 'car', status: 'confirmed' });
       const ms2 = ((await call(`/api/vehicles/${tc}?peek=1`)).d.values || []).find(x => x.value === 'E78-14 (model)');
-      urChk('ur2-3', ms2 && ms2.hidden_by_placard === true, 'model Size not hidden by a "Door-jamb label photo" value: ' + (ms2 && ms2.hidden_by_placard));
-      if (hasProc) {
+      urChk('ur2-3', !LOCAL || (ms2 && ms2.hidden_by_placard === true), 'model Size not hidden by a "Door-jamb label photo" value: ' + (ms2 && ms2.hidden_by_placard));
+      if (hasProc && LOCAL) {   // G review 1a: LOCAL only (the tool token cannot queue research; Rick's login does)
         const jb = await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research' } });
         // Ultrareview F9 (changed check): only the door-card field (Pressure) is not asked; every other tire field with no value is asked.
         const tireNames = (await call('/api/tabs')).d.fields.filter(f => f.tab === 'tires').map(f => f.name), haveT = new Set((await call(`/api/vehicles/${tc}?peek=1`)).d.values.filter(x => x.tab === 'tires').map(x => x.field));
@@ -755,14 +806,14 @@ if (health.schema >= '0009') {
         else chk(false, 'research job ' + jb.s);
         // a result for a field that already has a confirmed model value is skipped
         const sv = await mkVal({ tab: 'torque', field: 'Socket', value: '19 mm', confidence: 'High', source: 'selftest', scope: 'model', status: 'confirmed' }); const svv = sv.d && sv.d.values.find(x => x.field === 'Socket'); if (svv) mv.push(svv.id);
-        const j2 = await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Socket' }] } });
+        const j2 = await rjob({ vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Socket' }] });
         await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j2.d.id } });
         const rs = await call(`/api/jobs/${j2.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Socket', value: '21 mm', confidence: 'Low', source: 'selftest research' }] } });
         chk(rs.s === 200 && rs.d.proposed === 0 && rs.d.skipped === 1, 'confirmed field skipped: ' + rs.s + ' ' + JSON.stringify(rs.d));
         // Ultrareview F3 (changed check; before: a torque result without ftlb_lo was refused with 400). Rick 2026-10-27: the server reads
         // the numbers from the text and marks them converted, so an old research worker or a hand-run queue.sh result still works.
         // A text with no number is still refused.
-        const j3 = await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } });
+        const j3 = await rjob({ vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] });
         await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j3.d.id } });
         const r0 = await call(`/api/jobs/${j3.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Torque', value: 'tight', confidence: 'Low', source: 'selftest research' }] } });
         urChk('f3', r0.s === 400, 'torque text with no number: ' + r0.s);
@@ -771,7 +822,7 @@ if (health.schema >= '0009') {
         if (rt.s !== 200) await call(`/api/jobs/${j3.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } });
         const rv = ((await call(`/api/vehicles/${tc}?peek=1`)).d.values || []).find(x => x.field === 'Torque' && x.source === 'selftest research'); if (rv) mv.push(rv.id);
         urChk('f3', rv && rv.ftlb_lo === 75 && rv.ftlb_hi === 80 && rv.ftlb_src === 'converted' && rv.status === 'proposed', 'numbers from the text: ' + JSON.stringify(rv && [rv.ftlb_lo, rv.ftlb_hi, rv.ftlb_src, rv.status]));
-        const j3b = await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] } });
+        const j3b = await rjob({ vehicle_id: tc, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] });
         await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: j3b.d.id } });
         const rn = await call(`/api/jobs/${j3b.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Torque', value: '140 N·m', confidence: 'Low', source: 'selftest research nm' }] } });
         if (rn.s !== 200) await call(`/api/jobs/${j3b.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } });
@@ -814,7 +865,7 @@ if (health.schema >= '0009') {
       const gasItems = (await call('/api/service-items?car=' + tc)).d.map(i => i.name); chk(gasItems.includes('Oil change') && gasItems.includes('Other'), 'gas items: ' + gasItems);
       chk((await call(`/api/vehicles/${tc}`, { method: 'PATCH', body: { fuel: 'ev' } })).s === 200, 'fuel ev');
       const evItems = (await call('/api/service-items?car=' + tc)).d.map(i => i.name); chk(!evItems.includes('Oil change') && !evItems.includes('Engine air filter') && evItems.includes('Tire rotation'), 'ev items: ' + evItems);
-      const evJob = await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research' } });
+      const evJob = LOCAL ? await call('/api/jobs', { method: 'POST', body: { vehicle_id: tc, kind: 'research' } }) : { s: 0 };   // G review 1a: LOCAL only
       if (evJob.s === 201 && hasProc) { const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: evJob.d.id } }); chk(!cl.d.request.fields.some(f => f.tab === 'oil'), 'oil asked for an EV'); await call(`/api/jobs/${evJob.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } }); }
       const ev = await call(`/api/vehicles/${tc}/service`, { method: 'POST', body: { date: new Date().toISOString().slice(0, 10), mileage: 1000, items: [{ item_id: 1 }] } }); chk(ev.s === 400, 'oil change on an EV: ' + ev.s);
       chk((await call(`/api/vehicles/${tc}`, { method: 'PATCH', body: { fuel: 'gas' } })).s === 200, 'fuel gas again');
@@ -840,7 +891,8 @@ if (health.schema >= '0009') {
       chk(hist.entries.length === 4 && hist.entries.map(e => e.date).join() === '2026-06-01,2025-12-02,2025-12-01,2025-06-01', 'order: ' + hist.entries.map(e => e.date));
       chk(hist.last_done[byName('Oil change')]?.date === '2025-12-01' && hist.last_mileage === 50000, 'last_done / last_mileage: ' + JSON.stringify([hist.last_done, hist.last_mileage]));
       // the owner filter of the all-cars list worked on no join before (an SQL error, 500); it answers 200 with a list
-      const byOwner = await call('/api/service?owner=Nobody'); chk(byOwner.s === 200 && Array.isArray(byOwner.d) && byOwner.d.length === 0, 'owner filter: ' + byOwner.s);
+      // G1: the all-cars service list shows every car, so the tool token is refused (403); Rick's login (LOCAL) runs the check.
+      const byOwner = LOCAL ? await call('/api/service?owner=Nobody', RK) : { s: 200, d: [] }; chk(byOwner.s === 200 && Array.isArray(byOwner.d) && byOwner.d.length === 0, 'owner filter: ' + byOwner.s);
       // edit, soft delete, history rows
       // The edit goes through the same mileage-order check: 41000 on 2025-06-01 is above the later visit at 30000, so it asks first (409), then force.
       const ed0 = await call('/api/service/' + v1.d.id, { method: 'PATCH', body: { mileage: 41000 } }); chk(ed0.s === 409 && ed0.d.confirm_needed === true, 'edit mileage-order check ' + ed0.s);
@@ -926,6 +978,7 @@ if (health.schema >= '0009') {
     'ur2-8': 'ultrareview 2 #8: the value history keeps old and new warning level and source' };
   for (const [k, name] of Object.entries(UR_NAMES)) {
     if (!hasProc && ['f6', 'f7', 'allow', 'f3'].includes(k)) { skip(name, 'no processor token'); continue; }
+    if (!LOCAL && k === 'f3') { skip(name, 'local only: the tool token cannot queue research (review G 1a); Rick\'s login does'); continue; }
     await t(name, async () => { const u = UR[k]; ok(u && u.n > 0, 'NOT CHECKED: 0 checks ran'); ok(!u.bad.length, u.bad.join('; ')); return `${u.n} checks`; });
   }
 } else skip('HANDOFF 15: ft-lb numbers, door card wins, owner, fuel, service log', 'schema before 0009');
@@ -937,7 +990,7 @@ if (health.schema >= '0009') {
 if (health.schema >= '0012') {
   const GOOD = '1FTFW1CT5DFC10312', BADV = GOOD.slice(0, 16) + '8', made = [], vals17 = [];
   const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
-  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`, RK)).d;
   const addVal = async (id, body) => { const r = await call(`/api/vehicles/${id}/values`, { method: 'POST', body: { confidence: 'Low', source: 'selftest', ...body } }); return r; };
   const track = r => { (r.d && r.d.values || []).filter(x => x.source === 'selftest' && x.scope === 'model').forEach(x => { if (!vals17.includes(x.id)) vals17.push(x.id); }); return r; };
   // A value added for ANOTHER engine than the car's own is not in the answer of the add call, so track() cannot see it and it used to stay in the
@@ -983,10 +1036,10 @@ if (health.schema >= '0012') {
       const er = await call('/api/fe?year=2021&make=Failmake&model=X'); if (er.s !== 200 || er.d.variants.length || !er.d.error) b.push('fetch error with no saved row: ' + JSON.stringify(er.d));
       const n1 = FE_HITS.n; const cl = await call('/api/fe?year=1973&make=AMC&model=Hornet'); if (cl.s !== 200 || !cl.d.classic || FE_HITS.n !== n1) b.push('classic: ' + JSON.stringify(cl.d));
       if ((await call('/api/fe?year=2021&model=X')).s !== 400) b.push('missing make is not 400');
-      const tr = await call('/api/trims?year=1973&make=AMC&model=Hornet%20B'); if (tr.s !== 200 || !Array.isArray(tr.d.trims) || tr.d.trims.some(x => /^SELFTEST/.test(x.name))) b.push('trims: ' + JSON.stringify(tr.d));
+      const tr = await call('/api/trims?year=1973&make=AMC&model=Hornet%20B', { as: 'phone' }); if (tr.s !== 200 || !Array.isArray(tr.d.trims) || tr.d.trims.some(x => /^SELFTEST/.test(x.name))) b.push('trims: ' + JSON.stringify(tr.d));
       ok(!b.length, b.join('; ')); return `${h1} requests, then 0 more from the cache`;
     }); else skip('HANDOFF 17 B1: fueleconomy lists through the Worker', 'local mode only (the fake fueleconomy.gov)');
-    await t('HANDOFF 17 B2/B4/B5: variant, engine, fe_id and fuel on a car; a value with an engine shows only on that engine; research carries the engine', async () => {
+    await tmodel('HANDOFF 17 B2/B4/B5: variant, engine, fe_id and fuel on a car; a value with an engine shows only on that engine; research carries the engine', async () => {
       const b = [], E1 = 'Auto 8-spd, 8 cyl, 5.7 L', E2 = 'Auto 8-spd, 6 cyl, 3.6 L';
       const c = await mkCar({ engine: E1, variant: 'Grand Cherokee 4WD', fe_id: 43168, fuel: 'gas' }); const id = c.d && c.d.id;
       const cv = await carOf(id); if (c.s !== 201 || cv.engine !== E1 || cv.variant !== 'Grand Cherokee 4WD' || cv.fe_id !== 43168 || cv.fuel !== 'gas') b.push('fields not stored: ' + JSON.stringify([cv.engine, cv.variant, cv.fe_id, cv.fuel]));
@@ -1002,7 +1055,7 @@ if (health.schema >= '0012') {
       await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { engine: E2, fe_id: 43167 } }); s = await oil(id); if (s.join() !== 'oil for the V6,generic oil') b.push('car with the V6: ' + s);
       const hl = ((await call('/api/vehicles')).d || []).find(x => x.id === id); if (!hl || hl.nvals < 2) b.push('Home counts: ' + JSON.stringify(hl && hl.nvals));
       if (hasProc) {
-        const jb = await call('/api/jobs', { method: 'POST', body: { vehicle_id: id, kind: 'research', fields: [{ tab: 'oil', field: 'Quantity' }] } });
+        const jb = await rjob({ vehicle_id: id, kind: 'research', fields: [{ tab: 'oil', field: 'Quantity' }] });
         const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jb.d && jb.d.id, kinds: ['research', 'workup'] } });
         if (!cl.d || cl.d.request.engine !== E2) b.push('the research request has no engine: ' + JSON.stringify(cl.d && cl.d.request));
         const rs = cl.d && cl.d.id ? await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [
@@ -1021,7 +1074,7 @@ if (health.schema >= '0012') {
       }
       ok(!b.length, b.join('; ')); return 'engine filter, order, request and result';
     });
-    await t('HANDOFF 17 (Rick 2026-10-27): engines match by a normalized key (displacement, cylinders, turbo, electric), not by text', async () => {
+    await tmodel('HANDOFF 17 (Rick 2026-10-27): engines match by a normalized key (displacement, cylinders, turbo, electric), not by text', async () => {
       const b = [], LIST20 = 'Auto (variable gear ratios), 4 cyl, 2.0 L';
       const id = (await mkCar({ engine: LIST20 })).d.id;
       for (const [value, engine] of [['tag 2.0 L', '2.0 L'], ['tag 2.0L spelling', '2.0L'], ['tag list text', LIST20], ['tag 1.5 L turbo', '1.5 L turbo'], ['tag 2.0 L turbo', '2.0 L Turbo'], ['tag 4 cyl 2.0 L', '4 cyl 2.0 L'], ['tag 6 cyl 2.0 L', '6 cyl 2.0 L'], ['no tag', undefined]])
@@ -1037,7 +1090,7 @@ if (health.schema >= '0012') {
       if (!hl || hl.nvals !== nv) b.push(`Home counts ${hl && hl.nvals}, the car shows ${nv}`);
       ok(!b.length, b.join('; ')); return 'normalized key';
     });
-    await t('Ultrareview B #4: a car with no engine sees the untagged value first, the tagged ones are flagged no_headline; a car with an engine is not flagged', async () => {
+    await tmodel('Ultrareview B #4: a car with no engine sees the untagged value first, the tagged ones are flagged no_headline; a car with an engine is not flagged', async () => {
       const b = [], E = 'Auto (variable gear ratios), 4 cyl, 2.0 L';
       const none = (await mkCar({ year: 1975 })).d.id, eng = (await mkCar({ year: 1975, engine: E })).d.id;
       for (const [value, engine] of [['tagged oil 2.0', E], ['generic oil', undefined]]) track(await addVal(none, { tab: 'oil', field: 'Oil type', value, scope: 'model', engine }));
@@ -1050,7 +1103,7 @@ if (health.schema >= '0012') {
       if (s.map(x => x.value).join() !== 'tagged oil 2.0,generic oil' || s.some(x => x.no_headline)) b.push('car with the engine: ' + JSON.stringify(s.map(x => [x.value, x.no_headline])));
       ok(!b.length, b.join('; ')); return 'order and no_headline';
     });
-    await t('Ultrareview B #6: Needs confirming "replaces" looks at the same engine or no engine only, and the row carries the engine', async () => {
+    await tmodel('Ultrareview B #6: Needs confirming "replaces" looks at the same engine or no engine only, and the row carries the engine', async () => {
       const b = [], EA = 'Auto, 4 cyl, 2.0 L', EB = 'Auto, 4 cyl, 1.5 L turbo';
       const id = (await mkCar({ year: 1979 })).d.id;
       const mk = async (value, engine, confirm) => {
@@ -1084,7 +1137,7 @@ if (health.schema >= '0012') {
       if (h1 !== 1 || h2 !== 1) b.push(`an empty answer was cached: ${h1} then ${h2} request(s), want 1 and 1`);
       ok(!b.length, b.join('; ')); return 'fe=1 only; empty not cached';
     }); else skip('Ultrareview B #8 and #2', 'local mode only (the fake fueleconomy.gov)');
-    if (hasProc) await t('Ultrareview B #3 and #7: a waiting photo read does not stop the Frequent workup; a job for another engine does not block; the same engine does', async () => {
+    if (hasProc) await tr('Ultrareview B #3 and #7: a waiting photo read does not stop the Frequent workup; a job for another engine does not block; the same engine does', async () => {
       const b = [], EA = 'Auto, 4 cyl, 2.0 L', EB = 'Auto, 4 cyl, 1.5 L turbo', open = [];
       const drop = async (jid, kinds) => { const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jid, kinds } }); if (cl.d && cl.d.id) await call(`/api/jobs/${cl.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } }); };
       const freq = async id => (await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { grp: 'frequent' } })).d;
@@ -1173,11 +1226,34 @@ if (health.schema >= '0012') {
         void rf;
         ok(!b.length, b.join('; ')); return 'key list, claim by kind, photo access, result, VIN proposals';
       });
+      await t('G1 (TODO 39): the self-test tool token confirms or rejects a VIN proposal ONLY on a SELFTEST car (403 on a real car, nothing changes); Rick\'s login may', async () => {
+        const b = [], c = await mkCar(), id = c.d.id;
+        await readJob(id, { vin: GOOD });
+        const prop = async () => ((await call('/api/needs-confirming', RK)).d.vin_proposals || []).find(p => p.vehicle_id === id);   // Rick's view: the car is no longer a SELFTEST car
+        const pe = await prop(); ok(pe, 'no VIN proposal was made');
+        try {
+          ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain G1V' } })).s === 200, 'the trim change');   // now a car that is not a SELFTEST car
+          for (const a of ['confirm', 'reject']) { const r = await call(`/api/vin-proposals/${pe.id}/${a}`, { method: 'POST', body: { not_us: true } }); if (r.s !== 403) b.push(`tool ${a}: ${r.s}`); }
+          // While the car is not a SELFTEST car the tool token cannot see it (review G 1c: a live run has no Rick login), so the state check here is LOCAL only (Rick's view);
+          // live checks the same state after the trim is put back (below), when the car is a SELFTEST car again.
+          if (LOCAL && (!(await prop()) || (await carOf(id)).vin)) b.push('the proposal was decided or the VIN was saved');
+          if (LOCAL) { const rk = await call(`/api/vin-proposals/${pe.id}/confirm`, { as: 'phone', method: 'POST', body: {} }); if (rk.s !== 200 || (await carOf(id)).vin !== GOOD) b.push('Rick confirm ' + rk.s); }
+        } finally { await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST B' }, ...RK }); }
+        if (!LOCAL) {
+          if (!(await prop()) || (await carOf(id)).vin) b.push('the proposal was decided or the VIN was saved (checked after the trim was put back)');
+          const tk = await call(`/api/vin-proposals/${pe.id}/confirm`, { method: 'POST', body: {} }); if (tk.s !== 200 || (await carOf(id)).vin !== GOOD) b.push('on a SELFTEST car the tool token was refused: ' + tk.s);
+        }
+        ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
+      });
       await t('HANDOFF 17 B10: "No VIN" and "No door card" are computed; the processor does not get them', async () => {
         const b = [], c = await mkCar(), id = c.d.id, row = async () => ((await call('/api/vehicles')).d || []).find(x => x.id === id);
         let r = await row(); if (!r || r.no_vin !== true || r.no_doorcard !== true) b.push('new car: ' + JSON.stringify(r && [r.no_vin, r.no_doorcard]));
         let nc = (await call('/api/needs-confirming')).d; if (!(nc.badges || []).some(x => x.vehicle_id === id && x.no_vin && x.no_doorcard)) b.push('Needs confirming has no badge for the car');
-        await addVal(id, { tab: 'tires', field: 'Pressure', value: '30 psi', scope: 'car', status: 'confirmed', confidence: 'High', source: 'Door-jamb label photo, 2026-10-27' });
+        const dc = await addVal(id, { tab: 'tires', field: 'Pressure', value: '30 psi', scope: 'car', status: 'confirmed', confidence: 'High', source: 'Door-jamb label photo, 2026-10-27' });
+        if (!LOCAL) {   // live: no Rick login, so the tool token adds it as PROPOSED; it confirms it itself (allowed on a SELFTEST car) to make a confirmed door card
+          const dx = ((dc.d && dc.d.values) || []).find(y => y.field === 'Pressure' && /^Door-jamb label photo/.test(y.source || ''));
+          const cx = dx ? await call(`/api/values/${dx.id}/confirm`, { method: 'POST', body: {} }) : null; if (!cx || cx.s !== 200) b.push('confirm of the door card value: ' + (cx ? cx.s : 'no value'));
+        }
         await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { vin: GOOD } });
         r = await row(); if (!r || r.no_vin !== false || r.no_doorcard !== false) b.push('after VIN and a confirmed door card: ' + JSON.stringify(r && [r.no_vin, r.no_doorcard]));
         nc = (await call('/api/needs-confirming')).d; if ((nc.badges || []).some(x => x.vehicle_id === id)) b.push('the badge stays in Needs confirming');
@@ -1202,7 +1278,7 @@ if (health.schema >= '0012') {
 if (health.schema >= '0013') {
   const GOOD = '1FTFW1CT5DFC10312', NODEC = '9TESTX' + '000XX000000', PLANT_VIN = '3TESTY' + '000YY' + '000001', FAKE_KEY = 'sk-' + 'ant-api03-SECRETSECRET', made = [];
   const mkCar = async (extra = {}) => { const r = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor', ...extra } }); if (r.d && r.d.id) made.push(r.d.id); return r; };
-  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`, RK)).d;
   const PLANT = 'Bearer abc123token ' + FAKE_KEY + ' CF_ACCESS_CLIENT_SECRET ' + 'a'.repeat(40) + ' someone@example.com team-x.cloudflareaccess.com ' + PLANT_VIN;
   const PLANTED = ['Bearer abc123token', FAKE_KEY, 'CF_ACCESS_CLIENT_SECRET', 'a'.repeat(32), 'someone@example.com', 'cloudflareaccess.com', PLANT_VIN];
   const push = async (rows, now, extra = {}) => call('/api/admin/log', { as: 'proc', method: 'POST', now, body: { rows, ...extra } });
@@ -1246,6 +1322,14 @@ if (health.schema >= '0013') {
         const b = [], now = new Date().toISOString();
         // The health row gets a time 5 hours ago (the test clock), so the next check can see an old report; no later row is pushed before it.
         const hOld = new Date(Date.now() - 5 * 3600e3).toISOString();
+        // G7: a Worker that has never had a report from an N100 (a friend's setup without the optional box) shows grey info, not a red problem.
+        const s00 = await call('/api/admin/status', { as: 'phone' });
+        if (s00.s === 200 && s00.d && s00.d.n100 && !s00.d.n100.as_of) {
+          const n0 = s00.d.n100.items.find(i => i.name === 'n100_report');
+          if (!n0 || n0.level !== 'info' || !/^No report from the always-on box yet\. This is normal when you run LiftPad without it\.$/.test(n0.reason) || /N100/.test(n0.reason)) b.push('G7 no report: ' + JSON.stringify(n0));
+          if (s00.d.worker_runs.level !== 'info') b.push('G7 no report, the worker line is ' + s00.d.worker_runs.level);
+          if (s00.d.n100.items.some(i => i.level === 'red')) b.push('G7 no report: a red line');
+        } else b.push('G7 the status had a report before the test pushed one (as_of ' + (s00.d && s00.d.n100 && s00.d.n100.as_of) + ')');
         const r0 = await push([{ ts: hOld, kind: 'health', level: 'amber', text: 'N100 health: amber', data: { items: [{ name: 'disk_root', level: 'amber', reason: 'disk / 85% full ' + PLANT, pad: PLANT, note: ['x ' + PLANT] }] } }], hOld);
         const r1 = await push([{ ts: now, kind: 'backup', level: 'red', text: 'backup failed: ' + PLANT }]);
         if (r0.s !== 200 || r0.d.inserted !== 1 || r1.s !== 200 || r1.d.inserted !== 1) b.push('push: ' + r0.s + JSON.stringify(r0.d) + ' ' + r1.s + JSON.stringify(r1.d));
@@ -1413,19 +1497,19 @@ if (health.schema >= '0014' && hasProc) {
   const SRC = `${US1} and ${US2}`;
   const P = (o = {}) => ({ item: 'wiper_driver', choice: 'first', brand: 'Bosch', part_no: '99011', size_in: 24, confidence: 'Medium', source: SRC, ...o });   // wipers: the research job asks for wipers and fluids only
   const research = async (id, parts) => {
-    const q = await call(`/api/vehicles/${id}/parts-research`, { method: 'POST', body: {} }); ok(q.s === 201 && q.d.id, 'queue ' + q.s + JSON.stringify(q.d));
+    const q = await rq(id, `/api/vehicles/${id}/parts-research`, {}); ok(q.s === 201 && q.d.id, 'queue ' + q.s + JSON.stringify(q.d));   // G review 1a: Rick's login, on a car with a plain trim for the moment
     const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } }); ok(cl.d && cl.d.id === q.d.id, 'claim ' + JSON.stringify(cl.d));
     const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts } }); return { q, cl, r };
   };
-  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`)).d;
+  const carOf = async id => (await call(`/api/vehicles/${id}?peek=1`, RK)).d;
   const partsOf = async id => (await call(`/api/vehicles/${id}/parts`)).d;
   const find = (d, item, choice) => d.parts.find(x => x.item === item && x.choice === choice);
   const why = (r, re) => r.d.drops.some(x => re.test(x.reason));
   let jeep = null, jp = null;
   try {
-    await t('F2: the parts job request holds year, make, model, engine, trim and fuel only (no VIN, no owner); a claim with no kinds never gets it', async () => {
+    await tr('F2: the parts job request holds year, make, model, engine, trim and fuel only (no VIN, no owner); a claim with no kinds never gets it', async () => {
       const c = await mkCar({ vin: GOOD }); await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { owner: 'Zed Q Owner' } });
-      const q = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); ok(q.s === 201, 'queue ' + q.s);
+      const q = await rq(c.d.id, `/api/vehicles/${c.d.id}/parts-research`, {}); ok(q.s === 201, 'queue ' + q.s);
       const again = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); ok(again.d.already === true && again.d.id === q.d.id, 'a second queue made a second job');
       ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id } })).d.none === true, 'a claim with no kinds got the parts job');
       ok((await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['research', 'workup'] } })).d.none === true, 'a research claim got the parts job');
@@ -1435,9 +1519,9 @@ if (health.schema >= '0014' && hasProc) {
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [] } })).s === 200, 'empty result');
       return 'six keys';
     });
-    await t('F2: a result must be a list; one bad item is dropped with its reason and the good item is stored (not a 400 for the job)', async () => {
+    await tr('F2: a result must be a list; one bad item is dropped with its reason and the good item is stored (not a 400 for the job)', async () => {
       const c = await mkCar(); jeep = c.d.id;
-      const bad1 = await call('/api/vehicles/' + jeep + '/parts-research', { method: 'POST', body: {} });
+      const bad1 = await rq(jeep, '/api/vehicles/' + jeep + '/parts-research', {});
       const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: bad1.d.id, kinds: ['parts'] } });
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { values: [] } })).s === 400, 'no parts list');
       const r = await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P({ item: 'bogus' }), P()] } });
@@ -1447,7 +1531,7 @@ if (health.schema >= '0014' && hasProc) {
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P()] } })).s === 409, 'a done job took a second result');
       return 'bad dropped, good stored';
     });
-    await t('F2: grading case - Bosch 99011 / Rain-X PL99012 / passenger 9910130AB from US sources; the New Zealand page number 98001 is dropped as non-US and never stored', async () => {
+    await tr('F2: grading case -Bosch 99011 / Rain-X PL99012 / passenger 9910130AB from US sources; the New Zealand page number 98001 is dropped as non-US and never stored', async () => {
       const c = await mkCar({ trim: 'SELFTEST B' }); jp = c.d.id;
       const r = (await research(jp, [P({ source: 'https://www.wixfilters.com/en-nz/filters/98001' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012' }),
         P({ item: 'wiper_passenger', part_no: '9910130AB', also_fits: '09910130AA' }), P({ part_no: '99011', also_fits: '99011XP' })])).r;
@@ -1456,7 +1540,7 @@ if (health.schema >= '0014' && hasProc) {
       ok(!JSON.stringify(d).includes('98001') && find(d, 'wiper_driver', 'first').also_fits === '99011XP' && d.parts.every(x => x.confidence === 'Medium' && x.check_car === 1 && x.status === 'proposed'), JSON.stringify(d.parts));
       return 'three stored, 98001 dropped';
     });
-    await t('F2: every server check drops its item with a reason (no URL, memory only, High part number, wrong brand, non-US host, locale path, size, missing size, no number, High fluid from the web, conflict not Low, slot twice)', async () => {
+    await tr('F2: every server check drops its item with a reason (no URL, memory only, High part number, wrong brand, non-US host, locale path, size, missing size, no number, High fluid from the web, conflict not Low, slot twice)', async () => {
       const c = await mkCar(), id = c.d.id;
       const r = (await research(id, [
         P({ source: 'from my memory, WIX 99011' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', confidence: 'High' }), P({ item: 'wiper_passenger', brand: 'Rain-X' }),
@@ -1471,7 +1555,7 @@ if (health.schema >= '0014' && hasProc) {
       ok(r.d.proposed === 2 && wr && wr.size_in === 12 && wr.part_no === '' && wr.brand === 'Rain-X', 'the size-only Rain-X wiper was not stored ' + JSON.stringify(r.d));
       return `${r.d.drops.length} dropped, ${r.d.proposed} stored`;
     });
-    await t('F2: a fluid from an owner-manual page may be High, a part number never; a conflict stores one row with conflict_no and confidence Low', async () => {
+    await tr('F2: a fluid from an owner-manual page may be High, a part number never; a conflict stores one row with conflict_no and confidence Low', async () => {
       const c = await mkCar(), id = c.d.id;
       const r = (await research(id, [{ item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'High', source: 'Owner manual p.312 (selftest)' },
         { item: 'coolant', choice: 'spec', spec_text: 'OAT, selftest spec', confidence: 'Medium', source: US1 }, P({ part_no: '99011', conflict_no: '98002', confidence: 'Low', source: US1 + ' says 99011; ' + US2 + ' says 98002' })])).r;
@@ -1480,7 +1564,7 @@ if (health.schema >= '0014' && hasProc) {
       ok(bf.confidence === 'High' && bf.part_no === '' && o.conflict_no === '98002' && o.confidence === 'Low' && o.part_no === '99011', JSON.stringify([bf, o]));
       return 'manual High fluid, conflict row';
     });
-    await t('F2: an electric car: a filter in a result is dropped (filters are entered by Rick), its coolant needs a manual page, a wiper and a brake fluid are stored; the items that apply leave out the oil filter and the engine air filter', async () => {
+    await tr('F2: an electric car: a filter in a result is dropped (filters are entered by Rick), its coolant needs a manual page, a wiper and a brake fluid are stored; the items that apply leave out the oil filter and the engine air filter', async () => {
       const c = await mkCar(), id = c.d.id; await call('/api/vehicles/' + id, { method: 'PATCH', body: { fuel: 'ev' } });
       const r = (await research(id, [P(), { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99014', confidence: 'Medium', source: SRC }, { item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99015', confidence: 'Medium', source: SRC },
         { item: 'coolant', choice: 'spec', spec_text: 'selftest', confidence: 'Medium', source: US1 }, { item: 'brake_fluid', choice: 'spec', spec_text: 'DOT 4', confidence: 'Medium', source: US1 }])).r;
@@ -1488,7 +1572,7 @@ if (health.schema >= '0014' && hasProc) {
       const d = await partsOf(id); ok(!d.applies.includes('oil_filter') && !d.applies.includes('engine_air_filter') && d.applies.includes('cabin_air_filter') && d.fuel === 'ev', JSON.stringify(d.applies));
       return 'EV items';
     });
-    await t('F2 filters (Rick 2026-11-01 addendum): a processor result with a filter - any filter, any choice - is dropped with "filters are entered by Rick" and nothing is stored; a wiper next to it is stored', async () => {
+    await tr('F2 filters (Rick 2026-11-01 addendum): a processor result with a filter - any filter, any choice - is dropped with "filters are entered by Rick" and nothing is stored; a wiper next to it is stored', async () => {
       const c = await mkCar(), id = c.d.id;
       const F = (item, choice, brand, no) => ({ item, choice, brand, part_no: no, confidence: 'Medium', source: SRC });
       const r = (await research(id, [F('oil_filter', 'first', 'WIX', '99071'), F('oil_filter', 'other', 'Purolator', 'PL99071'), F('oil_filter', 'oem', 'Honda', '99071-EXA'), F('engine_air_filter', 'first', 'WIX', '99072'),
@@ -1497,7 +1581,7 @@ if (health.schema >= '0014' && hasProc) {
       const d = await partsOf(id); ok(d.parts.length === 1 && d.parts[0].item === 'wiper_rear' && !JSON.stringify(d).includes('9907'), JSON.stringify(d.parts));
       return 'filters dropped';
     });
-    await t('F2: Rick confirms (check flag off, history row), a confirm is not repeated, a new search never overwrites a confirmed part and replaces a proposed one (with history), reject frees the slot', async () => {
+    await tr('F2: Rick confirms (check flag off, history row), a confirm is not repeated, a new search never overwrites a confirmed part and replaces a proposed one (with history), reject frees the slot', async () => {
       const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first'), ch = find(d0, 'wiper_driver', 'other');
       const cf = await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} }); if (cf.s !== 200 || cf.d.part.status !== 'confirmed' || cf.d.part.check_car !== 0 || !cf.d.part.confirmed_at || !cf.d.part.confirmed_by) b.push('confirm ' + JSON.stringify(cf.d));
       if ((await call(`/api/parts/${o.id}/confirm`, { method: 'POST', body: {} })).s !== 409) b.push('a confirm was repeated');
@@ -1513,7 +1597,7 @@ if (health.schema >= '0014' && hasProc) {
       const ho = (await call(`/api/parts/${o.id}/history`)).d; if (JSON.stringify(ho.map(x => x.action)) !== JSON.stringify(['insert', 'confirm'])) b.push('confirm history ' + JSON.stringify(ho.map(x => x.action)));
       ok(!b.length, b.join('; ')); return 'confirm, replace, reject';
     });
-    await t('F2: Rick edits a part (shape, size, High and empty checks) with a history row, and deletes one (history row kept)', async () => {
+    await tr('F2: Rick edits a part (shape, size, High and empty checks) with a history row, and deletes one (history row kept)', async () => {
       const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first');
       const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: 'wix 99011xp', source: 'Rick typed it' } }); if (e.s !== 200 || e.d.part.part_no !== 'WIX 99011XP' || e.d.part.source !== 'Rick typed it' || e.d.part.status !== 'confirmed') b.push('edit ' + e.s + JSON.stringify(e.d));
       for (const [body, why2] of [[{ part_no: 'bad!!no' }, 'shape'], [{ confidence: 'High' }, 'High on a number'], [{ confidence: 'Sure' }, 'confidence'], [{ size_in: 40 }, 'size 40'], [{ size_in: 'big' }, 'size text'], [{}, 'empty']]) {
@@ -1523,10 +1607,10 @@ if (health.schema >= '0014' && hasProc) {
       const ho = (await call(`/api/parts/${o.id}/history`)).d; if (ho.map(x => x.action).join() !== 'insert,confirm,update' || !/99011"/.test(ho[2].old_json) || !/WIX 99011XP/.test(ho[2].new_json)) b.push('edit history ' + ho.map(x => x.action));
       const del = find(await partsOf(jp), 'wiper_driver', 'other'); const dl = await call(`/api/parts/${del.id}`, { method: 'DELETE' }); if (dl.s !== 200) b.push('delete ' + dl.s);
       if (find(await partsOf(jp), 'wiper_driver', 'other')) b.push('deleted part still listed');
-      const hd = (await call(`/api/parts/${del.id}/history`)).d; if (hd[hd.length - 1].action !== 'delete' || !/PL99012/.test(hd[hd.length - 1].old_json)) b.push('delete history');
+      const hd = (await call(`/api/parts/${del.id}/history`, { ...RK })).d;   // G review 1b: the tool sees no history of a deleted row; Rick's login does if (hd[hd.length - 1].action !== 'delete' || !/PL99012/.test(hd[hd.length - 1].old_json)) b.push('delete history');
       ok(!b.length, b.join('; ')); return 'edit, delete, history';
     });
-    await t('F2 review 3: Rick\'s edit keeps the per-item rules - a wiper keeps a size 8 to 32, a filter keeps its part number, a fluid keeps its spec text (400 otherwise, nothing changes)', async () => {
+    await tr('F2 review 3: Rick\'s edit keeps the per-item rules - a wiper keeps a size 8 to 32, a filter keeps its part number, a fluid keeps its spec text (400 otherwise, nothing changes)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [P(), { item: 'wiper_passenger', choice: 'first', brand: 'Bosch', size_in: 22, confidence: 'Medium', source: SRC },
         { item: 'coolant', choice: 'spec', brand: '', spec_text: 'test coolant spec', confidence: 'Medium', source: SRC }])).r; ok(r.d.proposed === 3, JSON.stringify(r.d));
@@ -1540,14 +1624,14 @@ if (health.schema >= '0014' && hasProc) {
       const okw = await call(`/api/parts/${w.id}`, { method: 'PATCH', body: { size_in: 18 } }); if (okw.s !== 200 || okw.d.part.size_in !== 18) b.push('a valid size was refused');
       ok(!b.length, b.join('; ')); return 'wiper, filter, fluid';
     });
-    await t('F2 review 7: a .co address and a /catalog/ac-dc/ path are US sources; /en-nz/ and .co.nz are dropped as non-US', async () => {
+    await tr('F2 review 7: a .co address and a /catalog/ac-dc/ path are US sources; /en-nz/ and .co.nz are dropped as non-US', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [P({ source: 'https://www.partsgeek.co/catalog/x and ' + US1 }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', source: 'https://www.quadratec.com/en/catalog/ac-dc/x and ' + US1 }),
         P({ item: 'wiper_passenger', part_no: '99021', source: 'https://www.wixfilters.com/en-nz/f/1 and ' + US1 }), P({ item: 'wiper_rear', part_no: '99031', source: 'https://www.wixfilters.co.nz/x and ' + US1 })])).r;
       if (r.d.proposed !== 2 || r.d.drops.length !== 2 || !r.d.drops.every(x => /non-US/.test(x.reason))) b.push(JSON.stringify(r.d));
       ok(!b.length, b.join('; ')); return 'short lists';
     });
-    await t('F2 Opus 4: deleting a car closes its open parts job (a claim for it finds nothing), so no paid result can land on a car that gets the same id later', async () => {
+    await tr('F2 Opus 4: deleting a car closes its open parts job (a claim for it finds nothing), so no paid result can land on a car that gets the same id later', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const q = await call(`/api/vehicles/${id}/parts-research`, { method: 'POST', body: {} }); if (q.s !== 201) b.push('queue ' + q.s);
       if ((await call('/api/vehicles/' + id, { method: 'DELETE' })).s !== 200) b.push('delete');
@@ -1556,19 +1640,27 @@ if (health.schema >= '0014' && hasProc) {
       ok(!b.length, b.join('; ')); return 'job closed with the car';
     });
     await t('F2 Opus 7: the self-test token cannot turn a real car into a SELFTEST car, and cannot start a parts search on a car that is not one', async () => {
-      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Real', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
-      const t1 = await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { trim: 'SELFTEST Z' } }); if (t1.s !== 403) b.push('trim to SELFTEST: ' + t1.s);
-      const t2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body: {} }); if (t2.s !== 403) b.push('parts search: ' + t2.s);
+      // G1b: the tool token can no longer make a car that is not a SELFTEST car, so the "real" car is a SELFTEST car turned real (the only way the tool can)
+      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+      ok((await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { trim: 'Plain Real' } })).s === 200, 'turn real');
+      const t1 = await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { trim: 'Plain Real 2' } }); if (t1.s !== 403) b.push('rename of a real car: ' + t1.s);
+      const t2 = await call(`/api/vehicles/${c.d.id}/parts-research`, { as: 'tool', method: 'POST', body: {} }); if (t2.s !== 403) b.push('parts search: ' + t2.s);
       ok(!b.length, b.join('; ')); return '403, 403';
     });
-    await t('F2 no seed bypass (Rick 2026-11-01): the tool token gets 403 on a parts search for a real car whatever the body says - {"seed":true} too - and GET /parts has no seed key; on a SELFTEST car it still queues', async () => {
-      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain NoSeed', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+    await t('F2 no seed bypass (Rick 2026-11-01): the tool token gets 403 on a parts search for a real car whatever the body says - {"seed":true} too - and GET /parts has no seed key; on a SELFTEST car it is 403 too (review G 1a)', async () => {
+      const b = [], c = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor' } }); ok(c.s === 201 || c.s === 200, 'create ' + c.s); made.push(c.d.id);
+      ok((await call('/api/vehicles/' + c.d.id, { method: 'PATCH', body: { trim: 'Plain NoSeed' } })).s === 200, 'turn real');   // G1b: a SELFTEST car turned real
       if ('seed' in await partsOf(c.d.id)) b.push('GET /parts has a seed key');
-      for (const [body, why2] of [[{}, 'empty body'], [{ seed: true }, 'seed true'], [{ seed: 'yes' }, 'seed yes'], [{ seed: false }, 'seed false']]) { const x = await call(`/api/vehicles/${c.d.id}/parts-research`, { method: 'POST', body }); if (x.s !== 403) b.push(`${why2}: ${x.s}`); }
-      const s = await mkCar(); const r = await research(s.d.id, []); if (r.r.s !== 200) b.push('a SELFTEST car could not queue and close a parts job: ' + r.r.s);   // research() queues, claims and closes its own job at once
+      for (const [body, why2] of [[{}, 'empty body'], [{ seed: true }, 'seed true'], [{ seed: 'yes' }, 'seed yes'], [{ seed: false }, 'seed false']]) { const x = await call(`/api/vehicles/${c.d.id}/parts-research`, { as: 'tool', method: 'POST', body }); if (x.s !== 403) b.push(`${why2}: ${x.s}`); }
+      // A deleted SELFTEST car's id is used again by the next one (the live run has ids 1-5 and every temp car gets 6), so a job or part left by an EARLIER run on that id shows on the new
+      // car. The check compares the car before and after the refused call: nothing may be new.
+      const s = await mkCar(), seen = async () => JSON.stringify([((await partsOf(s.d.id)).parts || []).map(x => x.id), ((await call(`/api/vehicles/${s.d.id}?peek=1`)).d.jobs || []).filter(j => j.kind === 'parts').map(j => j.id)]);
+      const before = await seen();
+      const r = await call(`/api/vehicles/${s.d.id}/parts-research`, { as: 'tool', method: 'POST', body: {} }); if (r.s !== 403) b.push('the tool token queued a parts search on a SELFTEST car: ' + r.s);   // G review 1a: even on a SELFTEST car it is 403 now
+      const after = await seen(); if (after !== before) b.push('a parts job or part was made on the SELFTEST car: ' + before + ' -> ' + after);
       ok(!b.length, b.join('; ')); return 'no seed path';
     });
-    await t('F2 conflict (Rick 2026-11-01): Confirm - fits resolves a conflict (the other number is cleared, history keeps it, the source says who chose); "use the other number" swaps the two (history row, still proposed and Low) and the swapped row can be confirmed; Edit can clear the other number and the Low rule holds only while one is set', async () => {
+    await tr('F2 conflict (Rick 2026-11-01): Confirm - fits resolves a conflict (the other number is cleared, history keeps it, the source says who chose); "use the other number" swaps the two (history row, still proposed and Low) and the swapped row can be confirmed; Edit can clear the other number and the Low rule holds only while one is set', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [P({ part_no: '99011', conflict_no: '99012', confidence: 'Low' }), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012', conflict_no: 'PL99013', confidence: 'Low' }),
         P({ item: 'wiper_passenger', part_no: '99021', conflict_no: '99022', confidence: 'Low' })])).r;
@@ -1595,7 +1687,7 @@ if (health.schema >= '0014' && hasProc) {
       for (const [pid, why2] of [[e.id, 'no other number'], [a.id, 'a confirmed row'], [99999999, 'a missing part']]) { const x = await call(`/api/parts/${pid}/use-other`, { method: 'POST', body: {} }); if (x.s !== (pid === 99999999 ? 404 : 409)) b.push(`${why2}: ${x.s}`); }
       ok(!b.length, b.join('; ')); return 'confirm, swap, edit';
     });
-    await t('F2 add part (Rick 2026-11-01): POST /api/vehicles/:id/parts saves a part Rick adds as CONFIRMED (check flag off, Medium, confirmed by the caller, one insert history row); an occupied slot is 409; the per-item checks (brand, number, size 8-32, spec, source, electric car) are 400; research never overwrites it', async () => {
+    await tr('F2 add part (Rick 2026-11-01): POST /api/vehicles/:id/parts saves a part Rick adds as CONFIRMED (check flag off, Medium, confirmed by the caller, one insert history row); an occupied slot is 409; the per-item checks (brand, number, size 8-32, spec, source, electric car) are 400; research never overwrites it', async () => {
       const b = [], c = await mkCar(), id = c.d.id, SRCT = 'WIX Filter Finder - checked by Rick';
       const add = (body, o = {}) => call(`/api/vehicles/${id}/parts`, { method: 'POST', body, ...o });
       const a1 = await add({ item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: ' 99041xp ', source: SRCT });
@@ -1627,7 +1719,8 @@ if (health.schema >= '0014' && hasProc) {
       const e1 = await call(`/api/vehicles/${eid}/parts`, { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99048', source: SRCT } }); if (e1.s !== 400) b.push('ev oil filter ' + e1.s);
       // gates: the processor never; the self-test token only on a SELFTEST car; a missing car is 404
       const pr = await add({ item: 'engine_air_filter', choice: 'first', brand: 'WIX', part_no: '99049', source: SRCT }, { as: 'proc' }); if (pr.s !== 403) b.push('processor ' + pr.s);
-      const real = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'Plain Add', grp: 'visitor' } }); made.push(real.d.id);
+      const real = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet B', trim: 'SELFTEST B', grp: 'visitor' } }); made.push(real.d.id);
+      ok((await call('/api/vehicles/' + real.d.id, { method: 'PATCH', body: { trim: 'Plain Add' } })).s === 200, 'turn real');   // G1b: a SELFTEST car turned real
       const rl = await call(`/api/vehicles/${real.d.id}/parts`, { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99050', source: SRCT } }); if (rl.s !== 403) b.push('tool token on a real car ' + rl.s);
       if ((await call('/api/vehicles/99999999/parts', { method: 'POST', body: { item: 'oil_filter', choice: 'first', brand: 'WIX', part_no: '99051', source: SRCT } })).s !== 404) b.push('missing car');
       // a rejected slot is free again
@@ -1635,7 +1728,7 @@ if (health.schema >= '0014' && hasProc) {
       if (rj.s !== 200 || a3.s !== 201 || a3.d.part.part_no !== '99052') b.push('a rejected slot did not take a new part: ' + a3.s);
       ok(!b.length, b.join('; ')); return 'add part';
     });
-    await t('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
+    await tr('F2 Opus 8: High is only for a fluid - a wiper that carries a number only in also-fits cannot be High (research drops it, an edit is refused)', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [{ item: 'wiper_driver', choice: 'first', brand: 'Bosch', size_in: 22, also_fits: '99022', confidence: 'High', source: SRC }])).r;
       if (r.d.proposed !== 0 || !why(r, /never High/)) b.push('result ' + JSON.stringify(r.d));
@@ -1643,7 +1736,7 @@ if (health.schema >= '0014' && hasProc) {
       const w = find(await partsOf(id), 'wiper_driver', 'first'); const e = await call(`/api/parts/${w.id}`, { method: 'PATCH', body: { confidence: 'High' } }); if (e.s !== 400) b.push('edit to High: ' + e.s);
       ok(!b.length, b.join('; ')); return 'never High';
     });
-    await t('F2 review 5: Find parts does not overwrite a proposed row that Rick edited; a different number goes to conflict_no (Low) with a note; the skip is counted as edited by Rick', async () => {
+    await tr('F2 review 5: Find parts does not overwrite a proposed row that Rick edited; a different number goes to conflict_no (Low) with a note; the skip is counted as edited by Rick', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       await research(id, [P()]); const o = find(await partsOf(id), 'wiper_driver', 'first');
       const e = await call(`/api/parts/${o.id}`, { method: 'PATCH', body: { part_no: '99011XP' } }); if (e.s !== 200 || e.d.part.status !== 'proposed') b.push('edit ' + e.s);
@@ -1655,7 +1748,7 @@ if (health.schema >= '0014' && hasProc) {
       const r3 = (await research(id, [P({ part_no: '99011XP' })])).r; const n3 = find(await partsOf(id), 'wiper_driver', 'first'); if (r3.d.skipped_edited !== 1 || n3.part_no !== '99011XP') b.push('same number ' + JSON.stringify(r3.d));
       ok(!b.length, b.join('; ')); return 'edited row kept, conflict shown';
     });
-    await t('F2: the processor token is refused (403) on every parts route and on deleting a car; nothing changes', async () => {
+    await tr('F2: the processor token is refused (403) on every parts route and on deleting a car; nothing changes', async () => {
       const b = [], d0 = await partsOf(jp), o = find(d0, 'wiper_driver', 'first'), before = JSON.stringify(d0.parts);
       for (const [p, m, body] of [[`/api/vehicles/${jp}/parts`, 'GET'], [`/api/vehicles/${jp}/parts`, 'POST', { item: 'wiper_passenger', choice: 'other', brand: 'Rain-X', part_no: '99060', source: 'x' }], [`/api/vehicles/${jp}/parts-research`, 'POST', {}], [`/api/parts/${o.id}/confirm`, 'POST', {}], [`/api/parts/${o.id}/reject`, 'POST', {}], [`/api/parts/${o.id}/use-other`, 'POST', {}],
         [`/api/parts/${o.id}`, 'PATCH', { part_no: '1234' }], [`/api/parts/${o.id}`, 'DELETE'], [`/api/parts/${o.id}/history`, 'GET'], [`/api/vehicles/${jp}`, 'DELETE']]) {
@@ -1665,7 +1758,7 @@ if (health.schema >= '0014' && hasProc) {
       if (LOCAL) for (const as of ['forged', 'expired']) if ((await call(`/api/parts/${o.id}/confirm`, { as, method: 'POST', body: {} })).s !== 403) b.push(as + ' token confirmed');   // a live run cannot sign a token (Access refuses those before the Worker)
       ok(!b.length, b.join('; ')); return '8 routes, 403 each';
     });
-    await t('F2: the self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (403 on any other car, nothing changes); Rick\'s login may', async () => {
+    await tr('F2: the self-test tool token may confirm, reject, edit or delete a part ONLY on a SELFTEST car (403 on any other car, nothing changes); Rick\'s login may', async () => {
       const b = [], c = await mkCar(), id = c.d.id;
       const r = (await research(id, [P(), P({ choice: 'other', brand: 'Rain-X', part_no: 'PL99012' })])).r; ok(r.d.proposed === 2, JSON.stringify(r.d));
       const d0 = await partsOf(id), o = find(d0, 'wiper_driver', 'first'), ch = find(d0, 'wiper_driver', 'other');
@@ -1687,33 +1780,268 @@ if (health.schema >= '0014' && hasProc) {
       if (!LOCAL && back.s !== 200) b.push('on a SELFTEST car the tool token was refused: ' + back.s);
       ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
     });
-    await t('F2: the processor may post parts only for a job it has claimed (an unclaimed or another job is 409), and the result needs a car', async () => {
-      const q = await call(`/api/vehicles/${jp}/parts-research`, { method: 'POST', body: {} });
+    await tr('F2: the processor may post parts only for a job it has claimed (an unclaimed or another job is 409), and the result needs a car', async () => {
+      const q = await rq(jp, `/api/vehicles/${jp}/parts-research`, {});
       ok((await call(`/api/jobs/${q.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: [P()] } })).s === 409, 'a queued job took a result');
       const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: q.d.id, kinds: ['parts'] } });
       ok((await call(`/api/jobs/${cl.d.id}/result`, { as: 'proc', method: 'POST', body: { parts: new Array(41).fill(P()) } })).s === 400, 'more than 40 parts');
       ok((await call(`/api/jobs/${cl.d.id}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } })).s === 200, 'fail'); return 'claim rule';
     });
-    await t('F2: deleting a car removes its parts rows (no foreign key stop) and the car is gone', async () => {
+    await tr('F2: deleting a car removes its parts rows (no foreign key stop) and the car is gone', async () => {
       ok((await partsOf(jp)).parts.length >= 2, 'the car holds no parts rows, so the delete proves nothing');
       const d = await call('/api/vehicles/' + jp, { method: 'DELETE' }); made.splice(made.indexOf(jp), 1);
       ok(d.s === 200 && (await call('/api/vehicles/' + jp)).s === 404, 'delete ' + d.s + JSON.stringify(d.d)); return 'deleted with parts';
     });
   } finally {
-    for (const id of made) await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null);
+    for (const id of made) { await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST B' } }).catch(() => null); await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null); }   // G1b: a car turned real goes back first
   }
 } else skip('HANDOFF 21 F2: parts routes', health.schema >= '0014' ? 'no processor token' : 'schema before 0014');
+
+// ---------- HANDOFF 22 G1 (TODO 39): the tool token and the values of a real car ----------
+RICK_VALS = false; CARSCOPE = false;   // from here on the cases name the token themselves
+// The self-test tool token may confirm, reject, edit or delete a VALUE, and confirm, type or clear a curb weight, only on a SELFTEST car (same rule as
+// toolPartGate for parts). The car is a SELFTEST car while it is made; the test turns it into a "real" car (a trim that does not start with SELFTEST,
+// which the tool token may do) and tries every route, then turns it back. A model-scope value belongs to the make, model and years, so it counts as
+// real when a car that is not a SELFTEST car has that make, model and year. Rick's login (a phone, local mode only) is never gated.
+await tl('G1: the self-test tool token decides values and the curb weight ONLY on a SELFTEST car (403 on a real car, nothing changes); Rick\'s login may', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1', trim: 'SELFTEST G1', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id, vids = [];
+  const carOf = async () => (await call(`/api/vehicles/${id}?peek=1`, RK)).d;
+  try {
+    const add = async (value, scope, as, status) => { const r = await call(`/api/vehicles/${id}/values`, { as, method: 'POST', body: { tab: 'torque', field: 'Socket', value, confidence: 'Low', source: 'selftest', scope, status } }); const x = ((r.d && r.d.values) || []).find(y => y.value === value); if (x) vids.push(x.id); return x; };
+    const car1 = await add('G1 car 17 mm', 'car');
+    // Review G #1: the tool token adds CAR-scope values only (a model-scope value applies to every car of that make and model, now and later), and only as proposed. The model-scope
+    // value for the rest of this case is made with Rick's login (a phone, local mode only).
+    const tm = await call(`/api/vehicles/${id}/values`, { method: 'POST', body: { tab: 'torque', field: 'Socket', value: 'G1 tool model', confidence: 'Low', source: 'selftest', scope: 'model', status: 'confirmed' } });
+    if (tm.s !== 403) b.push('tool model-scope value add: ' + tm.s);
+    const tc2 = await add('G1 car asks confirmed', 'car', undefined, 'confirmed');
+    if (!tc2 || tc2.status !== 'proposed') b.push('tool value asked for confirmed was stored as ' + (tc2 && tc2.status));
+    const mod1 = LOCAL ? await add('G1 model 18 mm', 'model', 'phone') : null;
+    ok(car1 && (mod1 || !LOCAL), 'the test values were not made');
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain G1' } })).s === 200, 'the trim change');   // now a car that is not a SELFTEST car
+    const snap = async () => JSON.stringify(((await carOf()).values || []).filter(x => vids.includes(x.id)).map(x => [x.id, x.value, x.status, x.confidence, x.note, x.source]).sort());
+    const before = await snap(); ok(before.length > 10, 'no snapshot');
+    for (const x of [car1, mod1].filter(Boolean)) {
+      for (const [p, m, body] of [[`/api/values/${x.id}/confirm`, 'POST', {}], [`/api/values/${x.id}/reject`, 'POST', {}], [`/api/values/${x.id}`, 'PATCH', { value: 'changed' }], [`/api/values/${x.id}`, 'PATCH', { warn: 2 }], [`/api/values/${x.id}`, 'DELETE']]) {
+        const r = await call(p, { method: m, body }); if (r.s !== 403) b.push(`tool ${m} ${p} (${x.scope}): ${r.s}`);
+      }
+    }
+    if (await snap() !== before) b.push('a value changed');
+    if (LOCAL) {   // Rick's own login is not gated
+      const cf = await call(`/api/values/${car1.id}/confirm`, { as: 'phone', method: 'POST', body: {} }); if (cf.s !== 200) b.push('Rick confirm ' + cf.s);
+      const pe = await call(`/api/values/${mod1.id}`, { as: 'phone', method: 'PATCH', body: { note: 'Rick typed it' } }); if (pe.s !== 200) b.push('Rick edit ' + pe.s);
+    }
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1' }, ...RK })).s === 200, 'restore the trim');   // the tool token cannot touch the car now: Rick's login (local)
+    // back on a SELFTEST car the tool token may decide its CAR-scope values (the live self-test grades the routes this way); a MODEL-scope value stays refused for it (Review G #1, #2)
+    const cm = await call(`/api/values/${tc2.id}/confirm`, { method: 'POST', body: {} }); if (cm.s !== 200) b.push('tool confirm (car) on a SELFTEST car: ' + cm.s);
+    const pm = await call(`/api/values/${car1.id}`, { method: 'PATCH', body: { note: 'x' } }); if (pm.s !== 200) b.push('tool edit on a SELFTEST car: ' + pm.s);
+    if (mod1) for (const [p, m, body] of [[`/api/values/${mod1.id}/confirm`, 'POST', {}], [`/api/values/${mod1.id}`, 'PATCH', { note: 'x' }], [`/api/values/${mod1.id}`, 'DELETE']]) {
+      const r = await call(p, { method: m, body }); if (r.s !== 403) b.push(`tool ${m} ${p} (model value, even with a SELFTEST car of that make): ${r.s}`);
+    }
+    if (mod1) { const d = await call(`/api/values/${mod1.id}`, { as: 'phone', method: 'DELETE' }); if (d.s !== 200) b.push('Rick delete of the model value: ' + d.s); }
+    for (const x of [car1, tc2].filter(Boolean)) { const d = await call(`/api/values/${x.id}`, { method: 'DELETE' }); if (d.s !== 200) b.push('tool delete on a SELFTEST car: ' + d.s); }
+    ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
+  } finally {
+    await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1' }, ...RK }).catch(() => null);
+    for (const v of vids) await call('/api/values/' + v, { method: 'DELETE', ...RK }).catch(() => null);
+    await call('/api/vehicles/' + id, { method: 'DELETE', ...RK }).catch(() => null);
+  }
+});
+
+// The curb weight on its own (so it can be graded alone against the old Worker: lp-run g-oldcheck).
+await tl('G1: the self-test tool token cannot confirm, type or clear the curb weight of a car that is not a SELFTEST car (403, no weight saved); on a SELFTEST car it can; Rick\'s login may', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1W', trim: 'SELFTEST G1W', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id, curb = async () => (await call(`/api/vehicles/${id}?peek=1`, RK)).d.curb;
+  try {
+    const w = (body, as) => call(`/api/vehicles/${id}/weight`, { as, method: 'POST', body });
+    ok((await w({ action: 'confirm', lb: 2800 })).s === 200, 'tool weight on a SELFTEST car'); ok((await curb()).lb === 2800, 'weight saved');   // a weight to lose
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain G1W' } })).s === 200, 'the trim change');
+    for (const [body, why] of [[{ action: 'confirm', lb: 2900 }, 'type'], [{ action: 'confirm' }, 'confirm'], [{ action: 'clear' }, 'clear']]) { const r = await w(body); if (r.s !== 403) b.push(`tool weight ${why}: ${r.s}`); }
+    const c = await curb(); if (!c || c.lb !== 2800) b.push('the weight changed: ' + JSON.stringify(c));
+    if (LOCAL) { const r = await w({ action: 'confirm', lb: 2900 }, 'phone'); if (r.s !== 200) b.push('Rick weight ' + r.s); }
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1W' }, ...RK })).s === 200, 'restore the trim');
+    if ((await w({ action: 'clear' })).s !== 200 || await curb()) b.push('tool clear on a SELFTEST car');
+    ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
+  } finally {
+    await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1W' }, ...RK }).catch(() => null);
+    await call('/api/vehicles/' + id, { method: 'DELETE', ...RK }).catch(() => null);
+  }
+});
+
+// ---------- HANDOFF 22 G1b: one gate for the tool token on every car route ----------
+// The self-test tool token touches SELFTEST cars and test data only. The test makes a SELFTEST car with a visit and a photo, turns it into a "real" car
+// (a trim that does not start with SELFTEST) and tries each route; nothing may change. Then the trim goes back and the tool token may delete it.
+await tl('G1b: the self-test tool token changes a car only when it is a SELFTEST car - 403 on a real car for delete, edit, values, service visits, photos, photo read, research and facts; it cannot make a real car; it cannot move or remove a chart box that Rick drew', async () => {
+  const b = [], today = new Date().toISOString().slice(0, 10);
+  const mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1B', trim: 'SELFTEST G1B', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id;
+  const carOf = async () => (await call(`/api/vehicles/${id}?peek=1`, RK)).d;
+  try {
+    const other = ((await call(`/api/service-items?car=${id}`)).d || []).find(i => i.name === 'Other');
+    const vis = await call(`/api/vehicles/${id}/service`, { method: 'POST', body: { date: today, mileage: 1000, items: [{ item_id: other && other.id, other_text: 'g1b' }] } }); ok(vis.s === 201, 'visit ' + vis.s + JSON.stringify(vis.d));
+    const ph = await raw(`/api/vehicles/${id}/photos`, { method: 'POST', body: GREY }); ok(ph.status === 201, 'photo ' + ph.status); const photo = (await ph.json()).name;
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'Plain G1B' } })).s === 200, 'the trim change');   // now a car that is not a SELFTEST car
+    const snap = async () => { const c = await carOf(); return JSON.stringify([c.trim, c.grp, c.owner, c.vin, c.engine, c.fuel, (c.values || []).length, (await call(`/api/vehicles/${id}/service`, RK)).d.entries.map(e => [e.id, e.mileage, e.date])]); };
+    const before = await snap(), photos0 = (await call(`/api/vehicles/${id}/photos`, RK)).d.length;
+    const tries = [['PATCH', `/api/vehicles/${id}`, { grp: 'mine' }], ['PATCH', `/api/vehicles/${id}`, { owner: 'Someone' }], ['PATCH', `/api/vehicles/${id}`, { fuel: 'ev' }], ['PATCH', `/api/vehicles/${id}`, { vin: '1FTFW1CT5DFC10312' }],
+      ['PATCH', `/api/vehicles/${id}`, { trim: 'Plain G1B 2' }],
+      ['POST', `/api/vehicles/${id}/values`, { tab: 'torque', field: 'Socket', value: '19 mm', confidence: 'Low', source: 'selftest', scope: 'car' }],
+      ['POST', `/api/vehicles/${id}/service`, { date: today, mileage: 2000, items: [{ item_id: other && other.id, other_text: 'g1b 2' }] }],
+      ['PATCH', `/api/service/${vis.d.id}`, { mileage: 1500, force: 1 }], ['DELETE', `/api/service/${vis.d.id}`],
+      ['DELETE', `/api/photos/${id}/${photo}`], ['POST', `/api/vehicles/${id}/doorcard`, { photo }], ['POST', `/api/vehicles/${id}/facts`, {}], ['POST', '/api/jobs', { vehicle_id: id }],
+      ['DELETE', `/api/vehicles/${id}`]];
+    for (const [m, p, body] of tries) { const r = await call(p, { as: 'tool', method: m, body }); if (r.s !== 403) b.push(`tool ${m} ${p}: ${r.s}`); }   // as:'tool': POST /api/jobs must be the tool token here, not Rick's login (review G 1a)
+    const up = await raw(`/api/vehicles/${id}/photos`, { method: 'POST', body: GREY }); if (up.status !== 403) b.push('tool photo upload: ' + up.status);
+    if (await snap() !== before) b.push('the car, its values or its visits changed');
+    if ((await call(`/api/vehicles/${id}/photos`, RK)).d.length !== photos0) b.push('a photo was added or removed');
+    if ((await call(`/api/vehicles/${id}`, RK)).s !== 200) b.push('THE CAR WAS DELETED');
+    // the tool token cannot make a car that is not a SELFTEST car
+    const rc = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1B', trim: 'Plain Made', grp: 'visitor' } });
+    if (rc.s !== 403) { b.push('tool created a real car: ' + rc.s); if (rc.d && rc.d.id) await call('/api/vehicles/' + rc.d.id, { method: 'PATCH', body: { trim: 'SELFTEST MADE' } }).then(() => call('/api/vehicles/' + rc.d.id, { method: 'DELETE' })).catch(() => null); }
+    if (LOCAL) {   // Rick's own login is never gated
+      if ((await call(`/api/vehicles/${id}`, { as: 'phone', method: 'PATCH', body: { owner: 'Rick G1B' } })).s !== 200) b.push('Rick edit');
+      if ((await call(`/api/vehicles/${id}/values`, { as: 'phone', method: 'POST', body: { tab: 'torque', field: 'Socket', value: '19 mm', confidence: 'Low', source: 'Rick', scope: 'car' } })).s !== 201) b.push('Rick add value');
+      if ((await call(`/api/service/${vis.d.id}`, { as: 'phone', method: 'PATCH', body: { mileage: 1500, force: 1 } })).s !== 200) b.push('Rick edit visit');
+    }
+    ok((await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1B' }, ...RK })).s === 200, 'restore the trim');
+    if ((await call(`/api/vehicles/${id}`, { method: 'PATCH', body: { owner: 'Test Owner' } })).s !== 200) b.push('tool edit on a SELFTEST car');
+    if ((await call(`/api/photos/${id}/${photo}`, { method: 'DELETE' })).s !== 200) b.push('tool photo delete on a SELFTEST car');
+    ok(!b.length, b.join('; ')); return 'tool refused off SELFTEST cars';
+  } finally {
+    await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1B' }, ...RK }).catch(() => null);
+    await call('/api/vehicles/' + id, { method: 'DELETE', ...RK }).catch(() => null);
+  }
+});
+if (LOCAL) await t('G1b: the self-test tool token cannot move or remove a chart box that Rick drew (403, the box stays); it can draw and remove its own', async () => {
+  const A = chartCar && chartCar.ali.img && !chartCar.ali.box ? chartCar.ali : null;   // the SELFTEST Grand Cherokee's chart
+  if (!A) return 'no chart page without a box';
+  const key = { edition: A.edition, chart: A.chart, pdf_page: A.pdf_page }, q = `edition=${encodeURIComponent(A.edition)}&chart=${encodeURIComponent(A.chart)}`, b = [];
+  try {
+    if ((await call('/api/ali/boxes', { as: 'phone', method: 'PUT', body: { ...key, x: 0.1, y: 0.1, w: 0.3, h: 0.3 } })).s !== 200) b.push('Rick draw');
+    if ((await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.5, y: 0.5, w: 0.2, h: 0.2 } })).s !== 403) b.push('tool moved Rick\'s box');
+    if ((await call('/api/ali/boxes?' + q, { method: 'DELETE' })).s !== 403) b.push('tool removed Rick\'s box');
+    if ((await call('/api/ali/boxes?' + q, { as: 'phone', method: 'DELETE' })).s !== 200) b.push('Rick remove');
+    if ((await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.5, y: 0.5, w: 0.2, h: 0.2 } })).s !== 200) b.push('tool draw on a chart with no box');
+    if ((await call('/api/ali/boxes', { method: 'PUT', body: { ...key, x: 0.4, y: 0.4, w: 0.2, h: 0.2 } })).s !== 200) b.push('tool move its own box');
+    if ((await call('/api/ali/boxes?' + q, { method: 'DELETE' })).s !== 200) b.push('tool remove its own box');
+  } finally { await call('/api/ali/boxes?' + q, { as: 'phone', method: 'DELETE' }).catch(() => null); }
+  ok(!b.length, b.join('; ')); return 'Rick\'s box is safe';
+});
+
+// ---------- Review G #7, #3, and the list rule (Rick/Cowork 2026-11-02) ----------
+await t('G1c: the tool token lists and reads SELFTEST cars only (list, Needs confirming, photos of a real car -> 403); \' SELFTEST x\' is stored trimmed and stays editable; \'selftest\' is a real car', async () => {
+  const b = [], ids = [], vals = [];
+  try {
+    const a = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1C', trim: '  SELFTEST G1C ', grp: 'visitor' } });
+    if (a.s !== 201) b.push('create with spaces around the trim: ' + a.s); else ids.push(a.d.id);
+    if (ids[0]) {
+      const v = (await call(`/api/vehicles/${ids[0]}?peek=1`)).d; if (!v || v.trim !== 'SELFTEST G1C') b.push('the trim was stored as ' + JSON.stringify(v && v.trim));
+      const e = await call(`/api/vehicles/${ids[0]}`, { method: 'PATCH', body: { owner: 'G1C owner' } }); if (e.s !== 200) b.push('edit of the trimmed SELFTEST car: ' + e.s);
+      const ph = await call(`/api/vehicles/${ids[0]}/photos`); if (ph.s !== 200) b.push('photo list of a SELFTEST car: ' + ph.s);
+    }
+    const lc = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1C', trim: 'selftest', grp: 'visitor' } });
+    if (lc.s !== 403) { b.push('the tool made a car with the trim "selftest": ' + lc.s); if (lc.d && lc.d.id) ids.push(lc.d.id); }
+    const lst = (await call('/api/vehicles?hidden=1')).d, nc = (await call('/api/needs-confirming')).d;
+    if (!Array.isArray(lst) || lst.some(c => !/^SELFTEST/.test(String(c.trim || '').trim()))) b.push('the tool list has a car that is not a SELFTEST car');
+    if (!nc || (nc.values || []).some(x => x.scope !== 'car' || !lst.some(c => c.id === x.vehicle_id)) || (nc.vin_proposals || []).some(x => !lst.some(c => c.id === x.vehicle_id)) || (nc.badges || []).some(x => !lst.some(c => c.id === x.vehicle_id))) b.push('Needs confirming for the tool shows more than the values, VIN proposals and badges of SELFTEST cars');
+    if (LOCAL) {   // a real car (Rick's login makes it)
+      const r = await call('/api/vehicles', { as: 'phone', method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1C', trim: 'Plain G1C', grp: 'visitor' } }); ids.push(r.d.id);
+      const mv = await call(`/api/vehicles/${r.d.id}/values`, { as: 'phone', method: 'POST', body: { tab: 'torque', field: 'Socket', value: 'G1C real model value', confidence: 'Low', source: 'selftest', scope: 'model' } });
+      const cv = await call(`/api/vehicles/${r.d.id}/values`, { as: 'phone', method: 'POST', body: { tab: 'torque', field: 'Socket', value: 'G1C real car value', confidence: 'Low', source: 'selftest', scope: 'car' } });
+      for (const x of [...(mv.d.values || []), ...(cv.d.values || [])]) if (/^G1C real/.test(x.value)) vals.push(x.id);
+      for (const p of [`/api/vehicles/${r.d.id}`, `/api/vehicles/${r.d.id}/photos`, `/api/photos/${r.d.id}/2026-01-01T00-00-00Z.jpg`, `/api/vehicles/${r.d.id}/values`, `/api/service?car=${r.d.id}`]) {
+        const q = await call(p); if (q.s !== 403) b.push(`tool GET ${p} on a real car: ${q.s}`);
+      }
+      const l2 = (await call('/api/vehicles?hidden=1')).d, n2 = (await call('/api/needs-confirming')).d;
+      if (l2.some(c => c.id === r.d.id)) b.push('the real car is in the tool list');
+      if ((n2.values || []).some(x => /^G1C real/.test(x.value))) b.push('a value of the real car (or its make and model) is in the tool Needs confirming');
+      const rl = (await call('/api/vehicles?hidden=1', { as: 'phone' })).d;
+      if (!rl.some(c => c.id === r.d.id)) b.push('Rick\'s login does not see the real car');
+    }
+  } finally {
+    for (const v of vals) await call('/api/values/' + v, { as: 'phone', method: 'DELETE' }).catch(() => null);
+    for (const id of ids) { await call('/api/vehicles/' + id, { method: 'PATCH', body: { trim: 'SELFTEST G1C' } }).catch(() => null); await call('/api/vehicles/' + id, { as: 'phone', method: 'DELETE' }).catch(() => null); await call('/api/vehicles/' + id, { method: 'DELETE' }).catch(() => null); }
+  }
+  ok(!b.length, b.join('; ')); return 'the tool sees SELFTEST cars only';
+});
+
+// ---------- Review G 1a: the tool token cannot queue research ----------
+await t('G review 1a: the self-test token cannot queue research (POST /api/jobs, parts-research, PATCH grp frequent) even on a SELFTEST car (403, no job made)', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1A', trim: 'SELFTEST G1A', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id;
+  try {
+    const before = new Set((((await call(`/api/vehicles/${id}?peek=1`, { as: 'tool' })).d || {}).jobs || []).map(j => j.id));   // jobs are listed by model: an older job of the same model is not this case's
+    for (const [m, p, body] of [['POST', '/api/jobs', { vehicle_id: id, kind: 'research', fields: [{ tab: 'torque', field: 'Torque' }] }], ['POST', '/api/jobs', { vehicle_id: id, kind: 'workup' }],
+      ['POST', `/api/vehicles/${id}/parts-research`, {}], ['PATCH', `/api/vehicles/${id}`, { grp: 'frequent' }]]) {
+      const r = await call(p, { as: 'tool', method: m, body }); if (r.s !== 403) b.push(`tool ${m} ${p} ${body.kind || ''}: ${r.s}`);
+    }
+    const v = (await call(`/api/vehicles/${id}?peek=1`, { as: 'tool' })).d;
+    if (!v || (v.jobs || []).some(j => !before.has(j.id) && ['research', 'workup', 'parts'].includes(j.kind))) b.push('a research, workup or parts job was made: ' + JSON.stringify(v && v.jobs));
+    if (v && v.grp !== 'visitor') b.push('the group changed to ' + v.grp);
+  } finally { await call('/api/vehicles/' + id, { as: 'tool', method: 'DELETE' }).catch(() => null); }
+  ok(!b.length, b.join('; ')); return 'the tool token is refused on all three, no job made';
+});
+await tl('G review 1a: a research result for a job on a SELFTEST car stores no model value (400)', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1R', trim: 'SELFTEST G1R', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id;
+  try {
+    const q = await call('/api/jobs', { as: 'phone', method: 'POST', body: { vehicle_id: id, kind: 'research', fields: [{ tab: 'torque', field: 'Socket' }] } }); ok(q.s === 201, 'queue ' + q.s); const jid = q.d.id;
+    const cl = await call('/api/jobs/claim', { as: 'proc', method: 'POST', body: { only_id: jid, kinds: ['research', 'workup'] } }); ok(cl.d && cl.d.id === jid, 'claim ' + JSON.stringify(cl.d));
+    const r = await call(`/api/jobs/${jid}/result`, { as: 'proc', method: 'POST', body: { values: [{ tab: 'torque', field: 'Socket', value: '19 mm', confidence: 'Low', source: 'selftest' }] } });
+    if (r.s !== 400) b.push('result for a job on a SELFTEST car: ' + r.s + ' ' + JSON.stringify(r.d));
+    const f = await call(`/api/jobs/${jid}/fail`, { as: 'proc', method: 'POST', body: { error: 'selftest cleanup' } }); if (f.s !== 200) b.push('fail ' + f.s);
+    const d = (await call(`/api/vehicles/${id}?peek=1`, { as: 'phone' })).d;
+    if (!d || (d.values || []).some(x => x.value === '19 mm')) b.push('a value from the refused result is stored: ' + JSON.stringify(d && d.values));
+  } finally { await call('/api/vehicles/' + id, { as: 'phone', method: 'DELETE' }).catch(() => null); }
+  ok(!b.length, b.join('; ')); return 'refused, nothing stored';
+});
+await t('G review 1b: after a delete a reused id never shows the tool the history of the row that had it before (value history)', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1H', trim: 'SELFTEST G1H', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id;
+  const addV = async v => { const r = await call(`/api/vehicles/${id}/values`, { method: 'POST', body: { tab: 'torque', field: 'Socket', value: v, confidence: 'Low', source: 'selftest', scope: 'car' } }); const x = ((r.d && r.d.values) || []).find(y => y.value === v); ok(x, 'add ' + v + ' ' + r.s); return x.id; };
+  try {
+    const a = await addV('G1H first 11 mm');
+    ok((await call(`/api/values/${a}`, { method: 'DELETE' })).s === 200, 'delete the first');
+    const c = await addV('G1H second 12 mm');   // the freed id is reused when it was the highest
+    const h = await call(`/api/values/${c}/history`);
+    if (h.s !== 200) b.push('history ' + h.s);
+    if (JSON.stringify(h.d || []).includes('G1H first 11 mm')) b.push('the history of id ' + c + ' shows the row that had the id before (id ' + a + ')');
+    const gone = await call(`/api/values/${a}/history`);
+    if (a !== c && !(gone.s === 200 && Array.isArray(gone.d) && gone.d.length === 0)) b.push('the tool reads the history of a deleted row: ' + gone.s + ' ' + JSON.stringify(gone.d).slice(0, 80));   // the id is not live: nothing to show the tool
+  } finally { await call('/api/vehicles/' + id, { as: 'tool', method: 'DELETE' }).catch(() => null); }
+  ok(!b.length, b.join('; ')); return 'no old row in the history';
+});
+await t('G review 1c: the tool token lists SELFTEST trims only and reads no model-wide value through a car', async () => {
+  const b = [], mk = await call('/api/vehicles', { method: 'POST', body: { year: 1973, make: 'AMC', model: 'Hornet G1T', trim: 'SELFTEST G1T', grp: 'visitor' } });
+  ok(mk.s === 201, 'create ' + mk.s); const id = mk.d.id;
+  try {
+    const tr1 = await call('/api/trims?year=1973&make=AMC&model=Hornet%20G1T'); const names = ((tr1.d && tr1.d.trims) || []).map(x => x.name || x);
+    if (tr1.s !== 200 || !names.includes('SELFTEST G1T') || names.some(n => !/^SELFTEST/.test(n))) b.push('trims: ' + tr1.s + ' ' + JSON.stringify(names));
+    if (LOCAL) {   // a model-wide value of Rick's on the same make, model and year: the tool does not see it
+      const m = await call(`/api/vehicles/${id}/values`, { as: 'phone', method: 'POST', body: { tab: 'torque', field: 'Socket', value: 'G1T model 13 mm', confidence: 'Low', source: 'selftest', scope: 'model' } });
+      ok(m.s === 200 || m.s === 201, 'model value ' + m.s);
+      const asRick = (await call(`/api/vehicles/${id}?peek=1`, { as: 'phone' })).d, asTool = (await call(`/api/vehicles/${id}?peek=1`, { as: 'tool' })).d;
+      if (!(asRick.values || []).some(x => x.value === 'G1T model 13 mm')) b.push('Rick does not see his model value');
+      if ((asTool.values || []).some(x => x.scope === 'model' || x.value === 'G1T model 13 mm')) b.push('the tool sees a model-wide value');
+      for (const x of asRick.values || []) if (x.value === 'G1T model 13 mm') await call(`/api/values/${x.id}`, { as: 'phone', method: 'DELETE' });
+    }
+  } finally { await call('/api/vehicles/' + id, { as: LOCAL ? 'phone' : 'tool', method: 'DELETE' }).catch(() => null); }
+  ok(!b.length, b.join('; ')); return 'SELFTEST trims only; no model value for the tool';
+});
 
 // ---------- cleanup ----------
 // Every step runs and every problem is listed, so one failed step (a network error, or no value id
 // because the value check failed) never leaves the temp car on live (it did on 2026-10-22, car 5).
 await t('cleanup: temp values (history kept) and temp car removed', async () => {
   const bad2 = [], chk = (c, m) => { if (!c) bad2.push(m); };
+  RICK_VALS = LOCAL;   // the older cases made MODEL values through Rick's login; they are removed the same way
   const tc = async (p, o) => { try { return await call(p, o); } catch (e) { return { s: 'network error: ' + e.message, d: null }; } };
   for (const [k, id] of cleanup.reverse()) if (k === 'val') { const s = (await tc(`/api/values/${id}`, { method: 'DELETE' })).s; chk(s === 200 || s === 404, 'delete value ' + s); }
+    else if (k === 'xcar') { const s = (await tc('/api/vehicles/' + id, { method: 'DELETE' })).s; chk(s === 200 || s === 404, 'delete the chart-page test car ' + s); }
     else if (k === 'photo') { const s = (await tc(id, { method: 'DELETE' })).s; chk(s === 200, 'delete test photo ' + s); }
     else if (k === 'box') { const s = (await tc(`/api/ali/boxes?edition=${encodeURIComponent(id.edition)}&chart=${encodeURIComponent(id.chart)}`, { method: 'DELETE' })).s; chk(s === 200, 'delete test box ' + s); }
-  if (valId) { const h = (await tc(`/api/values/${valId}/history`)).d; chk(Array.isArray(h) && h.length && h[h.length - 1].action === 'delete', 'no delete history row'); }
+  // G review 1b: the tool token sees no history of a deleted row (live and review: no Rick login, so it must be empty there); Rick's login (local) sees the delete row.
+  if (valId) { const h = (await tc(`/api/values/${valId}/history`)).d; if (LOCAL) chk(Array.isArray(h) && h.length && h[h.length - 1].action === 'delete', 'no delete history row'); else chk(Array.isArray(h) && h.length === 0, 'the tool token sees the history of a deleted value: ' + JSON.stringify(h).slice(0, 120)); }
   else chk(false, 'no value id (the value check failed): history not checked');
   if (car) { const s = (await tc('/api/vehicles/' + car, { method: 'DELETE' })).s; chk(s === 200, 'delete car ' + s); chk((await tc('/api/vehicles/' + car)).s === 404, 'car still there'); }
   // HANDOFF 19: the jobs the run failed on purpose go too, so the Admin page shows no PROBLEM from test jobs (HANDOFF 18 C3 counts failed jobs of the last 24 hours).

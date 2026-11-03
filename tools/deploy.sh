@@ -2,7 +2,7 @@
 # LiftPad deploy. Runs inside node:22-alpine. See README for the full docker command.
 # Mounts:  /app     a build copy of the committed tree (git archive) - this script edits it
 #          /cfg     cf.env (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID) and svc.env. Never printed.
-#          /private deploy.env (LP_HOSTNAME, LP_ACCESS_EMAIL, LP_ACCESS_TEAM, optional LP_D1_NAME) and,
+#          /private deploy.env (LP_HOSTNAME, LP_ACCESS_EMAIL, LP_ACCESS_TEAM, optional LP_D1_NAME and LP_R2_BUCKET) and,
 #                   optional, seed-private.sql. Pre-migration backups go to /private/backups.
 # Changes: Cloudflare - creates the Access app, its policies, the self-test and the processor
 #          service tokens only if they do not exist; creates D1 $LP_D1_NAME (default "liftpad")
@@ -112,7 +112,7 @@ if [ -z "$DB" ]; then
   DB=$(grep -o '[0-9a-f]\{8\}-[0-9a-f-]\{27\}' /tmp/d1.txt | head -1); echo "D1 created"
 else echo "D1 exists"; fi
 [ -n "$DB" ] || { echo "STOP: no D1 id"; exit 1; }
-sed -i -e "s/__LP_D1_ID__/$DB/" -e "s/__LP_D1_NAME__/$DBN/" -e "s/__LP_HOSTNAME__/$LP_HOSTNAME/" wrangler.toml
+sed -i -e "s/__LP_D1_ID__/$DB/" -e "s/__LP_D1_NAME__/$DBN/" -e "s/__LP_HOSTNAME__/$LP_HOSTNAME/" -e "s/__LP_R2_BUCKET__/${LP_R2_BUCKET:-liftpad-private}/" wrangler.toml
 # Quoted values only: the comment at the top of wrangler.toml also names __LP_.
 if grep -q '"__LP_' wrangler.toml; then echo "STOP: wrangler.toml still has a placeholder"; exit 1; fi
 # The app icons are built here, not kept in git (the repo admits no .svg and ignores .png). HANDOFF 18 (C9): tools/make_icons.py draws

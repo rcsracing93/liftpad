@@ -1,108 +1,74 @@
 # LiftPad
 
-LiftPad is a small web app for a home garage with a 2-post lift. A touch screen next to the lift shows the lift points, wheel torque and tire pressure for each car. The same app works on a phone or a laptop.
+LiftPad is a small web app for a home garage with a 2-post lift. A tablet on the lift shows one screen per car: lift points, wheel torque, tire pressure, oil, parts and a service log. The same app works on a phone or a laptop.
 
-It runs on Cloudflare: one Worker serves the app and a small API, and one D1 database holds the data. Cloudflare Access puts a login in front of it.
+**Status: beta.** I built it for my own garage and I use it there. The code is public so friends and anyone else can read it, borrow from it or set up their own copy. Expect rough edges.
+
+It runs on Cloudflare: one Worker serves the app and a small API, one D1 database holds the data, and a private R2 bucket holds the guide pages. Cloudflare Access puts a login in front of it. Workers, D1 and R2 are free at this scale. Only the optional research helper costs money (the Anthropic API); see `docs/SETUP.md`, "Costs".
 
 ## Screenshots
 
 | | |
 |---|---|
-| ![Home screen on a tablet](docs/screenshots/tablet-home.png) | ![Lift tab on a tablet](docs/screenshots/tablet-lift.png) |
-| Home: your cars, and what needs attention on each. | Lift: the chart, the lift points and the guide page with the chart outlined. |
-| ![Torque tab on a tablet](docs/screenshots/tablet-torque.png) | ![Oil tab on a tablet](docs/screenshots/tablet-oil.png) |
-| Torque: the value in large numbers, its confidence and its source. | Oil: oil type, quantity in qt and L, filter. |
-| ![Needs confirming on a phone](docs/screenshots/phone-confirm.png) | |
-| Needs confirming (phone): confirm or reject proposed values. | |
+| ![A car screen on a tablet](docs/screenshots/tablet-car.png) | ![Lift screen on a tablet](docs/screenshots/tablet-lift.png) |
+| A car: one tile per topic, with the state of each. | Lift: the chart, the lift points and the guide page with the chart outlined. |
+| ![Parts screen on a tablet](docs/screenshots/tablet-parts.png) | ![A car on a phone](docs/screenshots/phone-car.png) |
+| Parts: wipers, filters and fluids for the car. | The same car on a phone. |
 
-Screenshots use sample data. The ALI lifting-point guide is not included in this repo.
-
-Each screen is described in [docs/SCREENS.md](docs/SCREENS.md).
+The screenshots use the sample data that ships in this repo and a made-up guide. Each screen is described in [docs/SCREENS.md](docs/SCREENS.md).
 
 ## What it does
 
-- A list of your cars ([screenshot](docs/screenshots/tablet-home.png)). Each car has four tabs: Lift, Torque, Tires, Oil.
-- Lift: the chart and page of your own lift guide, with the chart outlined ([screenshot](docs/screenshots/tablet-lift.png)).
-- Torque: wheel torque in large numbers, with thread and socket ([screenshot](docs/screenshots/tablet-torque.png)).
-- Oil: oil type, quantity and filter ([screenshot](docs/screenshots/tablet-oil.png)).
-- Each value has a confidence (High, Medium, Low), a source and a note. A new value is proposed until you confirm it ([screenshot](docs/screenshots/phone-confirm.png)).
-- Add a car by year, make and model, or decode a VIN.
+- A list of your cars. Add one by year, make and model, or decode a VIN.
+- Lift: the chart and page of your own lift guide, with the chart outlined (see "The lift guide is not included" below).
+- Torque: wheel torque in large numbers, with thread and socket.
+- Tires: pressure (door jamb placard or manual) and tire size.
+- Oil: oil type, quantity in qt and L, filter.
+- Parts: wipers, filters and fluids. You enter filters yourself (Add part). An optional research helper looks up wipers and fluids. It does not look up filters and it does not use RockAuto.
+- Service log: what was done, when, at what mileage.
+- Every value has a confidence (High, Medium, Low), a source and a note. A new value is proposed until you confirm it.
 - Make and model lists come from NHTSA vPIC (1981 and later) and from a classics list for older cars.
 - Works offline with the last saved data.
 
-## Hardware - recommended starting point
+## The lift guide is not included
 
-LiftPad is a web app: any modern browser works (phone, laptop, desktop). None of this hardware is required. This is the setup it was built and tested on, and a good starting point for a screen at the lift.
+I utilize data from the Automotive Lift Institute (ALI) *Vehicle Lifting Points Guide* for my personal, non-commercial use. You can buy your own printed copy from them here: https://www.autolift.org/product/vehicle-lifting-points-guide/
+
+None of the guide is in this repo: no pages, no chart codes, no index. `docs/LOAD-YOUR-GUIDE.md` shows how LiftPad reads your own copy, including a newer edition next to an older one. Without a guide the Lift screen says "No lift data loaded" and everything else works.
+
+## Set up your own
+
+`docs/SETUP.md` walks through it: Cloudflare token, secrets outside the repo, the private R2 bucket, the deploy, the self-test. Every command says where it runs. You need a Cloudflare account with a domain, Docker, Python 3 and git. It is written for someone comfortable with a terminal. It is not a beginner tutorial.
+
+The always-on box (a small Linux machine for the research helper and nightly backups) is optional. The app works without it. In that case the Admin page shows a grey "no report yet" line, which is normal.
+
+## Hardware - a good starting point
+
+LiftPad is a web app: any modern browser works. None of this hardware is required. This is what it was built and tested on.
 
 | Part | Model | Notes |
 |---|---|---|
-| Tablet | Lenovo Idea Tab 11, part **ZAFR0923US** (4 GB / 128 GB, Wi-Fi) | 11 in 2560x1600 IPS, 500 nits, 90 Hz; MediaTek Dimensity 6300; Android 15, updates to 2029 |
-| Kiosk app | Fully Kiosk Browser PLUS | one-time license; landscape lock, screen always on, auto-start |
-| Mount | VasSmtCPH magnetic tablet holder, model **MTSM-M-001** | 3.5 in rubber-coated base, 12 neodymium magnets, rated 66 lb pull; 360 deg ball head; holds 4.7-12.9 in devices |
+| Tablet | Lenovo Idea Tab 11, part **ZAFR0923US** (4 GB / 128 GB, Wi-Fi) | 11 in 2560x1600 IPS, 500 nits, 90 Hz; Android 15 |
+| Kiosk app | Fully Kiosk Browser PLUS | landscape lock, screen always on, auto-start |
+| Mount | VasSmtCPH magnetic tablet holder, model **MTSM-M-001** | rubber-coated base, 12 neodymium magnets, 360 deg ball head |
 
-**Suggested tablet spec for a lift screen** (any brand that meets it works):
-
-- Screen 10-11 in, landscape, at least 1280x800 CSS pixels (the lift-screen layout is built and tested at 1280x800); 1920x1200 or better recommended; 400+ nits for a garage.
-- Android 10 or later with a current Chrome / Android System WebView (Fully Kiosk uses it).
-- Wi-Fi 5 GHz (802.11ac) or better.
-- Battery charge limit (about 60-80%) if available, because it stays plugged in; otherwise a timer plug.
-- Camera optional on the tablet (door-jamb and VIN photos are taken on the phone).
-- Mount on a steel surface (the lift post), at eye level, clear of the carriage, arms and safety locks.
+For a lift screen any 10-11 in tablet works if it is at least 1280x800 CSS pixels in landscape, 400+ nits for a garage, Android 10 or later and 5 GHz Wi-Fi. Mount it on a steel surface at eye level, clear of the carriage, arms and safety locks.
 
 ## Data sources
 
 - **NHTSA vPIC** (public US government API) for makes, models and VIN decode. The Worker calls it at run time.
 - **Classics list** (older makes such as Studebaker, AMC, Nash, Hudson): `tools/build_classics.py` builds it from Wikidata model names and Wikipedia infobox production years. Wikidata is rate-limited, so the build is slow. Check the result by hand.
-- **Lift-point charts: NOT included.** The app can show which chart and page of the ALI / MOTOR *Lifting Point Guide* applies to a car. That guide is copyrighted. Buy your own copy, and type your own index into `private-data/ali-index.csv` (columns: `make,model,year_from,year_to,chart,guide_page,pdf_page,status,note`). Without it, the lift screen shows only the values you enter.
+- **Lift-point charts:** yours, from your own purchased guide (see above).
 
-## Deploy your own
+## What's next
 
-You need: a Cloudflare account with a domain, Docker, Python 3, and git.
+1) Not fitted rows - a way to say "this car does not have that" instead of leaving a blank.
+2) A better source for parts data. Today filters are typed in by hand. Suggestions?
+3) Newer lift guide editions. I don't expect to buy a new one every year, but newer vehicles keep coming. A newer edition is added next to the older ones, so older cars keep their charts. Today that takes a few documented steps (`docs/LOAD-YOUR-GUIDE.md`); the goal is a shorter routine.
 
-1. Make a Cloudflare API token with these permissions: Account - D1 Edit, Workers Scripts Edit, Access: Apps and Policies Edit, Access: Service Tokens Edit; Zone - Workers Routes Edit, DNS Edit (for your domain).
-2. Make a folder for secrets outside this repo, for example `~/.config/liftpad/`, and a file `cf.env` in it:
+## Contributing
 
-   ```
-   CLOUDFLARE_API_TOKEN=<your token>
-   CLOUDFLARE_ACCOUNT_ID=<your account id>
-   ```
-
-3. Make a folder `private-data/` (it is in `.gitignore`) with a file `deploy.env`:
-
-   ```
-   LP_HOSTNAME=lift.example.com
-   LP_ACCESS_EMAIL=you@example.com
-   LP_ACCESS_TEAM=yourteam.cloudflareaccess.com
-   ```
-
-   `LP_ACCESS_TEAM` is your Zero Trust team domain (Zero Trust dashboard, Settings). The Worker uses it to check the Access login proof (JWT) on the research-queue routes.
-
-4. Optional: put your own data in `private-data/` and build a private seed. `my-cars.csv` has one row per value (`year,make,model,trim,tab,field,value,confidence,source,note,warn`; `tab` is lift, torque or tires; `warn` is 0 none, 1 caution, 2 block).
-
-   ```
-   python3 tools/build_classics.py private-data/classics.csv
-   python3 tools/make_seed.py private-data
-   ```
-
-   Without a private seed, the deploy loads `db/seed-public.sql`: the makes list and 2 example cars.
-
-5. Deploy:
-
-   ```
-   docker run --rm -v "$PWD":/app -v ~/.config/liftpad:/cfg -v "$PWD/private-data":/private node:22-alpine sh /app/tools/deploy.sh
-   ```
-
-   The deploy creates the Access app, a login policy for your email, a service token for the self-test, the D1 database and the Worker. It edits `wrangler.toml` in place, so run it from a copy, not from your git checkout. It loads the database only when the database is empty. `-e RESEED=1` wipes the database and loads it again - this deletes the cars you added.
-
-6. Self-test (the deploy saved the service token in `svc.env`):
-
-   ```
-   docker run --rm --env-file ~/.config/liftpad/svc.env -v "$PWD":/app -w /app node:22-alpine node test/selftest.js https://lift.example.com
-   ```
-
-## Contributions
-
-This repository is an export from a private repository, one commit per release. Pull requests are not merged here, because the next export would overwrite them. Send patches by email to the address on the GitHub profile of rcsracing93. Contributors are named in the release notes.
+This is a beta and I am the only one working on it. Issues are on: bug reports and questions are welcome. Pull requests are not merged during the beta, because the next release overwrites this repository from my private one. If you have a fix, put it in an issue and I will take it from there.
 
 ## Licence
 

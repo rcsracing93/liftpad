@@ -25,7 +25,7 @@ database_id = "__LP_D1_ID__"
 # door-jamb photos. Served only by the Worker, behind Access.
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "liftpad-private"
+bucket_name = "__LP_R2_BUCKET__"
 
 [vars]
 NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
@@ -33,36 +33,5 @@ NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
 FE = "https://www.fueleconomy.gov/ws/rest/vehicle"
 # NHTSA recalls (HANDOFF 18): recallsByVehicle, asked once a day per car. The Worker caches the answer in D1 (car_facts).
 RECALLS = "https://api.nhtsa.gov/recalls"
-# Research job by itself when Rick adds a car or changes a trim: "1" = on. Default off; tools/deploy.sh sets it from deploy.env.
-LP_AUTO_RESEARCH = "0"
-
-# HANDOFF 14: the review environment (`wrangler deploy --env review`, run by tools/review/review_env.sh). Same code, its own
-# name, D1 and R2, no research key, no processor token. The placeholders start with __LPR_ (not __LP_) on purpose: the guard of
-# tools/deploy.sh greps for a quoted __LP_ and must not see these. A live deploy (no --env) ignores this block.
-[env.review]
-name = "liftpad-review"
-workers_dev = false
-preview_urls = false
-routes = [ { pattern = "__LPR_HOSTNAME__", custom_domain = true } ]
-
-[env.review.assets]
-directory = "./public"
-binding = "ASSETS"
-not_found_handling = "single-page-application"
-run_worker_first = true
-
-[[env.review.d1_databases]]
-binding = "DB"
-database_name = "liftpad-review"
-database_id = "__LPR_D1_ID__"
-
-[[env.review.r2_buckets]]
-binding = "BUCKET"
-bucket_name = "liftpad-review-private"
-
-[env.review.vars]
-NHTSA = "https://vpic.nhtsa.dot.gov/api/vehicles"
-FE = "https://www.fueleconomy.gov/ws/rest/vehicle"
-RECALLS = "https://api.nhtsa.gov/recalls"
-# Always "0" in review: no Anthropic key exists there.
+# Research job by itself when a car is added or changes a trim: "1" = on. Default off; tools/deploy.sh sets it from deploy.env.
 LP_AUTO_RESEARCH = "0"
